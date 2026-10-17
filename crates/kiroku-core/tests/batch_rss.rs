@@ -1,6 +1,8 @@
 //! 大批次端到端内存测量(issue 10)。每次只跑一个规模,让进程峰值 RSS 不受前一轮影响:
 //! `KIROKU_BATCH=1000 cargo test -p kiroku-core --test batch_rss -- --ignored --nocapture`
 //! 合成小视频(1 KiB)和本地假来源;不触碰真实媒体,不联网,没有图片下载。
+//! 峰值 RSS 用 getrusage 读取,只在 Unix 上编译。
+#![cfg(unix)]
 use kiroku_core::{
     code::Code, metadata::{Actor, Gender, PartialMetadata}, net::Http, organize::PlanOpts, pipeline::{self, Scraper},
     settings::{Settings, SourceCfg}, source::{Source, SourceError}, video_filter::VideoFilter,
