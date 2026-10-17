@@ -36,10 +36,12 @@ jobs:
         run: |
           set -o pipefail
           cargo test -p kiroku-core -p kiroku-cli --no-fail-fast 2>&1 | tee test.log && exit 0
-          # 每个失败测试的输出写成一条注解,不用下载日志就能在检查结果里看到
-          awk '/^---- .* stdout ----$/{if(b!="")print b; b=$0; next} b!=""&&/^$/{print b; b=""; next} b!=""{b=b"%0A"$0} END{if(b!="")print b}' test.log \
-            | head -10 | while IFS= read -r block; do echo "::error title=test failure::${block}"; done
-          grep -E "^error(\[|:)" test.log | head -5 | while IFS= read -r l; do echo "::error title=build error::${l}"; done
+          # 失败详情写成注解,不用下载日志就能在检查结果里看到
+          tr -d '\r' < test.log | sed 's/%/%25/g' > clean.log
+          awk '/^---- .* stdout ----$/{if(b!="")print b; b=$0; next} b!=""&&/^$/{print b; b=""; next} b!=""{b=b"%0A"$0} END{if(b!="")print b}' clean.log \
+            | head -8 | while IFS= read -r block; do echo "::error title=test failure::${block}"; done
+          echo "::error title=failed tests::$(grep -E 'FAILED|^error|panicked|exit code|STATUS_' clean.log | head -40 | awk '{printf "%s%%0A", $0}')"
+          echo "::error title=log tail::$(tail -60 clean.log | awk '{printf "%s%%0A", $0}')"
           exit 1
 
       - name: Frontend install, type-check, build
