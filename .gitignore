@@ -1,0 +1,16 @@
+/target
+node_modules
+.DS_Store
+*.db
+/apps/desktop/dist
+/apps/desktop/test-results
+/apps/desktop/playwright-report
+/apps/desktop/src-tauri/gen
+/.claude/.cc-writes
+
+/.superpowers/
+/.pnpm-store/
+/.private/
+/.scratch/
+/docs/research/
+/docs/amane-archaeology.md

@@ -1,0 +1,7 @@
+{
+ "status": "error",
+ "message": "Error: Error solving the challenge. Timeout after 1.0 seconds.",
+ "startTimestamp": 1792033807509,
+ "endTimestamp": 1792033809719,
+ "version": "3.5.2"
+}

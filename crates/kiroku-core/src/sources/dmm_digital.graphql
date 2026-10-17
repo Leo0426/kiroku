@@ -1,0 +1,20 @@
+query FetchDigitalContent($id: ID!) {
+  ppvContent(id: $id) {
+    title
+    description
+    deliveryStartDate
+    duration
+    actresses { name }
+    directors { name }
+    series { name }
+    maker { name }
+    label { name }
+    genres { name }
+    packageImage { largeUrl mediumUrl }
+    sampleImages { imageUrl largeImageUrl }
+    sample2DMovie { highestMovieUrl }
+  }
+  reviewSummary(contentId: $id) {
+    average
+  }
+}

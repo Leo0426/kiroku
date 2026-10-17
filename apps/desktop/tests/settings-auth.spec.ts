@@ -1,0 +1,58 @@
+import { expect, test } from '@playwright/test'
+import { overrideApi, seedLibrary } from './helpers'
+
+test('badge preview scrolls with its card instead of covering controls', async ({ page }) => {
+  await seedLibrary(page)
+  await page.setViewportSize({ width: 960, height: 720 })
+  await page.goto('/')
+  await page.getByRole('button', { name: '设置', exact: true }).click()
+  await page.getByRole('tab', { name: '封面角标', exact: true }).click()
+  const preview = page.locator('.badge-preview')
+  const before = await preview.boundingBox()
+  await page.locator('.view-shell').evaluate(el => { el.scrollTop += 250 })
+  await expect.poll(async () => (await preview.boundingBox())!.y).toBeLessThan(before!.y - 200)
+})
+
+test('source authentication tests the draft without saving and invalidates changed credentials', async ({ page }) => {
+  await seedLibrary(page)
+  await overrideApi(page, `window.authDraft = null; api.sourcesCheck = async (ids, draft) => { window.authDraft = draft; return [{ sourceId:ids[0], outcome:{status:'ok',reason:'authenticated',httpStatus:200},elapsedMs:10,checkedAt:1}]; };`)
+  await page.goto('/')
+  await page.getByRole('button', { name: '设置', exact: true }).click()
+  await page.getByRole('tab', { name: '命名与 NFO', exact: true }).click()
+  await page.getByLabel('目录模板').fill('')
+  await page.getByRole('tab', { name: '数据源', exact: true }).click()
+  await page.getByLabel('登录 Cookie', { exact: false }).fill('_jdb_session=synthetic-test')
+  await page.getByRole('button', { name: '验证 JavDB 认证', exact: true }).click()
+  await expect(page.getByRole('status', { name: 'JavDB 认证结果' })).toContainText('已登录')
+  expect(await page.evaluate(() => (window as any).authDraft.sources.find((s:any)=>s.id==='javdb').cookie)).toBe('_jdb_session=synthetic-test')
+  expect(await page.evaluate(() => JSON.parse(localStorage.getItem('kiroku-mock-settings-v2')!).sources?.find((s:any)=>s.id==='javdb')?.cookie)).toBeUndefined()
+  await page.getByLabel('登录 Cookie', { exact: false }).fill('_jdb_session=changed-test')
+  await expect(page.getByRole('status', { name: 'JavDB 认证结果' })).toHaveCount(0)
+})
+
+test('reachable homepage cannot be reported as a successful login and late results are discarded', async ({ page }) => {
+  await seedLibrary(page)
+  await overrideApi(page, `window.finishAuth=null; api.sourcesCheck = async ids => { await new Promise(r=>window.finishAuth=r); return [{sourceId:ids[0],outcome:{status:'ok',reason:'authUnknown',httpStatus:200},elapsedMs:10,checkedAt:1}]; };`)
+  await page.goto('/')
+  await page.getByRole('button', { name: '设置', exact: true }).click()
+  await page.getByRole('tab', { name: '数据源', exact: true }).click()
+  await page.getByRole('button', { name: '验证 JavDB 认证', exact: true }).click()
+  await expect.poll(() => page.evaluate(() => !!(window as any).finishAuth)).toBe(true)
+  await page.evaluate(() => (window as any).finishAuth())
+  await expect(page.getByRole('status', { name: 'JavDB 认证结果' })).toContainText('未确认')
+  await page.getByRole('button', { name: '验证 JavDB 认证', exact: true }).click()
+  await page.getByLabel('登录 Cookie', { exact: false }).fill('changed')
+  await page.getByLabel('登录 Cookie', { exact: false }).fill('')
+  await page.evaluate(() => (window as any).finishAuth())
+  await expect(page.getByRole('button', { name: '验证 JavDB 认证', exact: true })).toBeEnabled()
+  await expect(page.getByRole('status', { name: 'JavDB 认证结果' })).toHaveCount(0)
+})
+
+ test('mock reachability with no login cookie is explicitly unauthenticated', async ({ page }) => {
+  await seedLibrary(page)
+  await page.goto('/')
+  await page.getByRole('button', { name: '设置', exact: true }).click()
+  await page.getByRole('tab', { name: '数据源', exact: true }).click()
+  await page.getByRole('button', { name: '验证 JavDB 认证', exact: true }).click()
+  await expect(page.getByRole('status', { name: 'JavDB 认证结果' })).toContainText('未登录')
+})

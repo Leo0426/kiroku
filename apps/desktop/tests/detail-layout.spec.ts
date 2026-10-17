@@ -1,0 +1,36 @@
+import { expect, test } from '@playwright/test'
+import { seedLibrary } from './helpers'
+
+test('detail tools are compact and language export opens without losing its draft', async ({ page }) => {
+  await seedLibrary(page)
+  await page.goto('/')
+  await page.locator('button.pcard').first().click()
+  const panel = page.getByLabel('影片详情', { exact: true })
+  const tools = panel.getByRole('region', { name: '影片工具', exact: true })
+  await expect(tools).toBeVisible()
+  await expect(panel.getByLabel('NFO 导出语言')).not.toBeVisible()
+  const buttons = tools.getByRole('button')
+  await expect(buttons).toHaveCount(5)
+  const edit = await tools.getByRole('button', { name: '编辑元数据', exact: true }).boundingBox()
+  const update = await tools.getByRole('button', { name: '更新与来源', exact: true }).boundingBox()
+  expect(Math.abs(edit!.y - update!.y)).toBeLessThan(3)
+  await tools.getByRole('button', { name: '语言与 NFO', exact: true }).click()
+  await panel.getByLabel('NFO 导出语言').selectOption('original')
+  await tools.getByRole('button', { name: '语言与 NFO', exact: true }).click()
+  await tools.getByRole('button', { name: '语言与 NFO', exact: true }).click()
+  await expect(panel.getByLabel('NFO 导出语言')).toHaveValue('original')
+  await page.screenshot({ path: '/tmp/kiroku-detail-layout.png' })
+})
+
+test('expanded editors fit a narrow detail panel and can be cancelled', async ({ page }) => {
+  await seedLibrary(page)
+  await page.setViewportSize({ width: 720, height: 720 })
+  await page.goto('/')
+  await page.locator('button.pcard').first().click()
+  const panel = page.getByLabel('影片详情', { exact: true })
+  await panel.getByRole('button', { name: '编辑元数据', exact: true }).click()
+  await expect(panel.getByLabel('编辑标题', { exact: true })).toBeVisible()
+  expect(await panel.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true)
+  await panel.getByRole('button', { name: '取消编辑', exact: true }).click()
+  await expect(panel.getByRole('button', { name: '编辑元数据', exact: true })).toBeVisible()
+})

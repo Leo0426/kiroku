@@ -1,0 +1,32 @@
+[package]
+name = "kiroku-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+regex.workspace = true
+fancy-regex = "0.14"
+unicode-normalization = "0.1"
+tokio.workspace = true
+async-trait.workspace = true
+tokio-util.workspace = true
+rusqlite.workspace = true
+quick-xml = "0.37"
+trash = "5"
+walkdir.workspace = true
+reqwest.workspace = true
+scraper = "0.23"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+sha2 = "0.10"
+same-file = "1"
+log = "0.4"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+tempfile = "3"
+futures-util = "0.3"
+
+[dev-dependencies]
+libc = "0.2"

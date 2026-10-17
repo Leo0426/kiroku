@@ -1,0 +1,170 @@
+@import './tokens.css';
+
+*, *::before, *::after { box-sizing: border-box; }
+html, body, #app { height: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text-1);
+  font: var(--fs-md) / 1.5 var(--font);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  /* Paths, remote titles and error text may contain no natural break points. */
+  overflow-wrap: anywhere;
+  overflow: hidden;
+  -webkit-tap-highlight-color: transparent;
+}
+button, input, select, textarea { font: inherit; color: inherit; }
+button { cursor: pointer; }
+button:disabled { cursor: default; }
+a { color: var(--accent); }
+h1, h2, h3, p { margin: 0; }
+::selection { background: var(--accent-soft); }
+.tnum { font-variant-numeric: tabular-nums; }
+.muted { color: var(--text-2); }
+.faint { color: var(--text-3); }
+.skeleton-fill { background:linear-gradient(100deg,var(--surface-2) 30%,var(--surface-3) 50%,var(--surface-2) 70%); background-size:200% 100%; animation:shimmer 1.6s linear infinite; }
+.mono { font-family: var(--font-mono); font-size: 0.92em; }
+
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: var(--r-sm); }
+
+* { scrollbar-width: thin; scrollbar-color: var(--surface-hover) transparent; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: var(--surface-hover); border-radius: 10px; border: 2px solid transparent; background-clip: content-box; }
+::-webkit-scrollbar-thumb:hover { background: var(--line-strong); background-clip: content-box; }
+
+/* =====================================================================
+   交互原则:外观素约,反馈充分。
+   - 悬停:轻微上浮/变亮;按下:缩小;松开:带一点过冲回弹
+   - 点击处出现涟漪(main.ts 里统一挂,作用于 .btn 与 .ripple-host)
+   - 图标随所在按钮的悬停做各自的小动作(见文件末尾)
+   ===================================================================== */
+
+.btn {
+  position: relative; overflow: hidden; isolation: isolate;
+  display: inline-flex; align-items: center; justify-content: center; gap: var(--s2);
+  height: 34px; padding: 0 var(--s4);
+  border: 0; border-radius: var(--r-sm);
+  background: var(--surface-3); color: var(--text-1);
+  font-weight: 500; white-space: nowrap;
+  transition:
+    background var(--d-fast) var(--ease-out),
+    color var(--d-fast) var(--ease-out),
+    box-shadow var(--d-base) var(--ease-out),
+    transform var(--d-base) var(--ease-back),
+    opacity var(--d-base) var(--ease-out);
+}
+.btn:hover:not(:disabled) { background: var(--surface-hover); transform: translateY(-1px); }
+.btn:active:not(:disabled) { transform: translateY(0) scale(0.96); transition-duration: 80ms; }
+.btn:disabled { opacity: 0.4; }
+.btn.primary { background: var(--accent); color: var(--accent-ink); font-weight: 600; }
+.btn.primary:hover:not(:disabled) { background: var(--accent-hover); box-shadow: 0 6px 20px -4px color-mix(in srgb, var(--accent) 55%, transparent); }
+.btn.ghost { background: transparent; }
+.btn.ghost:hover:not(:disabled) { background: var(--surface-3); }
+.btn.danger { color: var(--danger); }
+.btn.danger:hover:not(:disabled) { background: var(--danger-soft); }
+.btn.sm { height: 28px; padding: 0 var(--s3); font-size: var(--fs-sm); }
+.btn.icon { width: 34px; padding: 0; }
+
+/* 点击涟漪 */
+.ripple-host { position: relative; overflow: hidden; isolation: isolate; }
+.ripple {
+  position: absolute; z-index: -1; border-radius: 50%; pointer-events: none;
+  background: currentColor; opacity: 0;
+  transform: translate(-50%, -50%) scale(0);
+  animation: ripple 560ms var(--ease-out) forwards;
+}
+@keyframes ripple {
+  0% { opacity: 0.22; transform: translate(-50%, -50%) scale(0); }
+  100% { opacity: 0; transform: translate(-50%, -50%) scale(1); }
+}
+
+/* 输入框:聚焦时描边从中心「长」出来 */
+.input {
+  height: 34px; padding: 0 var(--s3);
+  background: var(--surface-2); border: 0; border-radius: var(--r-sm);
+  box-shadow: inset 0 0 0 1px transparent, 0 0 0 0 var(--accent-soft); min-width: 0;
+  transition: box-shadow var(--d-base) var(--ease-out), background var(--d-fast) var(--ease-out), width var(--d-slow) var(--ease-out);
+}
+.input:hover:not(:disabled):not(:focus) { background: var(--surface-3); }
+.input::placeholder { color: var(--text-3); transition: opacity var(--d-base), transform var(--d-base) var(--ease-out); }
+.input:focus { outline: none; box-shadow: inset 0 0 0 1.5px var(--accent), 0 0 0 4px var(--accent-soft); }
+.input:focus::placeholder { opacity: 0.5; transform: translateX(3px); }
+.input:disabled { opacity: 0.5; }
+.input[aria-invalid='true'] { box-shadow: inset 0 0 0 1.5px var(--danger), 0 0 0 4px var(--danger-soft); animation: shake 320ms var(--ease-out); }
+select.input { padding-right: var(--s2); cursor: pointer; }
+
+/* 复选框:勾号弹性画出,选中时整体轻弹一下 */
+.checkbox {
+  appearance: none; -webkit-appearance: none; margin: 0; flex-shrink: 0; cursor: pointer;
+  width: 18px; height: 18px; border-radius: 6px; display: inline-grid; place-content: center;
+  background: transparent; box-shadow: inset 0 0 0 1.5px var(--line-strong);
+  transition: background var(--d-fast) var(--ease-out), box-shadow var(--d-fast) var(--ease-out), transform var(--d-base) var(--ease-back);
+}
+.checkbox::after {
+  content: ''; width: 9px; height: 5px; margin-top: -2px;
+  border: 2px solid var(--accent-ink); border-top: 0; border-right: 0;
+  transform: rotate(-45deg) scale(0); transition: transform var(--d-base) var(--ease-back);
+}
+.checkbox:hover:not(:disabled) { box-shadow: inset 0 0 0 1.5px var(--accent); }
+.checkbox:checked { background: var(--accent); box-shadow: none; animation: pop 320ms var(--ease-back); }
+.checkbox:checked::after { transform: rotate(-45deg) scale(1); }
+.checkbox:active:not(:disabled) { transform: scale(0.85); }
+.checkbox:disabled { opacity: 0.35; cursor: default; }
+
+.card { background: var(--surface-1); border-radius: var(--r-md); box-shadow: var(--inset-edge); }
+
+/* 表格行:悬停时底色淡入并轻推,新行入场时从上方滑入 */
+.trow { transition: background var(--d-fast) var(--ease-out), transform var(--d-base) var(--ease-out); animation: rowIn 320ms var(--ease-out) both; }
+.trow:hover { background: var(--surface-2); transform: translateX(2px); }
+
+/* 子元素依次入场:给容器加 .stagger */
+.stagger > * { animation: rise var(--d-slow) var(--ease-out) both; }
+.stagger > :nth-child(2) { animation-delay: 40ms; }
+.stagger > :nth-child(3) { animation-delay: 80ms; }
+.stagger > :nth-child(4) { animation-delay: 120ms; }
+.stagger > :nth-child(5) { animation-delay: 160ms; }
+.stagger > :nth-child(6) { animation-delay: 200ms; }
+.stagger > :nth-child(7) { animation-delay: 240ms; }
+.stagger > :nth-child(n + 8) { animation-delay: 280ms; }
+
+@keyframes shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes pulse { 50% { opacity: 0.45; } }
+@keyframes pop { 0% { transform: scale(0.8); } 60% { transform: scale(1.08); } 100% { transform: scale(1); } }
+@keyframes rise { from { opacity: 0; transform: translateY(8px); } }
+@keyframes rowIn { from { opacity: 0; transform: translateY(-4px); } }
+@keyframes float { 50% { transform: translateY(-4px); } }
+@keyframes shake { 20%, 60% { transform: translateX(-3px); } 40%, 80% { transform: translateX(3px); } }
+
+/* =====================================================================
+   图标微动效:Icon 组件带有 i-<名字> 类;所在的可交互元素悬停时各做一个小动作
+   ===================================================================== */
+svg.icon { transition: transform var(--d-base) var(--ease-back); }
+:is(button, a, label, [role='tab']):hover:not(:disabled) > .i-arrow-right,
+:is(button, a, label, [role='tab']):hover:not(:disabled) .i-arrow-right { transform: translateX(3px); }
+:is(button, a):hover:not(:disabled) .i-arrow-left { transform: translateX(-3px); }
+:is(button, a):hover:not(:disabled) .i-refresh { transform: rotate(180deg); }
+:is(button, a):hover:not(:disabled) .i-plus { transform: rotate(90deg); }
+:is(button, a):hover:not(:disabled) .i-x { transform: rotate(90deg); }
+:is(button, a):hover:not(:disabled) .i-undo { transform: rotate(-35deg); }
+:is(button, a):hover:not(:disabled) .i-play { transform: scale(1.18); }
+:is(button, a):hover:not(:disabled) .i-folder { transform: translateY(-1px) rotate(-8deg); }
+:is(button, a):hover:not(:disabled) .i-pencil { transform: rotate(-14deg) translateY(-1px); }
+:is(button, a):hover:not(:disabled) .i-download { transform: translateY(2px); }
+:is(button, a):hover:not(:disabled) .i-history { transform: rotate(-30deg); }
+:is(button, a):hover:not(:disabled) .i-settings { transform: scaleX(-1); }
+:is(button, a):hover:not(:disabled) .i-grid { transform: rotate(45deg) scale(0.9); }
+:is(button, a):hover:not(:disabled) .i-check { transform: scale(1.2); }
+:is(button, a):hover:not(:disabled) .i-globe { transform: rotate(-20deg); }
+:is(button, a):hover:not(:disabled) .i-sparkles { transform: scale(1.15) rotate(12deg); }
+:is(button, a):hover:not(:disabled) .i-tv { transform: translateY(-1px) scale(1.08); }
+:is(button, a):hover:not(:disabled) .i-sliders { transform: rotate(90deg); }
+:is(label, button):hover .i-search, .search:focus-within .i-search { transform: scale(1.12) rotate(-10deg); }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; }
+  .trow, .stagger > *, .checkbox:checked, .input[aria-invalid='true'] { animation: none; }
+  .ripple { display: none; }
+  svg.icon, .btn { transition-duration: 0.01ms; }
+}

@@ -1,0 +1,15 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>App</title>
+    <meta name="csrf-param" content="_csrf">
+    <meta name="csrf-token" content="c3ludGhldGljLWNzcmYtdG9rZW4tZm9yLXRlc3RzLW9ubHk=">
+    <meta name="description" content="Synthetic single-page app shell used by transport tests.">
+    <link href="/res/css/app.min.css?v=1" rel="stylesheet">
+</head>
+<body>
+    <div id="app-root"></div>
+</body>
+<script src="/res/js/app.min.js?v=1"></script>
+</html>

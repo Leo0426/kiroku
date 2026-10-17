@@ -1,0 +1,6 @@
+import {expect,test} from '@playwright/test'
+import {seedLibrary,overrideApi} from './helpers'
+test('playback validation progress can cancel only its own job before opening player',async({page})=>{
+ await seedLibrary(page);await overrideApi(page,`window.openedPlayer=false;window.cancelledMedia=0;api.play=async(code)=>{const {emitMock}=await import('/src/lib/events.ts');emitMock('media:progress',{jobId:777,root:'/mock/library',code,kind:'play',doneBytes:65536,totalBytes:1048576});return new Promise((resolve,reject)=>window.stopMedia=()=>reject('校验已取消'))};api.jobCancel=async(id)=>{window.cancelledMedia=id;window.stopMedia();return true};`)
+ await page.goto('/');await page.locator('button.pcard').first().click();const panel=page.getByLabel('影片详情',{exact:true});await page.waitForTimeout(500);await panel.getByRole('button',{name:'播放',exact:true}).first().click();await expect(panel.getByRole('status',{name:'媒体校验进度',exact:true})).toBeVisible();await panel.getByRole('button',{name:'取消媒体校验',exact:true}).click();await expect.poll(()=>page.evaluate(()=>(window as any).cancelledMedia)).toBe(777);await expect(panel.getByRole('status',{name:'媒体校验进度',exact:true})).toHaveCount(0);expect(await page.evaluate(()=>(window as any).openedPlayer)).toBe(false);
+})

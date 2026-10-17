@@ -1,0 +1,35 @@
+{
+ "status": "ok",
+ "message": "Challenge solved!",
+ "solution": {
+  "url": "https://lib.example.test/cn/vl_searchbyid.php?keyword=ABC-001",
+  "status": 200,
+  "headers": {},
+  "response": "<!DOCTYPE html>\n<html><head><title>识别码搜寻结果 - Library</title></head>\n<body>\n<div id=\"rightcolumn\">\n  <div class=\"boxtitle\">识别码搜寻结果</div>\n  <div class=\"videothumblist\"><div class=\"videos\">\n    <div class=\"video\" id=\"vid_aaa01\"><a href=\"./vaaa01.html\" title=\"ABC-001 Sample Title 001\"><div class=\"id\">ABC-001</div><img src=\"https://img.example.test/abc001ps.jpg\"><div class=\"title\">Sample Title 001</div></a></div>\n    <div class=\"video\" id=\"vid_aaa02\"><a href=\"./vaaa02.html\" title=\"ABC-001 Sample Title 001 (Blu-ray)\"><div class=\"id\">ABC-001</div><img src=\"https://img.example.test/abc001bdps.jpg\"><div class=\"title\">Sample Title 001 (Blu-ray)</div></a></div>\n    <div class=\"video\" id=\"vid_aaa10\"><a href=\"./vaaa10.html\" title=\"ABC-010 Sample Title 010\"><div class=\"id\">ABC-010</div><img src=\"https://img.example.test/abc010ps.jpg\"><div class=\"title\">Sample Title 010</div></a></div>\n  </div></div>\n</div>\n</body></html>\n",
+  "cookies": [
+   {
+    "domain": ".lib.example.test",
+    "expiry": 1823569810,
+    "httpOnly": true,
+    "name": "cf_clearance",
+    "path": "/",
+    "sameSite": "None",
+    "secure": true,
+    "value": "REDACTED"
+   },
+   {
+    "domain": "lib.example.test",
+    "httpOnly": false,
+    "name": "over18",
+    "path": "/",
+    "sameSite": "Lax",
+    "secure": false,
+    "value": "18"
+   }
+  ],
+  "userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
+ },
+ "startTimestamp": 1792033807509,
+ "endTimestamp": 1792033810719,
+ "version": "3.5.2"
+}
