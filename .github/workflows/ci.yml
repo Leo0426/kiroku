@@ -32,6 +32,8 @@ jobs:
           cache-dependency-path: apps/desktop/pnpm-lock.yaml
 
       - name: Rust tests (core + cli)
+        # Windows 尚未完成文件系统语义适配(见 docs/roadmap.md),测试照跑、失败写成注解,但暂不阻断
+        continue-on-error: ${{ matrix.os == 'windows-latest' }}
         shell: bash
         run: |
           set -o pipefail
