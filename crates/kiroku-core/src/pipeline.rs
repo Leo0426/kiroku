@@ -355,6 +355,7 @@ impl Scraper {
         let source = self.sources.iter().find(|s| s.id() == id).ok_or_else(|| fail(format!("数据源 {id} 不可用")))?;
         let http = self.source_http.get(&id).unwrap_or(&self.http);
         let fetched = tokio::select! {
+            biased; // 已收到停止时，不再轮询可能立即完成的来源请求。
             _ = cancel.cancelled() => return Err(ScrapeError::Cancelled),
             r = source.fetch_detail(url, code, http) => r,
         };
@@ -438,6 +439,7 @@ impl Scraper {
         }
         let requests = fetching.iter().map(|s| s.fetch(code, self.source_http.get(s.id()).unwrap_or(&self.http)));
         let mut fetched = tokio::select! {
+            biased; // on_site 也可能同步取消；取消与来源结果同时就绪时优先取消。
             _ = cancel.cancelled() => return Err(ScrapeError::Cancelled),
             r = futures_util::future::join_all(requests) => r,
         }.into_iter();

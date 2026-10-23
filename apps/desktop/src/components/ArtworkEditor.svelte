@@ -1,6 +1,7 @@
 <script lang="ts">
-  import { onDestroy } from 'svelte'
+  import { onDestroy, untrack } from 'svelte'
   import { fade, scale } from 'svelte/transition'
+  import {cancellableJob,type CancellableJob} from '../lib/cancellable-job'
   import { api } from '../lib/api'
   import { dur } from '../lib/motion'
   import { app } from '../lib/state.svelte'
@@ -25,8 +26,10 @@
   let error = $state('')
   let img: HTMLImageElement | undefined = $state()
   let frame: HTMLDivElement | undefined = $state()
+  let task = $state<CancellableJob<unknown> | null>(null)
   let generation = 0
   let url = ''
+  const openedSettings = untrack(() => app.settings)
 
   const size = $derived.by(() => {
     if (!original) return { width: 1, height: 1 }
@@ -42,17 +45,23 @@
 
   function release() {
     generation++
+    void task?.cancel()
+    task = null
     if (url) URL.revokeObjectURL(url)
     url = ''
   }
-  onDestroy(() => {
-    if (busy) void api.jobCancel()
-    release()
-  })
+  onDestroy(release)
 
   $effect(() => {
     code
-    void open()
+    void untrack(open)
+  })
+
+  $effect(() => {
+    if (app.settings !== openedSettings) untrack(() => {
+      release()
+      onclose()
+    })
   })
 
   async function open() {
@@ -61,8 +70,10 @@
     original = null
     busy = true
     error = ''
+    const request = cancellableJob(id => api.artworkOpen(code,id), e => { if(g===generation) error=String(e) })
+    task = request
     try {
-      const o = await api.artworkOpen(code)
+      const o = await request.promise
       if (g !== generation) return
       url = URL.createObjectURL(new Blob([new Uint8Array(o.image)], { type: 'image/png' }))
       source = url
@@ -75,7 +86,7 @@
     } catch (e) {
       if (g === generation) error = String(e)
     } finally {
-      if (g === generation) busy = false
+      if (g === generation) { task = null; busy = false }
     }
   }
 
@@ -85,9 +96,14 @@
     busy = true
     saving = true
     error = ''
+    const o = original, crop = { ...rect }
+    const request = cancellableJob(id => api.artworkPreview(o.token,o.root,o.code,crop,id), e => { if(g===generation) error=String(e) })
+    task = request
     try {
-      const p = (await api.artworkPreview(original.token, original.root, original.code, { ...rect })).revision
+      const p = (await request.promise).revision
+      if(request.cancelled) return
       if (g !== generation) return
+      task = null
       const r = await api.revisionSave(p.token, p.root, p.code)
       if (g !== generation) return
       if (r.error || r.indexError) {
@@ -100,7 +116,7 @@
     } catch (e) {
       if (g === generation) error = String(e)
     } finally {
-      if (g === generation) { busy = false; saving = false }
+      if (g === generation) { task = null; busy = false; saving = false }
     }
   }
 

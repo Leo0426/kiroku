@@ -2,11 +2,13 @@ mod commands;
 mod state;
 mod pending;
 mod history;
+#[cfg(target_os = "macos")]
+mod macos_shutdown;
 
 use kiroku_core::{logging, settings::Settings};
-use state::AppState;
-use std::{path::Path, time::Duration};
-use tauri::{Manager, RunEvent};
+use state::{AppState, Shutdown};
+use std::path::Path;
+use tauri::{AppHandle, Manager, RunEvent, WindowEvent};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -20,6 +22,8 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .manage(AppState::new(settings))
         .setup(|app| {
+            #[cfg(target_os = "macos")]
+            macos_shutdown::install(app.handle())?;
             // App 内日志:转成 log:line 事件,带上当前任务的 jobId(无任务时为 0)
             let handle = app.handle().clone();
             logging::set_app_sink(Box::new(move |line| {
@@ -34,7 +38,20 @@ pub fn run() {
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![
+        .invoke_handler(command_handler())
+        .build(app_context())
+        .expect("error while building kiroku");
+
+    app.run(handle_run_event);
+}
+
+fn app_context() -> tauri::Context<tauri::Wry> {
+    tauri::generate_context!()
+}
+
+/// Shared with native smoke checks so command names and argument decoding stay real.
+fn command_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync + 'static {
+    tauri::generate_handler![
             commands::get_settings,
             commands::catalog_inventory,
             commands::catalog_preview,
@@ -98,28 +115,38 @@ pub fn run() {
             commands::play,
             commands::reveal,
             commands::open_log_dir,
-        ])
-        .build(tauri::generate_context!())
-        .expect("error while building kiroku");
+        ]
+}
 
-    app.run(|handle, event| {
-        // 用户关闭窗口时若任务仍在运行:先取消并等日志落盘(最多 5 秒)再退出
-        if let RunEvent::ExitRequested { code: None, api, .. } = event {
-            let st = handle.state::<AppState>();
-            if st.job_running() {
-                api.prevent_exit();
-                st.cancel_job();
-                let h = handle.clone();
-                tauri::async_runtime::spawn(async move {
-                    for _ in 0..50 {
-                        if !h.state::<AppState>().job_running() {
-                            break;
-                        }
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                    }
-                    h.exit(0);
-                });
+fn handle_run_event(handle: &AppHandle, event: RunEvent) {
+    match event {
+        RunEvent::WindowEvent { label, event: WindowEvent::CloseRequested { api, .. }, .. }
+            if label == "main" => {
+                if defer_shutdown(handle, 0) { api.prevent_close(); }
             }
+        RunEvent::ExitRequested { code, api, .. } => {
+            if defer_shutdown(handle, code.unwrap_or(0)) { api.prevent_exit(); }
         }
-    });
+        _ => {}
+    }
+}
+
+/// Keep the window/event loop alive until the owning guard finishes disk work.
+/// The close decision also prevents any new job from entering the slot.
+fn defer_shutdown(handle: &AppHandle, exit_code: i32) -> bool {
+    match handle.state::<AppState>().request_shutdown() {
+        Shutdown::Ready => false,
+        Shutdown::Pending => true,
+        Shutdown::Wait => {
+            if let Some(window) = handle.get_webview_window("main") {
+                let _ = window.set_title("kiroku · 正在结束任务，请稍候");
+            }
+            let handle = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                handle.state::<AppState>().wait_for_shutdown().await;
+                handle.exit(exit_code);
+            });
+            true
+        }
+    }
 }

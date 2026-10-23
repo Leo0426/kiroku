@@ -1,5 +1,6 @@
 <script lang="ts">
- import { onDestroy } from 'svelte'
+ import { onDestroy, untrack } from 'svelte'
+ import {cancellableJob,type CancellableJob} from '../lib/cancellable-job'
  import { api } from '../lib/api'
  import { app } from '../lib/state.svelte'
  import { EDITABLE_FIELDS, FIELDS, type Metadata, type MetadataUpdate, type SourceCandidate, type RevisionPreview } from '../lib/types'
@@ -7,9 +8,10 @@
  let opened=$state(false),busy=$state(false),error=$state(''),replace=$state(false),force=$state(false),url=$state('')
  let selected=$state<string[]>(EDITABLE_FIELDS.map(f=>f.key)),sources=$state<Record<string,string>>({}),preview=$state<RevisionPreview|null>(null)
  let candidates=$state<Record<string,SourceCandidate[]>>({})
+ let task=$state<CancellableJob<unknown>|null>(null)
  let generation=0
- onDestroy(()=>{generation++})
- $effect(()=>{meta;app.settings;generation++;opened=false;preview=null;error='';busy=false;candidates={};sources={}})
+ onDestroy(()=>{generation++;void task?.cancel()})
+ $effect(()=>{meta;app.settings;untrack(()=>{generation++;void task?.cancel();task=null;opened=false;preview=null;error='';busy=false;candidates={};sources={}})})
  function text(value:unknown):string { if(value==null)return '（空）';if(Array.isArray(value))return value.map(v=>typeof v==='string'?v:('path' in v ? `${v.path} → ${v.source}（${v.size} 字节，来源校验 ${String(v.source_proof).slice(-12)}）` : v.name)).join('、')||'（空）';return String(value) }
  async function start(){
   opened=true;error='';preview=null;sources={};candidates={};const current=generation;busy=true
@@ -18,8 +20,9 @@
  }
  async function inspect(update:MetadataUpdate){
   const current=generation;busy=true;error=''
-  try{const next=await api.metadataUpdatePreview(meta.code,update);if(current===generation)preview=next}
-  catch(e){if(current===generation)error=String(e)}finally{if(current===generation)busy=false}
+  const request=cancellableJob(id=>api.metadataUpdatePreview(meta.code,update,id),e=>{if(current===generation)error=String(e)});task=request
+  try{const next=await request.promise;if(current===generation&&!request.cancelled)preview=next}
+  catch(e){if(current===generation)error=String(e)}finally{if(current===generation){task=null;busy=false}}
  }
  async function save(){
   if(!preview)return
@@ -51,7 +54,7 @@
  <label class="urlrow">详情页地址（可选）<input class="input" type="url" placeholder="https://javdb.com/v/…" bind:value={url} disabled={busy}/></label>
  <p class="muted">填写后，该站使用这一页的结果（搜索找错时使用），路线上的其他站点照常查询。</p>
  <button class="btn primary" disabled={busy} onclick={()=>inspect({kind:'refresh',fields:selected,replace,force,...(url.trim()?{url:url.trim()}:{})})}>{busy?'更新中…':'预览更新'}</button>
- {#if busy}<button class="btn" onclick={()=>api.jobCancel()}>取消更新任务</button>{/if}
+ {#if busy&&task}<button class="btn" onclick={()=>task?.cancel()}>取消更新任务</button>{/if}
  {#if Object.keys(meta.raw_sources??{}).length}<div aria-label="原站缓存">{#each Object.entries(meta.raw_sources??{}) as [site,snapshot]}<p>{site} · {snapshot.base} · 采集于 {new Date(snapshot.fetched_at*1000).toLocaleString()}</p>{/each}</div>{/if}
  <p class="muted">来源列表仅含当前设置下有效且非空的候选；过期缓存需重新抓取。</p>
  {#if meta.placements?.some(p=>p.mode==='symlink')}<p>媒体软链接依赖来源文件。来源恢复或经确认修改后，可预览更新身份记录；被替换的链接仍会拒绝登记。</p><button class="btn" disabled={busy} onclick={()=>inspect({kind:'revalidateLinks'})}>重新验证媒体链接</button>{/if}

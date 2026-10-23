@@ -30,19 +30,19 @@ import type {
 /** 后端能力的统一接口。Tauri 里走 invoke,浏览器里走 mock 引擎(便于不启动桌面壳就预览/验证界面)。 */
 export interface Api {
   recoveryInspect():Promise<RecoveryReport>
-  catalogInventory():Promise<CatalogInventory>
-  catalogPreview(dirs:string[]):Promise<CatalogPreview>
-  catalogApply(token:string):Promise<CatalogResult>
-  maintenancePreview(includeRecent?:boolean):Promise<MaintenancePreview>
-  maintenanceApply(token:string,selected:string[]):Promise<MaintenanceResult>
-  libraryHealth():Promise<HealthReport>
+  catalogInventory(requestId?:string):Promise<CatalogInventory>
+  catalogPreview(dirs:string[],requestId?:string):Promise<CatalogPreview>
+  catalogApply(token:string,requestId?:string):Promise<CatalogResult>
+  maintenancePreview(includeRecent?:boolean,requestId?:string):Promise<MaintenancePreview>
+  maintenanceApply(token:string,selected:string[],requestId?:string):Promise<MaintenanceResult>
+  libraryHealth(requestId?:string):Promise<HealthReport>
   revealLibraryPath(path:string):Promise<void>
-  sourcesCheck(ids?:string[], draft?:Settings):Promise<SourceCheck[]>
+  sourcesCheck(ids?:string[], draft?:Settings, requestId?:string):Promise<SourceCheck[]>
   pickMediaFiles():Promise<string[]>
-  appendTargetVideos(code:string,target:string):Promise<string[]>
-  appendTargets(code:string):Promise<string[]>
-  appendPreview(code:string,inputs:string[],target?:string,video?:string):Promise<AppendPreview>
-  appendApply(token:string):Promise<AppendResult>
+  appendTargetVideos(code:string,target:string,requestId?:string):Promise<string[]>
+  appendTargets(code:string,requestId?:string):Promise<string[]>
+  appendPreview(code:string,inputs:string[],target?:string,video?:string,requestId?:string):Promise<AppendPreview>
+  appendApply(token:string,requestId?:string):Promise<AppendResult>
   getSettings(): Promise<Settings>
   defaultSettings(): Promise<Settings>
   settingsPath(): Promise<string>
@@ -98,21 +98,21 @@ export interface Api {
   libraryTrash(code: string, keepMedia: boolean): Promise<TrashResult>
   repairImagesStart(code: string): Promise<number>
   metadataSourceCandidates(code: string): Promise<Record<string, SourceCandidate[]>>
-  nfoExportPreview(codes:string[],language:NfoLanguage):Promise<LanguageBatchPreview>
-  nfoExportApply(token:string,root:string):Promise<LanguageBatchResult>
+  nfoExportPreview(codes:string[],language:NfoLanguage,requestId?:string):Promise<LanguageBatchPreview>
+  nfoExportApply(token:string,root:string,requestId?:string):Promise<LanguageBatchResult>
   templatePreview(directory:string,file:string): Promise<TemplatePreview>
-  metadataUpdatePreview(code: string, update: MetadataUpdate): Promise<RevisionPreview>
-  artworkOpen(code:string):Promise<ArtworkOriginal>
-  artworkPreview(token:string,root:string,code:string,crop:CropBox):Promise<ArtworkPreview>
+  metadataUpdatePreview(code: string, update: MetadataUpdate, requestId?:string): Promise<RevisionPreview>
+  artworkOpen(code:string,requestId?:string):Promise<ArtworkOriginal>
+  artworkPreview(token:string,root:string,code:string,crop:CropBox,requestId?:string):Promise<ArtworkPreview>
   revisionPreview(code: string, patch: Record<string, unknown>): Promise<RevisionPreview>
   revisionSave(token: string, root: string, code: string): Promise<RevisionResult>
   openSourceUrl(url: string): Promise<void>
   libraryFacets(): Promise<Facets>
   libraryRebuild(): Promise<number>
 
-  /** Media validation emits media:progress; cancel its jobId with jobCancel before opener runs. */
-  play(code: string, part?: number): Promise<void>
-  reveal(code: string, part?: number): Promise<void>
+  /** job:started establishes ownership; media:progress reports validation before opening. */
+  play(code: string, part?: number, requestId?: string): Promise<void>
+  reveal(code: string, part?: number, requestId?: string): Promise<void>
   /** 打开日志文件夹(<设置目录>/logs) */
   openLogDir(): Promise<void>
 
@@ -123,19 +123,19 @@ export interface Api {
 async function tauriApi(): Promise<Api> {
   const { invoke, convertFileSrc } = await import('@tauri-apps/api/core')
   return {
-    catalogInventory:()=>invoke('catalog_inventory'),
-    catalogPreview:(dirs)=>invoke('catalog_preview',{dirs}),
-    catalogApply:(token)=>invoke('catalog_apply',{token}),
-    maintenancePreview:(includeRecent=false)=>invoke('maintenance_preview',{includeRecent}),
-    maintenanceApply:(token,selected)=>invoke('maintenance_apply',{token,selected}),
-    libraryHealth:()=>invoke('library_health'),
+    catalogInventory:(requestId)=>invoke('catalog_inventory',{requestId}),
+    catalogPreview:(dirs,requestId)=>invoke('catalog_preview',{dirs,requestId}),
+    catalogApply:(token,requestId)=>invoke('catalog_apply',{token,requestId}),
+    maintenancePreview:(includeRecent=false,requestId)=>invoke('maintenance_preview',{includeRecent,requestId}),
+    maintenanceApply:(token,selected,requestId)=>invoke('maintenance_apply',{token,selected,requestId}),
+    libraryHealth:(requestId)=>invoke('library_health',{requestId}),
     revealLibraryPath:(path)=>invoke('reveal_library_path',{path}),
-    sourcesCheck:(ids,draft)=>invoke('sources_check',{ids,draft}),
+    sourcesCheck:(ids,draft,requestId)=>invoke('sources_check',{ids,draft,requestId}),
     pickMediaFiles:()=>invoke('pick_media_files'),
-    appendTargetVideos:(code,target)=>invoke('append_target_videos',{code,target}),
-    appendTargets:(code)=>invoke('append_targets',{code}),
-    appendPreview:(code,inputs,target,video)=>invoke('append_preview',{code,inputs,target,video}),
-    appendApply:(token)=>invoke('append_apply',{token}),
+    appendTargetVideos:(code,target,requestId)=>invoke('append_target_videos',{code,target,requestId}),
+    appendTargets:(code,requestId)=>invoke('append_targets',{code,requestId}),
+    appendPreview:(code,inputs,target,video,requestId)=>invoke('append_preview',{code,inputs,target,video,requestId}),
+    appendApply:(token,requestId)=>invoke('append_apply',{token,requestId}),
     getSettings: () => invoke('get_settings'),
     defaultSettings: () => invoke('default_settings'),
     settingsPath: () => invoke('settings_path'),
@@ -172,19 +172,19 @@ async function tauriApi(): Promise<Api> {
     libraryTrash: (code, keepMedia) => invoke('library_trash', { code, keepMedia }),
     repairImagesStart: (code) => invoke('repair_images_start', { code }),
     metadataSourceCandidates: (code) => invoke('metadata_source_candidates', { code }),
-    nfoExportPreview:(codes,language)=>invoke('nfo_export_preview',{codes,language}),
-    nfoExportApply:(token,root)=>invoke('nfo_export_apply',{token,root}),
+    nfoExportPreview:(codes,language,requestId)=>invoke('nfo_export_preview',{codes,language,requestId}),
+    nfoExportApply:(token,root,requestId)=>invoke('nfo_export_apply',{token,root,requestId}),
     templatePreview: (directory,file) => invoke('template_preview', {directory,file}),
-    metadataUpdatePreview: (code, update) => invoke('metadata_update_preview', { code, update }),
-    artworkOpen: (code) => invoke('artwork_open', { code }),
-    artworkPreview: (token,root,code,crop) => invoke('artwork_preview', {token,root,code,crop}),
+    metadataUpdatePreview: (code, update,requestId) => invoke('metadata_update_preview', { code, update,requestId}),
+    artworkOpen: (code,requestId) => invoke('artwork_open', { code,requestId}),
+    artworkPreview: (token,root,code,crop,requestId) => invoke('artwork_preview', {token,root,code,crop,requestId}),
     revisionPreview: (code, patch) => invoke('revision_preview', { code, patch }),
     revisionSave: (token, root, code) => invoke('revision_save', { token, root, code }),
     openSourceUrl: (url) => invoke('open_source_url', { url }),
     libraryFacets: () => invoke('library_facets'),
     libraryRebuild: () => invoke('library_rebuild'),
-    play: (code, part) => invoke('play', { code, part }),
-    reveal: (code, part) => invoke('reveal', { code, part }),
+    play: (code, part, requestId) => invoke('play', { code, part, requestId }),
+    reveal: (code, part, requestId) => invoke('reveal', { code, part, requestId }),
     openLogDir: () => invoke('open_log_dir'),
     // A revision replaces bytes at the same path; refreshed cards must request new bytes.
     posterUrl: (path, revision) => assetUrl(path, revision, convertFileSrc),

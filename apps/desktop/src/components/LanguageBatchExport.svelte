@@ -1,22 +1,41 @@
 <script lang="ts">
- import { onDestroy } from 'svelte'
+ import { onDestroy, untrack } from 'svelte'
  import { listen } from '../lib/events'
+ import {cancellableJob,type CancellableJob} from '../lib/cancellable-job'
  import { api } from '../lib/api'
  import { app } from '../lib/state.svelte'
  import type { Query,MovieCard,NfoLanguage,LanguageBatchPreview,LanguageBatchResult } from '../lib/types'
  let {query}:{query:Query}=$props()
  let opened=$state(false),movies=$state<MovieCard[]>([]),selected=$state<string[]>([]),language=$state<NfoLanguage>('current'),preview=$state<LanguageBatchPreview|null>(null),result=$state<LanguageBatchResult|null>(null),error=$state(''),busy=$state(false),more=$state(false)
  let completed=$state(0),failures=$state(0)
- let generation=0;onDestroy(()=>generation++)
- $effect(()=>{app.settings?.library_root;generation++;opened=false;preview=null;result=null;selected=[];error=''})
+ let task=$state<CancellableJob<unknown>|null>(null)
+ let generation=0;onDestroy(()=>{generation++;void task?.cancel()})
+ $effect(()=>{app.settings;untrack(()=>{generation++;void task?.cancel();task=null;opened=false;preview=null;result=null;selected=[];error='';busy=false;completed=0;failures=0})})
  async function start(){const current=generation;opened=true;busy=true;error='';try{const page=await api.libraryList({...query,offset:0,limit:200});if(current===generation){movies=page.items;more=page.total>movies.length;selected=[];preview=null;result=null}}catch(e){if(current===generation)error=String(e)}finally{if(current===generation)busy=false}}
- async function inspect(){const current=generation;busy=true;error='';try{const p=await api.nfoExportPreview(selected,language);if(current===generation)preview=p}catch(e){if(current===generation)error=String(e)}finally{if(current===generation)busy=false}}
- async function save(){if(!preview)return;const current=generation,p=preview;busy=true;completed=0;failures=0;error='';try{const r=await api.nfoExportApply(p.token,p.root);if(current===generation){result=r;preview=null;app.libraryVersion++}}catch(e){if(current===generation){error=String(e);preview=null}}finally{if(current===generation)busy=false}}
- async function undo(){if(!result)return;busy=true;error='';try{for(const item of result.results){const r=await api.rollback(item.journalId);if(r.failures.length||r.indexError)throw [...r.failures,r.indexError].filter(Boolean).join('；')}result=null;app.libraryVersion++}catch(e){error=String(e)}finally{busy=false}}
- $effect(()=>{let alive=true,stop:(()=>void)|undefined;listen('nfo:export',event=>{if(busy){completed=event.completed;failures=event.failed}}).then(fn=>{if(alive)stop=fn;else fn()});return()=>{alive=false;stop?.()}})
+ async function inspect(){
+  const current=generation;busy=true;error=''
+  const request=cancellableJob(id=>api.nfoExportPreview(selected,language,id),e=>{if(current===generation)error=String(e)});task=request
+  try{const p=await request.promise;if(current===generation&&!request.cancelled)preview=p}
+  catch(e){if(current===generation)error=String(e)}finally{if(current===generation){task=null;busy=false}}
+ }
+ async function save(){
+  if(!preview)return
+  const current=generation,p=preview;busy=true;completed=0;failures=0;error=''
+  const request=cancellableJob(id=>api.nfoExportApply(p.token,p.root,id),e=>{if(current===generation)error=String(e)});task=request
+  try{const r=await request.promise;if(current===generation){result=r;preview=null;app.libraryVersion++}}
+  catch(e){if(current===generation){error=String(e);preview=null}}finally{if(current===generation){task=null;busy=false}}
+ }
+ async function undo(){
+  if(!result)return
+  const current=generation,items=result.results;busy=true;error=''
+  try{for(const item of items){const r=await api.rollback(item.journalId);if(r.failures.length||r.indexError)throw [...r.failures,r.indexError].filter(Boolean).join('；')}
+   if(current===generation){result=null;app.libraryVersion++}
+  }catch(e){if(current===generation)error=String(e)}finally{if(current===generation)busy=false}
+ }
+ $effect(()=>{let alive=true,stop:(()=>void)|undefined;listen('nfo:export',event=>{if(task?.jobId===event.jobId){completed=event.completed;failures=event.failed}}).then(fn=>{if(alive)stop=fn;else fn()});return()=>{alive=false;stop?.()}})
 </script>
 <section aria-label="批量 NFO 语言导出">
- <button class="btn" onclick={start}>批量导出 NFO 语言</button>
+ <button class="btn" onclick={start} disabled={busy}>批量导出 NFO 语言</button>
  {#if opened}
  <h3>选择影片与 NFO 语言</h3>
  {#if more}<p>仅列出当前筛选的前 200 部，请用媒体库搜索缩小范围。</p>{/if}
@@ -30,7 +49,7 @@
  <fieldset disabled={busy}><legend>影片</legend>{#each movies as movie}<label><input type="checkbox" value={movie.code} bind:group={selected}/>{movie.code} {movie.title??''}</label>{/each}</fieldset>
  <button class="btn" disabled={busy||!selected.length} onclick={inspect}>预览批量 NFO 导出</button>
  {/if}
- {#if busy}<p role="status">已导出 {completed} 部，失败 {failures} 部</p><button class="btn" onclick={()=>api.jobCancel()}>取消导出任务</button>{/if}<button class="btn ghost" disabled={busy} onclick={()=>opened=false}>关闭语言导出</button>
+ {#if busy&&task}<p role="status">已导出 {completed} 部，失败 {failures} 部</p><button class="btn" onclick={()=>task?.cancel()}>取消导出任务</button>{/if}<button class="btn ghost" disabled={busy} onclick={()=>opened=false}>关闭语言导出</button>
  {/if}
  {#if error}<p role="alert">{error}</p>{/if}
 </section>

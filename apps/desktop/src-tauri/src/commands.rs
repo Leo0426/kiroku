@@ -946,8 +946,12 @@ fn movie_path(state: &AppState, code: &str, part: Option<u8>,cancel:&tokio_util:
 }
 
 // IPC runs this blocking validation off the UI thread; the existing media API reports job progress.
-fn open_media(app:AppHandle,state:&AppState,code:String,part:Option<u8>,kind:&'static str)->CmdResult<()> {
-    let (id,cancel)=state.begin_job(kind)?;let _guard=JobGuard{app:app.clone(),id};
+fn open_media(app:AppHandle,state:&AppState,code:String,part:Option<u8>,kind:&'static str,request_id:Option<String>)->CmdResult<()> {
+    let (id,cancel)=reliability::begin_reported_job(state,kind,request_id,|id,request_id|{
+        emit(&app,"job:started",id,serde_json::json!({"requestId":request_id}));
+    })?;
+    let _guard=JobGuard{app:app.clone(),id};
+    if cancel.is_cancelled(){return Err("媒体校验已取消".into())}
     let root=state.library_root().ok_or("请先设置媒体库目录")?.display().to_string();
     let report=|done:u64,total:u64|emit(&app,"media:progress",id,serde_json::json!({"root":root,"code":code,"kind":kind,"doneBytes":done,"totalBytes":total}));
     report(0,0);
@@ -958,7 +962,7 @@ fn open_media(app:AppHandle,state:&AppState,code:String,part:Option<u8>,kind:&'s
     else{app.opener().reveal_item_in_dir(path).map_err(|e|e.to_string())}
 }
 #[tauri::command(async)]
-pub fn play(app:AppHandle,state:State<'_,AppState>,code:String,part:Option<u8>)->CmdResult<()>{open_media(app,&state,code,part,"play")}
+pub fn play(app:AppHandle,state:State<'_,AppState>,code:String,part:Option<u8>,request_id:Option<String>)->CmdResult<()>{open_media(app,&state,code,part,"play",request_id)}
 
 /// 打开日志文件夹(不存在时先创建)。
 #[tauri::command(async)]
@@ -970,8 +974,8 @@ pub fn open_log_dir(app: AppHandle) -> CmdResult<()> {
 
 /// 在 Finder / 资源管理器中显示。
 #[tauri::command(async)]
-pub fn reveal(app: AppHandle, state: State<'_, AppState>, code: String, part: Option<u8>) -> CmdResult<()> {
-    open_media(app,&state,code,part,"reveal")
+pub fn reveal(app: AppHandle, state: State<'_, AppState>, code: String, part: Option<u8>, request_id: Option<String>) -> CmdResult<()> {
+    open_media(app,&state,code,part,"reveal",request_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -1666,8 +1670,11 @@ pub async fn metadata_update_preview(
     state: State<'_, AppState>,
     code: String,
     update: MetadataUpdate,
+    request_id: Option<String>,
 ) -> CmdResult<RevisionPreview> {
-    let (id, cancel) = state.begin_job("metadata-update")?;
+    let (id, cancel) = reliability::begin_reported_job(&state, "metadata-update", request_id, |id, request_id| {
+        emit(&app, "job:started", id, serde_json::json!({"requestId":request_id}));
+    })?;
     let guard = JobGuard {
         app: app.clone(),
         id,
@@ -1791,9 +1798,12 @@ pub async fn artwork_open(
     app: AppHandle,
     state: State<'_, AppState>,
     code: String,
+    request_id: Option<String>,
 ) -> CmdResult<ArtworkOriginal> {
     use kiroku_core::artwork;
-    let (id, cancel) = state.begin_job("artwork-open")?;
+    let (id, cancel) = reliability::begin_reported_job(&state, "artwork-open", request_id, |id, request_id| {
+        emit(&app, "job:started", id, serde_json::json!({"requestId":request_id}));
+    })?;
     let guard = JobGuard {
         app: app.clone(),
         id,
@@ -1966,8 +1976,11 @@ pub async fn artwork_preview(
     root: String,
     code: String,
     crop: kiroku_core::artwork::CropBox,
+    request_id: Option<String>,
 ) -> CmdResult<ArtworkPreview> {
-    let (id, cancel) = state.begin_job("artwork-preview")?;
+    let (id, cancel) = reliability::begin_reported_job(&state, "artwork-preview", request_id, |id, request_id| {
+        emit(&app, "job:started", id, serde_json::json!({"requestId":request_id}));
+    })?;
     let guard = JobGuard {
         app: app.clone(),
         id,
@@ -2068,8 +2081,10 @@ pub struct LanguageBatchPreview { token:String, root:String, items:Vec<RevisionP
 #[serde(rename_all="camelCase")]
 pub struct LanguageBatchResult { job_id:u64, results:Vec<RevisionResult>, failed:Vec<String>, cancelled:bool }
 #[tauri::command]
-pub async fn nfo_export_preview(app:AppHandle,state:State<'_,AppState>,codes:Vec<String>,language:kiroku_core::localization::NfoLanguage)->CmdResult<LanguageBatchPreview> {
- let (id,cancel)=state.begin_job("nfo-export-preview")?;let job_guard=JobGuard{app:app.clone(),id};
+pub async fn nfo_export_preview(app:AppHandle,state:State<'_,AppState>,codes:Vec<String>,language:kiroku_core::localization::NfoLanguage,request_id:Option<String>)->CmdResult<LanguageBatchPreview> {
+ let (id,cancel)=reliability::begin_reported_job(&state, "nfo-export-preview", request_id, |id, request_id| {
+        emit(&app, "job:started", id, serde_json::json!({"requestId":request_id}));
+    })?;let job_guard=JobGuard{app:app.clone(),id};
  let root=state.library_root().ok_or("请先设置媒体库")?;let settings=state.settings();
  let result=tauri::async_runtime::spawn_blocking(move||->CmdResult<_>{
   let state=app.state::<AppState>();let guard=kiroku_core::pipeline::RootGuard::capture(&root,false).map_err(|e|e.to_string())?;
@@ -2081,14 +2096,17 @@ pub async fn nfo_export_preview(app:AppHandle,state:State<'_,AppState>,codes:Vec
   }
   let _writer=state.settings_writer.lock().unwrap_or_else(|e|e.into_inner());
   if state.settings()!=settings||state.library_root()!=Some(root.clone()){return Err("媒体库或设置已变化，请重新预览".into());}guard.verify().map_err(|e|e.to_string())?;
+  if cancel.is_cancelled(){return Err("已取消".into());}
   let token=id.to_string();let items=previews.iter().map(|p|RevisionPreview{token:token.clone(),preview:p.clone()}).collect();
   *state.language_export.lock().unwrap_or_else(|e|e.into_inner())=Some(crate::state::PendingLanguageExport{token:token.clone(),root:root.clone(),settings,previews,guard});
   Ok(LanguageBatchPreview{token,root:root.to_string_lossy().into_owned(),items})
  }).await.map_err(|e|e.to_string())?;drop(job_guard);result
 }
 #[tauri::command]
-pub async fn nfo_export_apply(app:AppHandle,state:State<'_,AppState>,token:String,root:String)->CmdResult<LanguageBatchResult> {
- let (id,cancel)=state.begin_job("nfo-export-apply")?;let job_guard=JobGuard{app:app.clone(),id};
+pub async fn nfo_export_apply(app:AppHandle,state:State<'_,AppState>,token:String,root:String,request_id:Option<String>)->CmdResult<LanguageBatchResult> {
+ let (id,cancel)=reliability::begin_reported_job(&state, "nfo-export-apply", request_id, |id, request_id| {
+        emit(&app, "job:started", id, serde_json::json!({"requestId":request_id}));
+    })?;let job_guard=JobGuard{app:app.clone(),id};
  let result=tauri::async_runtime::spawn_blocking(move||->CmdResult<_>{
   let state=app.state::<AppState>();let _writer=state.settings_writer.lock().unwrap_or_else(|e|e.into_inner());
   let pending=state.language_export.lock().unwrap_or_else(|e|e.into_inner()).take().filter(|p|p.token==token).ok_or("预览已过期，请重新预览")?;

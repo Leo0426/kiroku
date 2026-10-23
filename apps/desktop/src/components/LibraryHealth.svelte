@@ -1,18 +1,26 @@
 <script lang="ts">
- import {onDestroy} from 'svelte'
+ import {onDestroy,untrack} from 'svelte'
  import {api} from '../lib/api'
+ import {cancellableJob,type CancellableJob} from '../lib/cancellable-job'
  import {app} from '../lib/state.svelte'
  import {repairFlow} from '../lib/repairflow.svelte'
  import type {HealthReport,HealthIssue} from '../lib/types'
+ let task=$state<CancellableJob<unknown>|null>(null)
  let {onopen}:{onopen:(code:string)=>void}=$props()
  let report=$state<HealthReport|null>(null),busy=$state(false),error=$state(''),filter=$state('')
- let generation=0;onDestroy(()=>generation++);$effect(()=>{app.settings?.library_root;generation++;report=null;error='';busy=false})
+ let generation=0;onDestroy(()=>{generation++;void task?.cancel()});$effect(()=>{app.settings?.library_root;untrack(()=>{generation++;void task?.cancel();task=null;report=null;error='';busy=false})})
  const repairHere=$derived(repairFlow.root===app.settings?.library_root&&repairFlow.origin==='health')
- async function scan(){const g=generation;busy=true;error='';try{const next=await api.libraryHealth();if(g===generation)report=next}catch(e){if(g===generation)error=String(e)}finally{if(g===generation)busy=false}}
+ async function scan(){
+  if(busy)return
+  const g=generation;busy=true;error=''
+  const request=cancellableJob(id=>api.libraryHealth(id),e=>{if(g===generation)error=String(e)});task=request
+  try{const next=await request.promise;if(g===generation)report=next}
+  catch(e){if(g===generation)error=String(e)}finally{if(g===generation){busy=false;task=null}}
+ }
  async function action(i:HealthIssue){const g=generation;try{if(i.action==='rebuildIndex'){await app.rebuildIndex();if(g===generation)app.toast('info','索引重建完成后，请重新检查')}else if(i.action==='repairImages'&&i.code)await repairFlow.start(i.code,'health');else await api.revealLibraryPath(i.dir)}catch(e){if(g===generation)error=String(e)}}
  async function reveal(i:HealthIssue){try{await api.revealLibraryPath(i.dir)}catch(e){error=String(e)}}
 </script>
-<section aria-label="媒体库健康检查"><button class="btn" disabled={busy||repairFlow.running} onclick={scan}>{busy?'正在检查媒体库…':'检查媒体库'}</button>{#if busy}<button class="btn" onclick={()=>api.jobCancel()}>停止检查</button>{/if}
+<section aria-label="媒体库健康检查"><button class="btn" disabled={busy||repairFlow.running} onclick={scan}>{busy?'正在检查媒体库…':'检查媒体库'}</button>{#if busy}<button class="btn" onclick={()=>task?.cancel()}>停止检查</button>{/if}
  {#if repairHere&&repairFlow.running}<p role="status">{repairFlow.code} 正在补图…</p><button class="btn" onclick={()=>repairFlow.cancel()}>停止补图</button>{/if}
  {#if repairHere&&repairFlow.error}<p role="alert">补图失败：{repairFlow.error}</p>{/if}
  {#if repairHere&&repairFlow.result}{@const r=repairFlow.result}<div aria-label="健康检查补图结果"><p role="status">{r.code} {r.cancelled?'补图已停止':r.failed.length?'补图失败':'补图完成'}：写入 {r.written} 张图片。</p>{#each r.failed as failure}<p role="alert">{failure[1]}</p>{/each}{#each r.warnings as warning}<p>{warning}</p>{/each}{#if r.indexError}<p role="alert">索引更新失败：{r.indexError}</p>{/if}</div>{/if}

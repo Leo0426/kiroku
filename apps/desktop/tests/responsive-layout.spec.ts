@@ -60,7 +60,12 @@ test('all main pages and settings categories fit compact and large windows with 
   await page.goto('/');await page.locator('button.pcard').first().click();const panel=page.getByLabel('影片详情',{exact:true});
   for(const width of [480,720,820,960,1440]){
     await page.setViewportSize({width,height:600});await fits(page);
-    const box=await panel.boundingBox();if(width<=720){const nav=await page.getByRole('navigation',{name:'主导航'}).boundingBox();expect(box!.y+box!.height).toBeLessThanOrEqual(nav!.y+1)}
+    // Even reduced-motion CSS transitions settle on the next animation frame after resize.
+    // Read both bounds together and wait for the required layout, without a fixed delay.
+    if(width<=720) await expect.poll(() => panel.evaluate(el => {
+      const nav = document.querySelector('[aria-label="主导航"]')!
+      return el.getBoundingClientRect().bottom - nav.getBoundingClientRect().top
+    })).toBeLessThanOrEqual(1)
     await panel.getByRole('button',{name:'编辑元数据',exact:true}).click();await fits(page);
     await panel.getByRole('button',{name:'取消编辑',exact:true}).click();
     if(width===480) await page.screenshot({path:'/tmp/kiroku-responsive-detail.png'});

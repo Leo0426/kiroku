@@ -18,9 +18,12 @@ pub struct CatalogResult {
 pub async fn catalog_inventory(
     app: AppHandle,
     state: State<'_, AppState>,
+    request_id: Option<String>,
 ) -> CmdResult<catalog::Inventory> {
     let root = state.library_root().ok_or("请先设置媒体库")?;
-    let (id, cancel) = state.begin_job("catalog-inventory")?;
+    let (id, cancel) = reliability::begin_reported_job(&state, "catalog-inventory", request_id, |id, request_id| {
+        emit(&app, "job:started", id, serde_json::json!({"requestId":request_id}));
+    })?;
     let _guard = JobGuard {
         app: app.clone(),
         id,
@@ -42,10 +45,13 @@ pub async fn catalog_preview(
     app: AppHandle,
     state: State<'_, AppState>,
     dirs: Vec<PathBuf>,
+    request_id: Option<String>,
 ) -> CmdResult<CatalogEnvelope> {
     let root = state.library_root().ok_or("请先设置媒体库")?;
     let settings = state.settings();
-    let (id, cancel) = state.begin_job("catalog-preview")?;
+    let (id, cancel) = reliability::begin_reported_job(&state, "catalog-preview", request_id, |id, request_id| {
+        emit(&app, "job:started", id, serde_json::json!({"requestId":request_id}));
+    })?;
     let _guard = JobGuard {
         app: app.clone(),
         id,
@@ -80,8 +86,11 @@ pub async fn catalog_apply(
     app: AppHandle,
     state: State<'_, AppState>,
     token: String,
+    request_id: Option<String>,
 ) -> CmdResult<CatalogResult> {
-    let (id, cancel) = state.begin_job("catalog-apply")?;
+    let (id, cancel) = reliability::begin_reported_job(&state, "catalog-apply", request_id, |id, request_id| {
+        emit(&app, "job:started", id, serde_json::json!({"requestId":request_id}));
+    })?;
     let _guard = JobGuard {
         app: app.clone(),
         id,

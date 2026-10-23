@@ -2,7 +2,7 @@ import {RecoveryStore} from './recovery.svelte'
 import { api } from './api'
 import { listen } from './events'
 import { notifyFinish, rebuildNotice } from './notify'
-import type { MediaDirs, Settings } from './types'
+import type { MediaDirs, ProgressEvent, RebuiltEvent, Settings } from './types'
 
 export interface ConfirmOptions {
   title: string
@@ -17,6 +17,13 @@ export interface Toast {
   id: number
   kind: 'info' | 'ok' | 'error'
   text: string
+  action?: { label: string; run: () => void }
+}
+
+interface RebuildTask {
+  root: string
+  jobId: number | null
+  early: Map<number, { progress?: ProgressEvent; complete?: RebuiltEvent }>
 }
 
 class AppStore {
@@ -44,8 +51,7 @@ class AppStore {
   beforeNavigate: (() => boolean | Promise<boolean>) | null = null
   /** 正在等离开确认时用户又点了别的页:只记住最后一次点击,确认后去那里 */
   private pendingView: View | null = null
-  private rebuildId: number | null = null
-  private rebuilding = false
+  private rebuildTask: RebuildTask | null = null
 
   async init() {
     if (this.ready) return
@@ -56,20 +62,9 @@ class AppStore {
       unlisten.push(await listen('library:changed', () => {
         this.libraryVersion++
       }))
-      unlisten.push(await listen('library:progress', (e) => {
-        if (!this.acceptRebuild(e)) return
-        this.rebuild = { running: true, done: e.done, total: e.total }
-      }))
+      unlisten.push(await listen('library:progress', (e) => this.onRebuildEvent(e)))
       for (const event of ['plex:refreshed', 'server:refreshed'] as const) unlisten.push(await listen(event, (e) => { if (e.root === this.settings?.library_root) this.toast(e.ok ? 'ok' : 'error', e.message, e.ok ? 3200 : 6000) }))
-      unlisten.push(await listen('library:rebuilt', (e) => {
-        if (!this.acceptRebuild(e)) return
-        this.rebuilding = false
-        this.rebuildId = null
-        this.rebuild = { running: false, done: 0, total: 0 }
-        this.toast(e.error ? 'error' : 'ok', e.error ? `索引重建失败：${e.error}` : e.cancelled ? '已取消重建，保留原索引' : `索引已重建:${e.count} 部影片`)
-        notifyFinish(rebuildNotice(e))
-        this.libraryVersion++
-      }))
+      unlisten.push(await listen('library:rebuilt', (e) => this.onRebuildEvent(e)))
       this.ready = true
       void this.recovery.refresh()
     } catch (e) {
@@ -78,10 +73,12 @@ class AppStore {
     }
   }
 
-  toast(kind: Toast['kind'], text: string, ms = 3200) {
+  /** A zero duration keeps an actionable notice until dismissed or resolved. */
+  toast(kind: Toast['kind'], text: string, ms = 3200, action?: Toast['action']): number {
     const id = this.nextToast++
-    this.toasts = [...this.toasts, { id, kind, text }]
-    setTimeout(() => this.dismiss(id), ms)
+    this.toasts = [...this.toasts, { id, kind, text, action }]
+    if (ms > 0) setTimeout(() => this.dismiss(id), ms)
+    return id
   }
 
   dismiss(id: number) {
@@ -193,25 +190,48 @@ class AppStore {
     return home && p.startsWith(home) ? '~' + p.slice(home.length) : p
   }
 
-  private acceptRebuild(e: { jobId: number; root: string }): boolean {
-    if (!this.rebuilding || e.root !== this.settings?.library_root) return false
-    this.rebuildId ??= e.jobId
-    return this.rebuildId === e.jobId
+  private onRebuildEvent(e: ProgressEvent | RebuiltEvent) {
+    const task = this.rebuildTask
+    if (!task || e.root !== task.root) return
+    if (task.jobId === null) {
+      // A start response owns the task. Events can arrive first but cannot claim it.
+      const early = task.early.get(e.jobId) ?? {}
+      if ('count' in e) early.complete ??= e
+      else early.progress = e
+      task.early.set(e.jobId, early)
+      return
+    }
+    if (e.jobId !== task.jobId) return
+    if (!('count' in e)) {
+      this.rebuild = { running: true, done: e.done, total: e.total }
+      return
+    }
+    this.rebuildTask = null
+    this.rebuild = { running: false, done: 0, total: 0 }
+    if (task.root !== this.settings?.library_root) return
+    this.toast(e.error ? 'error' : 'ok', e.error ? `索引重建失败：${e.error}` : e.cancelled ? '已取消重建，保留原索引' : `索引已重建:${e.count} 部影片`)
+    notifyFinish(rebuildNotice(e))
+    this.libraryVersion++
   }
 
   async rebuildIndex() {
-    if (this.rebuild.running) return
-    this.rebuilding = true
-    this.rebuildId = null
+    if (this.rebuildTask) return
+    const task: RebuildTask = { root: this.settings?.library_root ?? '', jobId: null, early: new Map() }
+    this.rebuildTask = task
+    this.rebuild = { running: true, done: 0, total: 0 }
     try {
-      this.rebuild = { running: true, done: 0, total: 0 }
       const id = await api.libraryRebuild()
-      if (this.rebuilding) this.rebuildId ??= id
+      if (this.rebuildTask !== task) return
+      task.jobId = id
+      const early = task.early.get(id)
+      task.early.clear()
+      const event = early?.complete ?? early?.progress
+      if (event) this.onRebuildEvent(event)
     } catch (e) {
-      this.rebuilding = false
-      this.rebuildId = null
+      if (this.rebuildTask !== task) return
+      this.rebuildTask = null
       this.rebuild = { running: false, done: 0, total: 0 }
-      this.toast('error', String(e), 5000)
+      if (task.root === this.settings?.library_root) this.toast('error', String(e), 5000)
     }
   }
 }

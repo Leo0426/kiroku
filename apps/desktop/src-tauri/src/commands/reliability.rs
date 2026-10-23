@@ -1,5 +1,17 @@
 use super::*;
 use kiroku_core::append;
+
+/// Announce only after owning the slot, before any awaited or blocking work.
+pub(super) fn begin_reported_job(
+    state: &AppState,
+    kind: &'static str,
+    request_id: Option<String>,
+    started: impl FnOnce(u64, String),
+) -> CmdResult<(u64, tokio_util::sync::CancellationToken)> {
+    let (id, cancel) = state.begin_job(kind)?;
+    if let Some(request_id) = request_id { started(id, request_id); }
+    Ok((id, cancel))
+}
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppendEnvelope {
@@ -34,9 +46,12 @@ pub async fn append_targets(
     app: AppHandle,
     state: State<'_, AppState>,
     code: String,
+    request_id: Option<String>,
 ) -> CmdResult<Vec<PathBuf>> {
     let root = state.library_root().ok_or("请先设置媒体库")?;
-    let (id, cancel) = state.begin_job("append-preview")?;
+    let (id, cancel) = begin_reported_job(&state, "append-preview", request_id, |id, request_id| {
+        emit(&app, "job:started", id, serde_json::json!({"requestId":request_id}));
+    })?;
     let _guard = JobGuard { app, id };
     tauri::async_runtime::spawn_blocking(move || {
         append::targets_cancellable(&root, &code, &cancel).map_err(|e| e.to_string())
@@ -52,10 +67,13 @@ pub async fn append_preview(
     inputs: Vec<PathBuf>,
     target: Option<PathBuf>,
     video: Option<PathBuf>,
+    request_id: Option<String>,
 ) -> CmdResult<AppendEnvelope> {
     let root = state.library_root().ok_or("请先设置媒体库")?;
     let settings = state.settings();
-    let (id, cancel) = state.begin_job("append-preview")?;
+    let (id, cancel) = begin_reported_job(&state, "append-preview", request_id, |id, request_id| {
+        emit(&app, "job:started", id, serde_json::json!({"requestId":request_id}));
+    })?;
     let _guard = JobGuard {
         app: app.clone(),
         id,
@@ -92,8 +110,11 @@ pub async fn append_apply(
     app: AppHandle,
     state: State<'_, AppState>,
     token: String,
+    request_id: Option<String>,
 ) -> CmdResult<append::AppendResult> {
-    let (id, cancel) = state.begin_job("append")?;
+    let (id, cancel) = begin_reported_job(&state, "append", request_id, |id, request_id| {
+        emit(&app, "job:started", id, serde_json::json!({"requestId":request_id}));
+    })?;
     let _guard = JobGuard {
         app: app.clone(),
         id,
@@ -135,11 +156,14 @@ pub async fn sources_check(
     state: State<'_, AppState>,
     ids: Option<Vec<String>>,
     draft: Option<kiroku_core::settings::Settings>,
+    request_id: Option<String>,
 ) -> CmdResult<Vec<kiroku_core::connectivity::SourceCheck>> {
     let settings = draft.unwrap_or_else(|| state.settings());
     // The probe only reads sources/network settings. Unfinished templates or
     // scan rules in other draft categories must not block authentication.
-    let (id, cancel) = state.begin_job("sources-check")?;
+    let (id, cancel) = begin_reported_job(&state, "sources-check", request_id, |id, request_id| {
+        emit(&app, "job:started", id, serde_json::json!({"requestId":request_id}));
+    })?;
     let _guard = JobGuard { app, id };
     Ok(kiroku_core::connectivity::check(&settings, ids.as_deref(), &cancel).await)
 }
@@ -147,10 +171,13 @@ pub async fn sources_check(
 pub async fn library_health(
     app: AppHandle,
     state: State<'_, AppState>,
+    request_id: Option<String>,
 ) -> CmdResult<kiroku_core::health::HealthReport> {
     let root = state.library_root().ok_or("请先设置媒体库")?;
     let settings = state.settings();
-    let (id, cancel) = state.begin_job("library-health")?;
+    let (id, cancel) = begin_reported_job(&state, "library-health", request_id, |id, request_id| {
+        emit(&app, "job:started", id, serde_json::json!({"requestId":request_id}));
+    })?;
     let _guard = JobGuard {
         app: app.clone(),
         id,
@@ -209,13 +236,16 @@ pub async fn maintenance_preview(
     app: AppHandle,
     state: State<'_, AppState>,
     include_recent: Option<bool>,
+    request_id: Option<String>,
 ) -> CmdResult<MaintenanceEnvelope> {
     let root = state.library_root().ok_or("请先设置媒体库")?;
     let settings = state.settings();
     let policy = if include_recent.unwrap_or(false) {
         kiroku_core::maintenance::RetentionPolicy { history_days: 0, log_days: 0 }
     } else { settings.retention.clone() };
-    let (id, cancel) = state.begin_job("maintenance-preview")?;
+    let (id, cancel) = begin_reported_job(&state, "maintenance-preview", request_id, |id, request_id| {
+        emit(&app, "job:started", id, serde_json::json!({"requestId":request_id}));
+    })?;
     let _guard = JobGuard { app, id };
     let p = tauri::async_runtime::spawn_blocking(move || {
         kiroku_core::maintenance::preview_cancellable(
@@ -246,8 +276,11 @@ pub async fn maintenance_apply(
     state: State<'_, AppState>,
     token: String,
     selected: Vec<String>,
+    request_id: Option<String>,
 ) -> CmdResult<kiroku_core::maintenance::MaintenanceResult> {
-    let (id, cancel) = state.begin_job("maintenance")?;
+    let (id, cancel) = begin_reported_job(&state, "maintenance", request_id, |id, request_id| {
+        emit(&app, "job:started", id, serde_json::json!({"requestId":request_id}));
+    })?;
     let _guard = JobGuard {
         app: app.clone(),
         id,
@@ -328,9 +361,12 @@ pub async fn append_target_videos(
     state: State<'_, AppState>,
     code: String,
     target: PathBuf,
+    request_id: Option<String>,
 ) -> CmdResult<Vec<PathBuf>> {
     let root = state.library_root().ok_or("请先设置媒体库")?;
-    let (id, cancel) = state.begin_job("append-videos")?;
+    let (id, cancel) = begin_reported_job(&state, "append-videos", request_id, |id, request_id| {
+        emit(&app, "job:started", id, serde_json::json!({"requestId":request_id}));
+    })?;
     let _guard = JobGuard { app, id };
     tauri::async_runtime::spawn_blocking(move || {
         append::target_videos_cancellable(&root, &code, &target, &cancel).map_err(|e| e.to_string())
@@ -349,5 +385,28 @@ mod cancel_scope_tests {
         assert!(!token.is_cancelled());
         assert!(state.cancel_job_for(Some(id)));
         assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn reported_job_can_be_cancelled_as_soon_as_ownership_is_announced() {
+        let state = AppState::new(Default::default());
+        let (id, token) = begin_reported_job(&state, "library-health", Some("health-request".into()), |id, request| {
+            assert_eq!(request, "health-request");
+            assert!(state.cancel_job_for(Some(id)));
+        }).unwrap();
+        assert_eq!(state.current_job_id(), Some(id));
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn rejected_reported_job_does_not_announce_or_cancel_existing_owner() {
+        let state = AppState::new(Default::default());
+        let (owner, token) = state.begin_job("repair").unwrap();
+        let result = begin_reported_job(&state, "library-health", Some("health-request".into()), |_, _| {
+            panic!("rejected job must not announce ownership");
+        });
+        assert!(result.is_err());
+        assert_eq!(state.current_job_id(), Some(owner));
+        assert!(!token.is_cancelled());
     }
 }

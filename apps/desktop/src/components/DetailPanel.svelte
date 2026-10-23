@@ -3,6 +3,7 @@
   import { fade } from 'svelte/transition'
   import { untrack,onDestroy } from 'svelte'
   import {listen} from '../lib/events'
+  import {cancellableJob,type CancellableJob} from '../lib/cancellable-job'
   import { repairFlow } from '../lib/repairflow.svelte'
   import { api } from '../lib/api'
   import { baseName, fmtBytes } from '../lib/format'
@@ -34,7 +35,9 @@
   const repairError=$derived(repairHere?repairFlow.error:'')
   let undoError=$state('')
   let generation=0
-  $effect(()=>{code;app.settings?.library_root;generation++;undoError=''})
+  $effect(()=>{code;app.settings?.library_root;untrack(()=>{
+    generation++;undoError='';void mediaTask?.cancel();mediaTask=null;mediaBusy=false;mediaDone=0;mediaTotal=0
+  })})
   async function repair(){await repairFlow.start(code)}
   async function undoRepair(){if(!repairResult?.journalId)return;const current=generation;try{const result=await api.rollback(repairResult.journalId);if(current!==generation)return;if(result.failures.length||result.indexError)throw [...result.failures,result.indexError].filter(Boolean).join('; ');repairFlow.clearResult();attempt++;app.toast('ok','本次补图已撤销')}catch(e){if(current===generation)undoError=String(e)}}
 
@@ -79,9 +82,9 @@
   const fanart = $derived(detail ? api.posterUrl(detail.fanart ?? detail.poster, detail.fanart ? detail.fanartVersion : detail.posterVersion) : null)
   const meta = $derived(detail?.meta)
 
-  let mediaBusy=$state(false),mediaJobId=$state<number|null>(null),mediaDone=$state(0),mediaTotal=$state(0)
-  let mediaUnlisten:(()=>void)|null=null
-  onDestroy(()=>{generation++;mediaUnlisten?.();if(mediaJobId!==null)void api.jobCancel(mediaJobId)})
+  let mediaBusy=$state(false),mediaDone=$state(0),mediaTotal=$state(0)
+  let mediaTask=$state<CancellableJob<void>|null>(null)
+  onDestroy(()=>{generation++;void mediaTask?.cancel()})
   let favoriteBusy = $state(false)
   async function toggleFavorite() {
     if (!detail || favoriteBusy) return
@@ -96,19 +99,41 @@
 
   async function act(kind:'play'|'reveal',part?:number){
     if(!armed||mediaBusy)return
-    const current=generation,requested=code,root=app.settings?.library_root;mediaBusy=true;mediaJobId=null;mediaDone=0;mediaTotal=0
+    const current=generation,requested=code,root=app.settings?.library_root;mediaBusy=true;mediaDone=0;mediaTotal=0
+    let unlisten:(()=>void)|undefined
+    let cancelNotice:number|null=null
+    function clearCancelNotice(){if(cancelNotice!==null){app.dismiss(cancelNotice);cancelNotice=null}}
+    const request=cancellableJob(async id=>{
+      unlisten=await listen('media:progress',e=>{if(generation===current&&request.jobId===e.jobId&&e.code===requested&&e.root===root&&e.kind===kind){mediaDone=e.doneBytes;mediaTotal=e.totalBytes}})
+      if(current!==generation||request.cancelled)throw '媒体校验已取消'
+      await (kind==='play'?api.play(requested,part,id):api.reveal(requested,part,id))
+    },e=>{
+      // A failed stop still matters after this detail has closed or changed.
+      // The retry captures this request, never the current panel's task.
+      clearCancelNotice()
+      cancelNotice=app.toast('error',`${requested}：停止媒体校验失败：${String(e)}`,0,{
+        label:'重试停止',run:()=>{clearCancelNotice();void request.cancel()},
+      })
+    })
+    mediaTask=request
     try{
-      mediaUnlisten=await listen('media:progress',e=>{if(generation===current&&e.code===requested&&e.root===root&&e.kind===kind&&(mediaJobId===null||mediaJobId===e.jobId)){mediaJobId=e.jobId;mediaDone=e.doneBytes;mediaTotal=e.totalBytes}})
-      if(current!==generation)return
-      await (kind==='play'?api.play(requested,part):api.reveal(requested,part))
-      if(current===generation&&kind==='play')app.toast('info','已交给系统播放器打开')
+      await request.promise
+      if(current===generation&&kind==='play'&&!request.cancelled)app.toast('info','已交给系统播放器打开')
     }catch(e){if(current===generation)app.toast('error',String(e),5000)}
-    finally{mediaUnlisten?.();mediaUnlisten=null;if(current===generation){mediaBusy=false;mediaJobId=null;}}
+    finally{unlisten?.();clearCancelNotice();if(current===generation){mediaBusy=false;mediaTask=null;}}
+  }
+
+  function closeDetails() {
+    // Destruction (and even outrostart) can lag behind the close action.
+    // Record cancellation before a fast backend response can settle the job.
+    generation++
+    void mediaTask?.cancel()
+    onclose()
   }
 
   function onkey(e: KeyboardEvent) {
     // 裁剪弹窗开着时 Esc 只关弹窗
-    if (e.key === 'Escape' && !cropping) onclose()
+    if (e.key === 'Escape' && !cropping) closeDetails()
   }
 </script>
 
@@ -118,10 +143,10 @@
   <ArtworkEditor {code} onsaved={() => attempt++} onclose={() => (cropping = false)} />
 {/if}
 
-<div class="scrim" role="presentation" onclick={onclose} transition:fade={{ duration: dur(200) }}></div>
+<div class="scrim" role="presentation" onclick={closeDetails} transition:fade={{ duration: dur(200) }}></div>
 
 <aside class="panel" class:armed bind:this={panel} tabindex="-1" aria-label="影片详情" aria-busy={loading} transition:slideIn onintroend={() => (armed = true)}>
-  <button class="close btn icon ghost" aria-label="关闭详情" onclick={onclose}><Icon name="x" size={18} /></button>
+  <button class="close btn icon ghost" aria-label="关闭详情" onclick={closeDetails}><Icon name="x" size={18} /></button>
 
   {#if loading}
     <div class="skeleton"><div class="hero-sk" aria-hidden="true"></div><div class="body"><LoadingStatus label="正在读取影片详情…" /><div aria-hidden="true"><div class="l w60"></div><div class="l"></div><div class="l w80"></div></div></div></div>
@@ -159,7 +184,7 @@
         <button class="btn" class:on={detail.favorite} aria-pressed={detail.favorite} disabled={favoriteBusy} onclick={toggleFavorite}><Icon name="star" size={14} />{detail.favorite ? '取消收藏' : '收藏'}</button>
         {#if repairRunning}<button class="btn" onclick={() => repairFlow.cancel()}>停止补图</button>{/if}
       </div>
-      {#if mediaBusy}<div role="status" aria-label="媒体校验进度"><p>正在校验媒体来源…{mediaTotal?` ${Math.min(100,Math.round(mediaDone/mediaTotal*100))}%`:''}</p><button class="btn" disabled={mediaJobId===null} onclick={()=>mediaJobId!==null&&api.jobCancel(mediaJobId)}>取消媒体校验</button></div>{/if}
+      {#if mediaBusy}<div role="status" aria-label="媒体校验进度"><p>正在校验媒体来源…{mediaTotal?` ${Math.min(100,Math.round(mediaDone/mediaTotal*100))}%`:''}</p><button class="btn" onclick={()=>mediaTask?.cancel()}>取消媒体校验</button></div>{/if}
       {#if repairError||undoError}<p role="alert">补图失败：{repairError||undoError}</p>{/if}
       {#if repairResult}
         <div role="status" aria-label="补图结果">

@@ -1,22 +1,51 @@
 <script lang="ts">
- import {onDestroy} from 'svelte'
+ import {onDestroy,untrack} from 'svelte'
  import {api} from '../lib/api'
  import {listen} from '../lib/events'
+ import {cancellableJob,type CancellableJob} from '../lib/cancellable-job'
+ import {app} from '../lib/state.svelte'
  import {validateNames,NAME_FIELDS} from '../lib/names'
  import type {NameRules,NameField,CatalogInventory,CatalogPreview,CatalogResult} from '../lib/types'
  let {rules=$bindable(),dirty=false}:{rules:NameRules;dirty?:boolean}=$props()
  const labels:Record<NameField,string>={actors:'演员',tags:'标签',studio:'制作商',publisher:'发行商',series:'系列'}
- let field=$state<NameField>('actors'),canonical=$state(''),aliases=$state(''),error=$state(''),busy=$state(false),inventory=$state<CatalogInventory|null>(null),selected=$state<string[]>([]),preview=$state<CatalogPreview|null>(null),result=$state<CatalogResult|null>(null),message=$state(''),jobId=$state<number|null>(null),progress=$state(''),editIndex=$state<number|null>(null)
- let generation=0;onDestroy(()=>generation++)
+ let field=$state<NameField>('actors'),canonical=$state(''),aliases=$state(''),error=$state(''),busy=$state(false),inventory=$state<CatalogInventory|null>(null),selected=$state<string[]>([]),preview=$state<CatalogPreview|null>(null),result=$state<CatalogResult|null>(null),message=$state(''),progress=$state(''),editIndex=$state<number|null>(null)
+ let task=$state<CancellableJob<unknown>|null>(null)
+ let generation=0,libraryRoot:string|null=null
+ onDestroy(()=>{generation++;void task?.cancel()})
+ $effect(()=>{app.settings;untrack(()=>{
+  generation++;void task?.cancel();task=null;busy=false;preview=null;result=null;error='';message='';progress=''
+  const root=app.settings?.library_root??null
+  if(root!==libraryRoot){inventory=null;selected=[];libraryRoot=root}
+ })})
  $effect(()=>{rules;preview=null})
  function add(){error='';try{const next=structuredClone($state.snapshot(rules));const rule={canonical:canonical.trim(),aliases:aliases.trim()?aliases.split('\n').map(s=>s.trim()):[]};if(editIndex===null)next[field].push(rule);else next[field][editIndex]=rule;validateNames(next);rules=next;canonical='';aliases='';editIndex=null;preview=null}catch(e){error=String(e)}}
  function remove(index:number){rules={...rules,[field]:rules[field].filter((_,i)=>i!==index)};preview=null}
- async function run(task:()=>Promise<void>){const g=generation;busy=true;error='';message='';jobId=null;const unlisten=await listen('library:catalog',ev=>{if(g===generation){jobId=ev.jobId;progress=ev.total?`${ev.done}/${ev.total} ${ev.code}`:''}});try{await task()}catch(e){if(g===generation)error=String(e)}finally{unlisten();if(g===generation){busy=false;jobId=null}}}
+ async function run<T>(execute:(requestId:string)=>Promise<T>,accept:(value:T,cancelled:boolean)=>void){
+  if(busy)return
+  const g=generation;busy=true;error='';message='';progress=''
+  let unlisten:(()=>void)|undefined
+  const request=cancellableJob(async id=>{
+   unlisten=await listen('library:catalog',ev=>{if(g===generation&&request.jobId===ev.jobId)progress=ev.total?`${ev.done}/${ev.total} ${ev.code}`:''})
+   if(g!==generation||request.cancelled)throw '任务已取消'
+   return execute(id)
+  },e=>{if(g===generation)error=String(e)})
+  task=request
+  try{const next=await request.promise;if(g===generation)accept(next,request.cancelled)}
+  catch(e){if(g===generation)error=String(e)}finally{unlisten?.();if(g===generation){busy=false;task=null}}
+ }
  async function preset(){error='';message='';try{const r=await api.tagPresetMerge($state.snapshot(rules));rules=r.rules;field='tags';editIndex=null;preview=null;message=r.added_rules||r.added_aliases?`已加入 ${r.added_rules} 条标签规则、${r.added_aliases} 个别名，保存设置后生效`:'内置标签译名已全部在规则里'}catch(e){error=String(e)}}
- async function load(){inventory=null;selected=[];preview=null;result=null;await run(async()=>{const next=await api.catalogInventory();inventory=next})}
- async function build(){await run(async()=>{preview=await api.catalogPreview(selected);result=null})}
- async function apply(){if(!preview)return;const token=preview.token;await run(async()=>{result=await api.catalogApply(token);preview=null})}
- async function undo(){if(!result)return;await run(async()=>{for(const item of [...result!.items].reverse()){if(item.journalId){const r=await api.rollback(item.journalId);if(r.failures.length)throw r.failures.join('；')}}result=null;message='已撤销本次修改'})}
+ async function load(){if(busy)return;inventory=null;selected=[];preview=null;result=null;await run(id=>api.catalogInventory(id),next=>{inventory=next})}
+ async function build(){preview=null;result=null;await run(id=>api.catalogPreview(selected,id),(next,cancelled)=>{if(!cancelled)preview=next})}
+ async function apply(){if(!preview)return;const token=preview.token;preview=null;await run(id=>api.catalogApply(token,id),next=>{result=next;app.libraryVersion++})}
+ async function undo(){
+  if(busy||!result)return
+  const g=generation,items=[...result.items].reverse();busy=true;error='';message='';progress=''
+  try{for(const item of items){
+   if(g!==generation)return
+   if(item.journalId){const r=await api.rollback(item.journalId);if(r.failures.length||r.indexError)throw [...r.failures,r.indexError].filter(Boolean).join('；')}
+  }if(g===generation){result=null;message='已撤销本次修改';app.libraryVersion++}}
+  catch(e){if(g===generation)error=String(e)}finally{if(g===generation)busy=false}
+ }
 </script>
 <section class="card" aria-label="名称规则管理">
  <p>规则保存后用于新整理。已有影片需明确选择并预览；人工锁定字段优先。</p>
@@ -36,7 +65,7 @@
  {#if inventory.cancelled}<p>读取已取消，列表可能不完整。</p>{/if}
  <div class="movies">{#each inventory.movies as movie}<label data-catalog-movie><input type="checkbox" bind:group={selected} value={movie.dir} disabled={busy}/><span>{movie.code} · <span data-actors>{movie.names.actors.join('、')}</span><small>{movie.dir}</small></span></label>{/each}</div>
  <button class="btn" onclick={build} disabled={busy||dirty||!selected.length}>预览所选影片</button>{/if}
- {#if busy}<p role="status">处理中… {progress}</p><button class="btn" disabled={jobId===null} onclick={()=>jobId!==null&&api.jobCancel(jobId)}>停止当前任务</button>{/if}
+ {#if busy}<p role="status">处理中… {progress}</p>{#if task}<button class="btn" onclick={()=>task?.cancel()}>停止当前任务</button>{/if}{/if}
  {#if preview}<p>原有影片位置保持不变</p>{#each preview.warnings as warning}<p>{warning}</p>{/each}{#each preview.items as item}<div data-name-diff><strong>{item.code}</strong>{#each item.changes as change}<p>{change.field}：{JSON.stringify(change.before)} → {JSON.stringify(change.after)}</p>{/each}{#if !item.changes.length}<p>没有名称变化</p>{/if}</div>{/each}<button class="btn primary" disabled={busy||dirty} onclick={apply}>应用名称规则</button>{/if}
  {#if result}<p role="status">已完成 {result.items.filter(i=>!i.error).length} 项{result.cancelled?' · 已取消':''}</p>{#each result.items.filter(i=>i.error) as item}<p role="alert">{item.code}：{item.error}</p>{/each}{#if result.indexError}<p role="alert">索引更新失败：{result.indexError}</p>{/if}{#if result.items.some(i=>i.journalId)}<button class="btn" onclick={undo} disabled={busy}>撤销本次修改</button>{/if}{/if}
  {#if message}<p role="status">{message}</p>{/if}{#if error}<p role="alert">{error}</p>{/if}

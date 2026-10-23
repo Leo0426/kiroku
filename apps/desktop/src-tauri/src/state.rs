@@ -11,12 +11,20 @@ use std::{
     collections::HashMap,
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Mutex, MutexGuard,
     },
 };
 use tauri::{AppHandle, Emitter, Manager};
 use tokio_util::sync::CancellationToken;
+
+/// Only the first close request schedules a waiter; later requests keep it alive.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Shutdown {
+    Ready,
+    Wait,
+    Pending,
+}
 
 pub struct JobHandle {
     pub id: u64,
@@ -68,6 +76,9 @@ pub struct AppState {
     pub session: Mutex<Session>,
     pub revision: Mutex<Option<PendingRevision>>,
     next_job: AtomicU64,
+    // Changes are serialized with begin_job/end_job under the job mutex.
+    shutting_down: AtomicBool,
+    shutdown_ready: CancellationToken,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -93,6 +104,8 @@ impl AppState {
             session: Mutex::new(Session::default()),
             revision: Mutex::new(None),
             next_job: AtomicU64::new(1),
+            shutting_down: AtomicBool::new(false),
+            shutdown_ready: CancellationToken::new(),
         }
     }
 
@@ -147,6 +160,9 @@ impl AppState {
     /// 同一时间只允许一个任务。
     pub fn begin_job(&self, kind: &'static str) -> Result<(u64, CancellationToken), String> {
         let mut g = lock(&self.job);
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err("应用正在退出，请等待当前任务结束".into());
+        }
         if let Some(j) = g.as_ref() {
             return Err(format!("已有任务在运行:{}", j.kind));
         }
@@ -156,7 +172,6 @@ impl AppState {
         Ok((id, cancel))
     }
 
-    pub fn cancel_job(&self) -> bool {self.cancel_job_for(None)}
     pub fn cancel_job_for(&self,id:Option<u64>)->bool{lock(&self.job).as_ref().filter(|j|id.is_none_or(|id|j.id==id)).map(|j|j.cancel.cancel()).is_some()}
 
     /// 正在运行的任务编号(日志事件用它关联到任务)。
@@ -168,10 +183,35 @@ impl AppState {
         lock(&self.job).is_some()
     }
 
+    /// Close admission and cancel the current job in the same critical section.
+    /// A cancellation request is not evidence that disk writes have finished.
+    pub fn request_shutdown(&self) -> Shutdown {
+        let job = lock(&self.job);
+        let already_waiting = self.shutting_down.swap(true, Ordering::SeqCst);
+        match job.as_ref() {
+            None => {
+                self.shutdown_ready.cancel();
+                Shutdown::Ready
+            }
+            Some(job) => {
+                job.cancel.cancel();
+                if already_waiting { Shutdown::Pending } else { Shutdown::Wait }
+            }
+        }
+    }
+
+    /// Completion is remembered even if the guard releases before this is awaited.
+    pub async fn wait_for_shutdown(&self) {
+        self.shutdown_ready.cancelled().await;
+    }
+
     fn end_job(&self, id: u64) {
         let mut g = lock(&self.job);
         if g.as_ref().is_some_and(|j| j.id == id) {
             *g = None;
+            if self.shutting_down.load(Ordering::SeqCst) {
+                self.shutdown_ready.cancel();
+            }
         }
     }
 }
@@ -217,4 +257,106 @@ mod history_scope_tests {
         lock(&state.settings).library_root=Some("/library-b".into());state.replace_library(None);lock(&state.settings).library_root=Some("/library-a".into());state.replace_library(None);
         assert!(state.validate_history(&old).is_err());let current=state.history_snapshot().unwrap();assert!(state.validate_history(&current).is_ok());
     }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use std::{sync::Arc, time::Duration};
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_waits_for_real_completion_even_beyond_five_seconds() {
+        let state = Arc::new(AppState::new(Default::default()));
+        let (id, cancel) = state.begin_job("revision-save").unwrap();
+        assert_eq!(state.request_shutdown(), Shutdown::Wait);
+        assert!(cancel.is_cancelled());
+        // Revision commits cannot stop halfway: cancellation alone is not completion.
+        let waiting = state.clone();
+        let exit = tokio::spawn(async move { waiting.wait_for_shutdown().await });
+        for _ in 0..60 {
+            tokio::time::advance(Duration::from_millis(100)).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(!exit.is_finished(), "must not exit while the journaled operation still owns the slot");
+        state.end_job(id);
+        exit.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_shutdown_is_immediate_and_rejects_new_work() {
+        let state = AppState::new(Default::default());
+        assert_eq!(state.request_shutdown(), Shutdown::Ready);
+        state.wait_for_shutdown().await;
+        assert!(state.begin_job("apply").unwrap_err().contains("正在退出"));
+    }
+
+    #[tokio::test]
+    async fn repeated_close_cancels_once_and_waits_for_the_matching_job() {
+        let state = Arc::new(AppState::new(Default::default()));
+        let (id, cancel) = state.begin_job("apply").unwrap();
+        assert_eq!(state.request_shutdown(), Shutdown::Wait);
+        assert_eq!(state.request_shutdown(), Shutdown::Pending);
+        assert!(cancel.is_cancelled());
+        assert!(state.begin_job("scan").is_err());
+        let waiting = state.clone();
+        let exit = tokio::spawn(async move { waiting.wait_for_shutdown().await });
+        tokio::task::yield_now().await;
+        state.end_job(id + 1);
+        tokio::task::yield_now().await;
+        assert!(!exit.is_finished());
+        assert_eq!(state.current_job_id(), Some(id));
+        state.end_job(id);
+        tokio::time::timeout(Duration::from_secs(1), exit).await.unwrap().unwrap();
+        assert_eq!(state.request_shutdown(), Shutdown::Ready);
+        assert!(state.begin_job("scan").is_err());
+    }
+
+    #[tokio::test]
+    async fn completion_before_wait_is_not_lost() {
+        let state = AppState::new(Default::default());
+        let (id, _) = state.begin_job("rollback").unwrap();
+        assert_eq!(state.request_shutdown(), Shutdown::Wait);
+        state.end_job(id);
+        tokio::time::timeout(Duration::from_secs(1), state.wait_for_shutdown()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn normal_completion_does_not_mark_future_shutdown_ready() {
+        let state = Arc::new(AppState::new(Default::default()));
+        let (old, _) = state.begin_job("scan").unwrap();
+        state.end_job(old);
+        let (id, _) = state.begin_job("revision-save").unwrap();
+        assert_eq!(state.request_shutdown(), Shutdown::Wait);
+        let waiting = state.clone();
+        let exit = tokio::spawn(async move { waiting.wait_for_shutdown().await });
+        tokio::task::yield_now().await;
+        state.end_job(old);
+        tokio::task::yield_now().await;
+        assert!(!exit.is_finished());
+        state.end_job(id);
+        tokio::time::timeout(Duration::from_secs(1), exit).await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn shutdown_and_start_cannot_admit_work_after_the_close_boundary() {
+        for _ in 0..100 {
+            let state = Arc::new(AppState::new(Default::default()));
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let candidate = state.clone();
+            let start = barrier.clone();
+            let thread = std::thread::spawn(move || { start.wait(); candidate.begin_job("apply") });
+            barrier.wait();
+            let outcome = state.request_shutdown();
+            match thread.join().unwrap() {
+                Ok((id, cancel)) => {
+                    assert_eq!(outcome, Shutdown::Wait);
+                    assert!(cancel.is_cancelled());
+                    state.end_job(id);
+                }
+                Err(_) => assert_eq!(outcome, Shutdown::Ready),
+            }
+            assert!(state.begin_job("scan").is_err());
+        }
+    }
+
 }

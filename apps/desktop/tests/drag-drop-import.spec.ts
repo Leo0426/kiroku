@@ -41,6 +41,7 @@ test('dragging shows a drop hint, and an import in progress is left untouched', 
     api.getSettings = async () => ({ ...(await getSettings()), source_dirs: ['/mock/source'] });
   `)
   await page.goto('/')
+  await expect(page.getByRole('button', { name: '媒体库', exact: true })).toBeVisible()
   await drag(page, 'enter', ['/mock/new-a'])
   await expect(page.getByText('松开以添加待整理文件夹')).toBeVisible()
   await drag(page, 'leave')

@@ -17,6 +17,7 @@
     >
       <Icon name={t.kind === 'ok' ? 'check' : t.kind === 'error' ? 'alert' : 'info'} size={16} />
       <span>{t.text}</span>
+      {#if t.action}<button class="btn sm action" onclick={t.action.run}>{t.action.label}</button>{/if}
       <button class="x" aria-label="关闭" onclick={() => app.dismiss(t.id)}><Icon name="x" size={14} /></button>
     </div>
   {/each}
@@ -37,6 +38,7 @@
   }
   .toast:hover { transform: translateY(-2px); }
   .toast span { flex: 1; word-break: break-word; }
+  .action { flex-shrink: 0; white-space: nowrap; }
   .ok :global(svg:first-child) { color: var(--ok); }
   .error :global(svg:first-child) { color: var(--danger); }
   .info :global(svg:first-child) { color: var(--info); }

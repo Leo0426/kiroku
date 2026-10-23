@@ -23,6 +23,7 @@ function withTimeout<T>(p: Promise<T>, ms: number, message: string): Promise<T> 
 
 export type Step = 'source' | 'scan' | 'scrape' | 'plan' | 'apply' | 'done'
 type Kind = 'scan' | 'scrape' | 'plan' | 'apply'
+type TaskAttempt = { cancelled: boolean; cancelSent: boolean }
 
 class ImportFlow {
   step = $state<Step>('source')
@@ -73,11 +74,20 @@ class ImportFlow {
   private retiredJobId = 0
   private scanAttempt: { cancelled: boolean; dispatched: boolean } | null = null
   private planningAttempt: { requestId: string; cancelled: boolean; jobId: number | null } | null = null
+  private taskAttempt: TaskAttempt | null = null
+  private pendingLogLines: LogLineEvent[] = []
 
   /** 事件可能先于 invoke 的返回值到达,所以第一个事件带来的 jobId 视为当前任务 */
   private accept(kind: Kind, jobId: number): boolean {
     if (this.expecting !== kind || jobId <= this.retiredJobId) return false
-    if (this.jobId === null) this.jobId = jobId
+    if (this.jobId === null) {
+      this.jobId = jobId
+      if (kind === 'apply') {
+        this.logLines.push(...this.pendingLogLines.filter(line => line.jobId === jobId))
+        this.pendingLogLines = []
+      }
+      if (this.taskAttempt) void this.cancelTask(this.taskAttempt)
+    }
     return this.jobId === jobId
   }
 
@@ -85,6 +95,38 @@ class ImportFlow {
     this.retiredJobId = Math.max(this.retiredJobId, this.jobId ?? 0)
     this.expecting = null
     this.jobId = null
+    this.taskAttempt = null
+    this.pendingLogLines = []
+  }
+
+  /** 启动响应可能晚于完成事件；只允许仍归本次请求所有的响应改变流程。 */
+  private async startTask(kind: 'scrape' | 'apply', start: () => Promise<number>, onError: () => void) {
+    const attempt: TaskAttempt = { cancelled: false, cancelSent: false }
+    this.taskAttempt = attempt
+    this.expecting = kind
+    this.jobId = null
+    try {
+      const id = await start()
+      if (this.taskAttempt === attempt) this.accept(kind, id)
+    } catch (e) {
+      if (this.taskAttempt !== attempt) return
+      this.error = String(e)
+      onError()
+      this.finish()
+    }
+  }
+
+  /** 停止意图可早于任务编号到达，绝不使用未指定编号的全局取消。 */
+  private async cancelTask(attempt: TaskAttempt) {
+    if (this.taskAttempt !== attempt || !attempt.cancelled || attempt.cancelSent || this.jobId === null) return
+    attempt.cancelSent = true
+    try {
+      await api.jobCancel(this.jobId)
+    } catch (e) {
+      if (this.taskAttempt !== attempt) return
+      attempt.cancelSent = false
+      this.error = String(e)
+    }
   }
 
   async init() {
@@ -145,10 +187,12 @@ class ImportFlow {
         this.apply.total = e.total
       }))
       unlisten.push(await listen('log:line', (e) => {
-        // jobId 0 是不属于任何任务的日志(如媒体库页的后台检查);不能让它抢先认领整理任务的编号
-        if (e.jobId === 0 || !this.accept('apply', e.jobId)) return
-        this.logLines.push(e)
-        if (this.logLines.length > LOG_MAX) this.logLines.splice(0, this.logLines.length - LOG_MAX)
+        // 各类任务共用日志总线；只有整理事件或启动响应可以确认归属。
+        if (this.expecting !== 'apply' || e.jobId === 0 || e.jobId <= this.retiredJobId) return
+        if (this.jobId !== null && e.jobId !== this.jobId) return
+        const lines = this.jobId === null ? this.pendingLogLines : this.logLines
+        lines.push(e)
+        if (lines.length > LOG_MAX) lines.splice(0, lines.length - LOG_MAX)
       }))
       unlisten.push(await listen('apply:done', (e) => {
         if (!this.accept('apply', e.jobId)) return
@@ -305,17 +349,10 @@ class ImportFlow {
     this.scrapeSummary = null
     this.eta = null
     this.step = 'scrape'
-    this.expecting = 'scrape'
-    this.jobId = null
-    try {
-      const id = await api.scrapeStart(ids)
-      if (this.jobId === null) this.jobId = id
-    } catch (e) {
+    await this.startTask('scrape', () => api.scrapeStart(ids), () => {
       this.scrape.running = false
-      this.finish()
-      this.error = String(e)
       this.step = retry ? 'scrape' : 'scan'
-    }
+    })
   }
 
   /** 用某站详情页重刮一部影片(搜索没找到或找错时);结果走同样的刮削事件 */
@@ -330,16 +367,9 @@ class ImportFlow {
     this.scrapeSummary = null
     this.eta = null
     this.step = 'scrape'
-    this.expecting = 'scrape'
-    this.jobId = null
-    try {
-      const id = await api.scrapeUrlStart(ids, url.trim())
-      if (this.jobId === null) this.jobId = id
-    } catch (e) {
+    await this.startTask('scrape', () => api.scrapeUrlStart(ids, url.trim()), () => {
       this.scrape.running = false
-      this.finish()
-      this.error = String(e)
-    }
+    })
   }
 
   async buildPlan() {
@@ -391,20 +421,18 @@ class ImportFlow {
     this.applyDone = null
     this.apply = { done: 0, total: ids.length, running: true }
     this.step = 'apply'
-    this.expecting = 'apply'
-    this.jobId = null
-    try {
-      const id = await api.applyStart(ids)
-      if (this.jobId === null) this.jobId = id
-    } catch (e) {
+    await this.startTask('apply', () => api.applyStart(ids), () => {
       this.apply.running = false
-      this.finish()
-      this.error = String(e)
       this.step = 'plan'
-    }
+    })
   }
 
   async cancel() {
+    if (this.taskAttempt) {
+      this.taskAttempt.cancelled = true
+      await this.cancelTask(this.taskAttempt)
+      return
+    }
     if (this.planningAttempt) {
       this.planningAttempt.cancelled = true
       if (this.planningAttempt.jobId !== null) await api.jobCancel(this.planningAttempt.jobId)
@@ -422,7 +450,7 @@ class ImportFlow {
       }
       return
     }
-    await api.jobCancel(this.jobId ?? undefined)
+    if (this.expecting !== null && this.jobId !== null) await api.jobCancel(this.jobId)
   }
 }
 

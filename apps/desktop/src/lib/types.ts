@@ -280,8 +280,11 @@ export interface RepairDone {
 }
 
 export interface EventMap {
+  'job:started': { jobId: number; requestId: string }
+  /** Progress only; catalog request ownership is established by job:started. */
   'library:catalog': {jobId:number; phase:string; done:number; total:number; code:string}
   'nfo:export': {jobId:number;completed:number;failed:number}
+  /** Progress cannot claim a media request; use its matching job:started event. */
   'media:progress': {jobId:number;root:string;code:string;kind:'play'|'reveal';doneBytes:number;totalBytes:number}
   'repair:event': ApplyEvent
   'repair:done': RepairDone
