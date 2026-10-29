@@ -29,8 +29,12 @@ jobs:
           if [ "$tag" != "v$version" ]; then
             echo "::error::标签 $tag 与 tauri.conf.json 版本 $version 不一致"; exit 1
           fi
+          notes_args=(-F generate_release_notes=true)
+          if [ -f "docs/releases/$tag.md" ]; then
+            notes_args=(-F "body=@docs/releases/$tag.md")
+          fi
           id=$(gh api -X POST "repos/$GITHUB_REPOSITORY/releases" -f tag_name="$tag" -f target_commitish="$GITHUB_SHA" \
-            -f name="kiroku $tag" -F draft=true -F generate_release_notes=true --jq .id)
+            -f name="kiroku $tag" -F draft=true "${notes_args[@]}" --jq .id)
           if [ -z "$id" ]; then echo "::error::创建 Release 草稿失败"; exit 1; fi
           echo "release_id=$id" >> "$GITHUB_OUTPUT"
 
