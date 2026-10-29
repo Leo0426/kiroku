@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte'
   import Icon from '../components/Icon.svelte'
+  import InfoTip from '../components/InfoTip.svelte'
   import CodeEditor from '../components/CodeEditor.svelte'
   import LogPanel from '../components/LogPanel.svelte'
   import Count from '../components/Count.svelte'
@@ -188,9 +189,13 @@
       <!-- 1. 选择来源 -->
       {#if flow.step === 'source'}
         <section class="card pad" aria-labelledby="source-dirs-title">
-          <h2 id="source-dirs-title">待整理的文件夹</h2>
-          <p class="hint">选择存放视频的文件夹，也会查找其中的子文件夹；也可以把文件夹或单个视频拖进窗口。单个视频只导入它自己，不清理它所在的文件夹。</p>
-          <details class="disclosure"><summary>支持的视频格式</summary><p class="hint">mp4 / mkv / avi / wmv / mov / ts / m2ts / flv / rmvb</p></details>
+          <div class="titled">
+            <h2 id="source-dirs-title">待整理的文件夹</h2>
+            <InfoTip label="待整理的文件夹说明">
+              <p>选择存放视频的文件夹，也会查找其中的子文件夹；也可以把文件夹或单个视频拖进窗口。单个视频只导入它自己，不清理它所在的文件夹。</p>
+              <p><b>支持的视频格式</b><br /><span class="mono">mp4 / mkv / avi / wmv / mov / ts / m2ts / flv / rmvb</span></p>
+            </InfoTip>
+          </div>
           {#each flow.dirs as d (d)}
             <div class="dirrow">
               <Icon name={isVideoPath(d) ? 'film' : 'folder'} size={16} /><span class="mono grow" title={d}>{d}</span>
@@ -202,10 +207,15 @@
         </section>
 
         <section class="card pad" aria-label="整理目标">
-          <h2>整理到</h2>
+          <div class="titled">
+            <h2>整理到</h2>
+            <InfoTip label="整理方式说明">
+              <p>{MODE[mode].summary} 影片信息和海报会保存在媒体库。</p>
+              <p><b>命名规则</b><br /><span class="mono">{app.settings?.dir_template}/{app.settings?.plex.naming ? '(Plex 命名)' : app.settings?.file_template}</span></p>
+              <p>可在「设置 → 命名与 NFO」修改。</p>
+            </InfoTip>
+          </div>
           <div class="dirrow"><Icon name="folder" size={16} /><span class="mono grow" title={root}>{root}</span></div>
-          <p class="hint">{MODE[mode].summary} 影片信息和海报会保存在媒体库。</p>
-          <details class="disclosure"><summary>查看命名规则</summary><p class="hint mono">{app.settings?.dir_template}/{app.settings?.plex.naming ? '(Plex 命名)' : app.settings?.file_template}</p><p class="hint">可在「设置 → 命名与 NFO」修改。</p></details>
         </section>
 
         <footer>
@@ -472,9 +482,9 @@
   .results .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: var(--s3); }
   .pad { padding: var(--s5); display: flex; flex-direction: column; gap: var(--s3); }
   .hint { color: var(--text-2); font-size: var(--fs-sm); }
+  .titled { display: flex; align-items: center; gap: var(--s1); }
   .disclosure summary { cursor:pointer; padding:var(--s4); font-size:var(--fs-sm); color:var(--text-2); }
   .disclosure summary:hover { color:var(--text-1); }
-  .pad .disclosure summary { padding:0; }
   .disclosure p { margin-top:var(--s2); overflow-wrap:anywhere; }
   .section-head { padding:var(--s4); display:flex; flex-direction:column; gap:var(--s2); }
   .section-title { display:flex; justify-content:space-between; align-items:center; gap:var(--s3); flex-wrap:wrap; }

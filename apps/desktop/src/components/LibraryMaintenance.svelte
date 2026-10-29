@@ -1,5 +1,6 @@
 <script lang="ts">
  import {onDestroy,untrack} from 'svelte'
+ import InfoTip from './InfoTip.svelte'
  import {api} from '../lib/api'
  import {cancellableJob,type CancellableJob} from '../lib/cancellable-job'
  import {app} from '../lib/state.svelte'
@@ -21,8 +22,7 @@
  }
  async function collect(ids:string[]=[...selected]){if(busy||!preview||!ids.length)return;const g=generation,p=preview;const wanted=new Set(ids);const targets=p.candidates.filter(c=>wanted.has(c.id));const ok=await app.confirm({title:'确认删除生成数据',body:`将 ${targets.length} 项生成数据移到系统废纸篓：\n${targets.slice(0,5).map(c=>`${c.description}：${c.paths[0]??''}`).join('\n')+(targets.length>5?`\n另有 ${targets.length-5} 项，详见预览列表。`:'')}\n\n旧记录移走后不再出现在操作历史；有效撤销记录及其依赖继续保留。执行前会重新核对文件与引用。`,confirmLabel:'移到废纸篓'});if(!ok||g!==generation||preview!==p)return;busy=true;error='';const request=cancellableJob(id=>api.maintenanceApply(p.token,ids,id),e=>{if(g===generation)error=String(e)});task=request;try{const next=await request.promise;if(g===generation){result=next;preview=null;selected=[];app.libraryVersion++;void app.recovery.refresh()}}catch(e){if(g===generation){error=String(e);preview=null}}finally{if(g===generation){busy=false;task=null}}}
 </script>
-<section aria-label="安全空间维护"><h2>安全空间维护</h2><p class="muted">只提供无引用旧原图、已完整撤销且无依赖的历史与备份、旧文件日志；不会自动清理。</p>
- <p class="muted">影片视频、字幕、当前 NFO 与海报、仍用于裁剪或撤销的数据和当日日志会保留。删除的文件移到废纸篓。</p>
+<section aria-label="安全空间维护"><div class="tipped"><h2>安全空间维护</h2><InfoTip label="安全空间维护说明"><p>只提供无引用旧原图、已完整撤销且无依赖的历史与备份、旧文件日志；不会自动清理。</p><p>影片视频、字幕、当前 NFO 与海报、仍用于裁剪或撤销的数据和当日日志会保留。删除的文件移到废纸篓。</p></InfoTip></div>
  <label>历史与原图保留天数 <input class="input" type="number" min="0" step="1" bind:value={historyDays} disabled={busy||dirty}/></label>
  <label>文件日志保留天数 <input class="input" type="number" min="0" step="1" bind:value={logDays} disabled={busy||dirty}/></label>
  <button class="btn" onclick={savePolicy} disabled={busy||dirty}>保存保留期</button><button class="btn" onclick={inspect} disabled={busy||dirty}>预览空间清理</button>{#if dirty}<p>请先保存设置页中的改动，再进行维护。</p>{/if}
@@ -37,4 +37,4 @@
  <button class="btn primary" onclick={()=>collect()} disabled={busy||dirty||!selected.length}>清理选中项</button>{/if}
  {#if result}<p role="status">已移到废纸篓：{result.removed} 个文件{result.cancelled?' · 已取消':''}</p>{#each result.skipped as reason}<p>{reason}</p>{/each}{#each result.failed as failure}<p role="alert">{failure}</p>{/each}{/if}
  {#if error}<p role="alert">{error}</p>{/if}</section>
-<style>section{margin:16px 0;padding:20px;background:var(--surface-2);border-radius:12px}label{display:inline-flex;gap:8px;align-items:center;margin:8px;min-width:0;max-width:100%;flex-wrap:wrap}input[type=number]{width:90px}.candidate{margin:12px 0;padding:12px;border:1px solid var(--line);border-radius:var(--r-sm)}.candidate-head{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}.candidate-head label{flex:1;margin:0}.candidate-head .btn{flex-shrink:0}p{overflow-wrap:anywhere}button{margin:4px}details{margin:12px 0;max-height:240px;overflow:auto}</style>
+<style>.tipped{display:flex;align-items:center;gap:4px}section{margin:16px 0;padding:20px;background:var(--surface-2);border-radius:12px}label{display:inline-flex;gap:8px;align-items:center;margin:8px;min-width:0;max-width:100%;flex-wrap:wrap}input[type=number]{width:90px}.candidate{margin:12px 0;padding:12px;border:1px solid var(--line);border-radius:var(--r-sm)}.candidate-head{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}.candidate-head label{flex:1;margin:0}.candidate-head .btn{flex-shrink:0}p{overflow-wrap:anywhere}button{margin:4px}details{margin:12px 0;max-height:240px;overflow:auto}</style>

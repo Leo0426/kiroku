@@ -287,7 +287,14 @@ class ImportFlow {
     if (this.dirs.length) await this.startScan()
   }
 
-  async startScan() {
+  async startFromFiles(paths: string[]) {
+    if (this.busy || !paths.length) return
+    this.reset()
+    this.dirs = [...new Set(paths)]
+    await this.startScan(false)
+  }
+
+  async startScan(rememberSources = true) {
     const attempt = { cancelled: false, dispatched: false }
     this.scanAttempt = attempt
     this.error = null
@@ -304,10 +311,10 @@ class ImportFlow {
       await cancelPendingReads()
       if (attempt.cancelled || this.scanAttempt !== attempt) return
       attempt.dispatched = true
-      const id = await api.scanStart(dirs)
+      const id = await api.scanStart(dirs, rememberSources)
       if (attempt.cancelled) await api.jobCancel(id)
       // scanStart 会记住来源,同步门面状态供「待整理」再次开始时使用。
-      if (app.settings) app.settings = { ...app.settings, source_dirs: dirs.filter((d) => !isVideoPath(d)) }
+      if (rememberSources && app.settings) app.settings = { ...app.settings, source_dirs: dirs.filter((d) => !isVideoPath(d)) }
       if (this.expecting === 'scan' && this.scanAttempt === attempt && this.jobId === null) this.jobId = id
     } catch (e) {
       if (this.scanAttempt !== attempt) return

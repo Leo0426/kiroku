@@ -23,7 +23,7 @@ test('a movie can be favorited from its detail panel, filtered, and the change u
   const row = page.getByRole('list', { name: '操作记录' }).getByRole('listitem').filter({ hasText: code }).first()
   await row.getByRole('button', { name: '撤销' }).click()
   await row.getByRole('button', { name: '确认撤销' }).click()
-  await expect(page.getByText(/已撤销/).first()).toBeVisible()
+  await expect(row.getByText('已撤销',{exact:true})).toBeVisible()
   await page.getByRole('button', { name: '媒体库', exact: true }).click()
   await expect(page.locator('button.pcard').filter({ hasText: code }).getByLabel('已收藏')).toHaveCount(0)
 })

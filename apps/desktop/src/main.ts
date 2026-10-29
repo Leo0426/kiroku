@@ -1,7 +1,10 @@
 import { mount } from 'svelte'
 import './styles/base.css'
 import App from './App.svelte'
+import { appearance } from './lib/appearance.svelte'
 import { reduced } from './lib/motion'
+
+appearance.init()
 
 // 全局点击涟漪:按钮与 .ripple-host 元素在按下处泛起一圈
 document.addEventListener('pointerdown', (e) => {

@@ -24,7 +24,7 @@ import type {
   RollbackResult,
   ScanItem,
   Settings,
-  TrashResult,
+  TrashResult, LibraryPruned,
 } from './types'
 
 /** 后端能力的统一接口。Tauri 里走 invoke,浏览器里走 mock 引擎(便于不启动桌面壳就预览/验证界面)。 */
@@ -57,6 +57,7 @@ export interface Api {
   /** 测试 Jellyfin / Emby 连接(未保存的设置) */
   mediaServerTest(cfg: MediaServerCfg): Promise<ServerTest>
   /** 用给定的 AI 设置试译一句 */
+  /** 使用所选 provider 的未保存配置试译；与全局标题/简介开关无关。 */
   aiTest(cfg: AiCfg): Promise<{ title: string | null; plot: string | null }>
   inspectDirectory(path: string): Promise<DirInfo>
   /** 清空 AI 汉化译文缓存 */
@@ -73,7 +74,7 @@ export interface Api {
   pendingSummary(requestId?: string, force?: boolean): Promise<PendingSummary>
   pendingCancel(requestId: string): Promise<boolean>
   setSourceDirs(dirs: string[]): Promise<Settings>
-  scanStart(dirs: string[]): Promise<number>
+  scanStart(dirs: string[], rememberSources?: boolean): Promise<number>
   /** 手动指定/修正某个文件的番号;无法识别会抛错 */
   setItemCode(itemId: number, code: string): Promise<ScanItem>
   scrapeStart(itemIds: number[]): Promise<number>
@@ -87,17 +88,24 @@ export interface Api {
   jobCancel(jobId?:number): Promise<boolean>
 
   /** 按 id 从新到旧分页;只读取本页日志 */
+  historyDetail(requestId:string, journalId:string, offset?:number): Promise<import('./types').HistoryDetail>
   historyList(requestId?:HistoryRequestId, page?:HistoryPageRequest): Promise<HistoryPage>
   historyCancel(requestId:HistoryRequestId):Promise<boolean>
   revealJournal(journalId: string): Promise<void>
   rollback(journalId: string): Promise<RollbackResult>
 
+  libraryOverview(query: Query): Promise<import('./types').LibraryOverview>
   libraryList(query: Query): Promise<Page>
+  libraryExportCsv(query: Query, requestId?: string): Promise<number | null>
+  libraryPruneMissing(root: string, automatic: boolean, requestId?: string): Promise<LibraryPruned>
   libraryGet(code: string): Promise<MovieDetail | null>
   /** 移到系统废纸篓并移出索引。keepMedia:只移走资料(NFO/图片等),视频和字幕留下;否则整个影片目录 */
   libraryTrash(code: string, keepMedia: boolean): Promise<TrashResult>
   repairImagesStart(code: string): Promise<number>
   metadataSourceCandidates(code: string): Promise<Record<string, SourceCandidate[]>>
+  batchEditPreview(codes:string[],edit:import('./types').BatchEdit,requestId?:string):Promise<import('./types').BatchEditPreview>
+  batchEditDiscard(token:string):Promise<void>
+  batchEditApply(token:string,root:string,requestId?:string):Promise<import('./types').BatchEditResult>
   nfoExportPreview(codes:string[],language:NfoLanguage,requestId?:string):Promise<LanguageBatchPreview>
   nfoExportApply(token:string,root:string,requestId?:string):Promise<LanguageBatchResult>
   templatePreview(directory:string,file:string): Promise<TemplatePreview>
@@ -155,7 +163,7 @@ async function tauriApi(): Promise<Api> {
     pendingSummary: (requestId = crypto.randomUUID(), force = false) => invoke('pending_summary', { requestId, force }),
     pendingCancel: (requestId) => invoke('pending_cancel', { requestId }),
     setSourceDirs: (dirs) => invoke('set_source_dirs', { dirs }),
-    scanStart: (dirs) => invoke('scan_start', { dirs }),
+    scanStart: (dirs, rememberSources = true) => invoke('scan_start', { dirs, rememberSources }),
     setItemCode: (itemId, code) => invoke('set_item_code', { itemId, code }),
     scrapeStart: (itemIds) => invoke('scrape_start', { itemIds }),
     planBuild: (itemIds, requestId) => invoke('plan_build', { itemIds, requestId }),
@@ -163,15 +171,22 @@ async function tauriApi(): Promise<Api> {
     scrapeUrlStart: (itemIds, url) => invoke('scrape_url_start', { itemIds, url }),
     jobCancel: (jobId) => invoke('job_cancel',{jobId}),
     recoveryInspect:()=>invoke('recovery_inspect'),
-    historyList: (requestId, page = {}) => invoke('history_list', {requestId, before: page.before ?? null, limit: page.limit ?? null}),
+    historyDetail: (requestId, journalId, offset = 0) => invoke('history_detail', { requestId, journalId, offset }),
+    historyList: (requestId, page = {}) => invoke('history_list', {requestId, before: page.before ?? null, limit: page.limit ?? null, filter:page.filter ?? null}),
     historyCancel: (requestId) => invoke('history_cancel', {requestId}),
     revealJournal: (journalId) => invoke('reveal_journal', { journalId }),
     rollback: (journalId) => invoke('rollback', { journalId }),
+    libraryOverview: (query) => invoke('library_overview', { query }),
     libraryList: (query) => invoke('library_list', { query }),
+    libraryExportCsv: (query, requestId) => invoke('library_export_csv', { query, requestId }),
+    libraryPruneMissing: (root, automatic, requestId) => invoke('library_prune_missing', { root, automatic, requestId }),
     libraryGet: (code) => invoke('library_get', { code }),
     libraryTrash: (code, keepMedia) => invoke('library_trash', { code, keepMedia }),
     repairImagesStart: (code) => invoke('repair_images_start', { code }),
     metadataSourceCandidates: (code) => invoke('metadata_source_candidates', { code }),
+    batchEditPreview: (codes,edit,requestId) => invoke('batch_edit_preview',{codes,edit,requestId}),
+    batchEditApply: (token,root,requestId) => invoke('batch_edit_apply',{token,root,requestId}),
+    batchEditDiscard: (token) => invoke('batch_edit_discard',{token}),
     nfoExportPreview:(codes,language,requestId)=>invoke('nfo_export_preview',{codes,language,requestId}),
     nfoExportApply:(token,root,requestId)=>invoke('nfo_export_apply',{token,root,requestId}),
     templatePreview: (directory,file) => invoke('template_preview', {directory,file}),

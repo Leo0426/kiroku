@@ -1,10 +1,11 @@
 <script lang="ts">
   import { api } from '../lib/api'
+  import { reduced } from '../lib/motion'
   import type { MovieCard } from '../lib/types'
   import Icon from './Icon.svelte'
 
   /** delay < 0 表示不播放入场动画(滚动中新出现的卡片不应再动) */
-  let { card, delay = -1, onopen, onmenu }: { card: MovieCard | null; delay?: number; onopen?: (code: string) => void; onmenu?: (card: MovieCard, x: number, y: number) => void } = $props()
+  let { card, delay = -1, onopen, onmenu, layout = 'posters', index, tabIndex, onfocus }: { card: MovieCard | null; delay?: number; onopen?: (code: string) => void; onmenu?: (card: MovieCard, x: number, y: number) => void; layout?: 'posters' | 'list'; index?: number; tabIndex?: number; onfocus?: () => void } = $props()
 
   // 键盘(Shift+F10 / 菜单键)触发时没有鼠标坐标,改用卡片位置
   function contextmenu(e: MouseEvent) {
@@ -13,6 +14,22 @@
     const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
     const keyboard = e.clientX === 0 && e.clientY === 0
     onmenu(card, keyboard ? r.left + r.width / 2 : e.clientX, keyboard ? r.top + r.height / 2 : e.clientY)
+  }
+
+  // 悬停时海报随指针轻微倾斜,高光跟着光标走;只响应鼠标,触屏与减少动态效果时不动
+  let poster: HTMLDivElement | undefined = $state()
+  function tilt(e: PointerEvent) {
+    if (!poster || layout === 'list' || e.pointerType !== 'mouse' || reduced()) return
+    const r = poster.getBoundingClientRect()
+    const x = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width))
+    const y = Math.min(1, Math.max(0, (e.clientY - r.top) / r.height))
+    poster.style.setProperty('--rx', `${((0.5 - y) * 9).toFixed(2)}deg`)
+    poster.style.setProperty('--ry', `${((x - 0.5) * 11).toFixed(2)}deg`)
+    poster.style.setProperty('--gx', `${(x * 100).toFixed(1)}%`)
+    poster.style.setProperty('--gy', `${(y * 100).toFixed(1)}%`)
+  }
+  function untilt() {
+    for (const k of ['--rx', '--ry', '--gx', '--gy']) poster?.style.removeProperty(k)
   }
 
   let loaded = $state(false)
@@ -30,14 +47,20 @@
 {#if card}
   <button
     class="pcard"
+    data-card-index={index}
+    tabindex={tabIndex}
+    {onfocus}
+    class:list={layout === 'list'}
     class:enter={delay >= 0}
     style="--delay:{Math.max(delay, 0)}ms"
     aria-label="{card.code} {card.title ?? ''}"
     title="查看 {card.code} 的影片详情"
     onclick={() => onopen?.(card.code)}
     oncontextmenu={contextmenu}
+    onpointermove={tilt}
+    onpointerleave={untilt}
   >
-    <div class="poster">
+    <div class="poster" bind:this={poster}>
       {#if src && !failed}
         {#key src}
         <img class:ready={loaded} {src} alt="" loading="lazy" decoding="async" draggable="false" onload={() => (loaded = true)} onerror={() => (failed = true)} />
@@ -45,6 +68,7 @@
       {/if}
       <div class="ph" class:ready={loaded} class:skeleton-fill={!!src && !failed && !loaded} aria-hidden="true"><Icon name="image" size={26} /><span>{failed ? '海报未能加载' : !src ? '暂无海报' : card.code}</span></div>
       <div class="shade"></div>
+      <div class="glare" aria-hidden="true"></div>
       {#if card.score !== null && card.score >= 85}
         <span class="badge score tnum"><Icon name="star" size={10} />{(card.score / 10).toFixed(1)}</span>
       {/if}
@@ -55,10 +79,12 @@
     <div class="meta">
       <div class="title">{card.title ?? card.code}</div>
       <div class="sub"><span class="mono">{card.code}</span>{#if card.year}<span class="faint"> · {card.year}</span>{/if}</div>
+      {#if layout === 'list'}<div class="sub">{card.actors.join(' / ') || '暂无演员资料'}</div>{/if}
     </div>
+    {#if layout === 'list'}<div class="row-facts"><span>{card.score === null ? '暂无评分' : `${(card.score / 10).toFixed(1)} 分`}</span><span>{card.parts} 个文件{card.favorite ? ' · 已收藏' : ''}</span></div>{/if}
   </button>
 {:else}
-  <div class="pcard skel" aria-hidden="true">
+  <div class="pcard skel" class:list={layout === 'list'} aria-hidden="true">
     <div class="poster"></div>
     <div class="meta"><div class="line"></div><div class="line short"></div></div>
   </div>
@@ -76,11 +102,12 @@
   .poster {
     position: relative; width: 100%; aspect-ratio: var(--poster-ratio); overflow: hidden; border-radius: var(--r-md);
     background: var(--surface-2);
+    --tilt: perspective(720px) rotateX(var(--rx, 0deg)) rotateY(var(--ry, 0deg));
     transition: transform var(--d-base) var(--ease-out), box-shadow var(--d-base) var(--ease-out);
     will-change: transform;
   }
-  .pcard:hover .poster, .pcard:focus-visible .poster { transform: translateY(-5px) scale(1.03); box-shadow: var(--shadow-3); }
-  .pcard:active .poster { transform: translateY(-1px) scale(0.99); }
+  .pcard:hover .poster, .pcard:focus-visible .poster { transform: translateY(-5px) scale(1.03) var(--tilt); box-shadow: var(--shadow-3); }
+  .pcard:active .poster { transform: translateY(-1px) scale(0.99) var(--tilt); }
   .pcard:focus-visible { outline: none; }
   .pcard:focus-visible .poster { box-shadow: 0 0 0 2px var(--accent), var(--shadow-3); }
 
@@ -96,6 +123,12 @@
   .ph.skeleton-fill { background:linear-gradient(100deg,var(--surface-2) 30%,var(--surface-3) 50%,var(--surface-2) 70%); background-size:200% 100%; }
   .shade { position: absolute; inset: 0; background: linear-gradient(to top, rgb(0 0 0 / 0.5), transparent 38%); opacity: 0; transition: opacity var(--d-base) var(--ease-out); pointer-events: none; }
   .pcard:hover .shade, .pcard:focus-visible .shade { opacity: 1; }
+  .glare {
+    position: absolute; inset: 0; pointer-events: none; opacity: 0;
+    background: radial-gradient(circle at var(--gx, 50%) var(--gy, 0%), rgb(255 255 255 / 0.2), transparent 55%);
+    transition: opacity var(--d-base) var(--ease-out);
+  }
+  .pcard:hover .glare { opacity: 1; }
 
   .badge {
     position: absolute; display: inline-flex; align-items: center; gap: 3px; height: 20px; padding: 0 7px;
@@ -112,7 +145,7 @@
   }
   .pcard:hover .play, .pcard:focus-visible .play { opacity: 1; transform: scale(1); }
 
-  .meta { padding: 0 2px; height: 48px; overflow: hidden; }
+  .meta { padding: 0 2px; height: calc(48px * var(--text-scale, 1)); overflow: hidden; }
   .meta { transition: transform var(--d-base) var(--ease-out); }
   .pcard:hover .meta { transform: translateY(2px); }
   .title { transition: color var(--d-fast); }
@@ -127,4 +160,11 @@
   .line { height: 11px; border-radius: 6px; margin: 6px 0 0; width: 80%; }
   .line.short { width: 45%; }
   .badge.fav { left: auto; right: 8px; top: 8px; bottom: auto; color: var(--warn); }
+  .poster:has(.fav) .score { top:34px; }
+  .pcard.list { flex-direction:row; height:calc(72px * var(--text-scale, 1)); gap:14px; padding:6px 12px 6px 6px; border-radius:var(--r-sm); background:var(--surface-1); align-items:center; }
+  .list .poster { width:42px; height:60px; aspect-ratio:auto; flex-shrink:0; border-radius:5px; transform:none; box-shadow:none; }
+  .list .meta { height:auto; flex:1; min-width:0; transform:none; }
+  .list .title { font-size:var(--fs-md); }.list .badge,.list .play,.list .glare,.list .shade,.list .ph span { display:none; }
+  .row-facts { display:flex; flex-direction:column; gap:5px; text-align:right; color:var(--text-2); font-size:var(--fs-xs); flex-shrink:0; }
+  @media(max-width:560px) { .row-facts { max-width:80px; }.pcard.list { gap:10px; }.list .title { font-size:var(--fs-sm); } }
 </style>

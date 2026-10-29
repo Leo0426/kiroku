@@ -1,7 +1,7 @@
 //! Display-only bounded summaries. Never used by recovery or ownership discovery.
 use super::{Journal,JournalStatus,storage};
 use crate::pipeline::RootGuard;
-use serde::Serialize;
+use serde::{Serialize,Deserialize};
 use std::{collections::BTreeMap,fs,io,path::{Path,PathBuf}};
 use tokio_util::sync::CancellationToken;
 const MAX_ENTRIES:usize=4096;
@@ -18,20 +18,30 @@ impl HistorySummary {
 #[derive(Debug,Clone,PartialEq,Serialize)]
 #[serde(rename_all="camelCase")]
 pub struct HistoryPage {pub items:Vec<HistorySummary>,pub total:usize,pub next:Option<String>}
+#[derive(Debug,Clone,Default,Deserialize)]
+#[serde(rename_all="camelCase", default)]
+pub struct HistoryFilter { pub text:String, pub status:Option<JournalStatus>, pub from:Option<u64>, pub until:Option<u64> }
+impl HistoryFilter {
+    fn active(&self)->bool { !self.text.trim().is_empty() || self.status.is_some() || self.from.is_some() || self.until.is_some() }
+    fn matches(&self, summary:&HistorySummary, codes:&str)->bool {
+        self.status.is_none_or(|v|v==summary.status) && self.from.is_none_or(|v|summary.ts>=v) && self.until.is_none_or(|v|summary.ts<v)
+          && self.text.split_whitespace().all(|word|codes.contains(&word.to_lowercase()) || summary.id.to_lowercase().contains(&word.to_lowercase()))
+    }
+}
 #[derive(Clone,PartialEq)]
-struct Stamp {token:storage::Token,len:u64}
-fn stamp(path:&Path)->io::Result<Stamp>{crate::append::regular(path)?;let h=same_file::Handle::from_path(path)?;Ok(Stamp{token:storage::Token::of(&h)?,len:h.as_file().metadata()?.len()})}
-struct Cached {stamp:Stamp,summary:HistorySummary,bytes:usize}
+pub(super) struct Stamp {token:storage::Token,len:u64}
+pub(super) fn file_stamp(path:&Path)->io::Result<Stamp>{crate::append::regular(path)?;let h=same_file::Handle::from_path(path)?;Ok(Stamp{token:storage::Token::of(&h)?,len:h.as_file().metadata()?.len()})}
+struct Cached {stamp:Stamp,summary:HistorySummary,codes:String,bytes:usize}
 #[derive(Default)]
 pub struct HistoryCache {root:Option<(PathBuf,RootGuard)>,entries:BTreeMap<PathBuf,Cached>,bytes:usize}
 impl HistoryCache {
     pub fn retained(&self)->(usize,usize){(self.entries.len(),self.bytes)}
     pub fn clear(&mut self){self.entries.clear();self.bytes=0;self.root=None;}
-    fn insert(&mut self,path:PathBuf,stamp:Stamp,summary:HistorySummary){
+    fn insert(&mut self,path:PathBuf,stamp:Stamp,summary:HistorySummary,codes:String){
         if let Some(old)=self.entries.remove(&path){self.bytes-=old.bytes;}
-        let bytes=summary.bytes()+path.capacity()+std::mem::size_of::<Cached>()+128;
+        let bytes=summary.bytes()+codes.capacity()+path.capacity()+std::mem::size_of::<Cached>()+128;
         if bytes>MAX_BYTES{return}
-        self.bytes+=bytes;self.entries.insert(path,Cached{stamp,summary,bytes});
+        self.bytes+=bytes;self.entries.insert(path,Cached{stamp,summary,codes,bytes});
         // Keep newest filenames, avoiding a full-list LRU scan evicting all hot entries.
         while self.entries.len()>MAX_ENTRIES || self.bytes>MAX_BYTES {if let Some((_,old))=self.entries.pop_first(){self.bytes-=old.bytes;}}
     }
@@ -41,9 +51,13 @@ impl HistoryCache {
     /// 按 id 从新到旧取 `before` 之后的最多 `limit` 条；只解码本页的日志。
     /// 以 id 作游标，翻页期间新增的日志不会让后续页重复或漏项。
     pub fn read_page(&mut self,root:&Path,before:Option<&str>,limit:usize,cancel:&CancellationToken)->io::Result<HistoryPage>{
-        let result=self.read_inner(root,before,limit,cancel);if result.is_err(){self.clear();}result
+        self.read_filtered_page(root,before,limit,&HistoryFilter::default(),cancel)
     }
-    fn read_inner(&mut self,root:&Path,before:Option<&str>,limit:usize,cancel:&CancellationToken)->io::Result<HistoryPage>{
+    pub fn read_filtered_page(&mut self,root:&Path,before:Option<&str>,limit:usize,filter:&HistoryFilter,cancel:&CancellationToken)->io::Result<HistoryPage>{
+        if filter.text.len()>512 || filter.from.zip(filter.until).is_some_and(|(a,b)|a>=b){return Err(io::Error::other("历史筛选范围无效"))}
+        let result=self.read_inner(root,before,limit,filter,cancel);if result.is_err(){self.clear();}result
+    }
+    fn read_inner(&mut self,root:&Path,before:Option<&str>,limit:usize,filter:&HistoryFilter,cancel:&CancellationToken)->io::Result<HistoryPage>{
         crate::append::check_cancel(cancel)?;
         let alias=std::path::absolute(root)?;
         if !self.root.as_ref().is_some_and(|(p,guard)|*p==alias && guard.verify().is_ok()){self.clear();self.root=Some((alias,RootGuard::capture(root,false)?));}
@@ -57,22 +71,31 @@ impl HistoryCache {
         let present:std::collections::HashSet<&Path>=logs.iter().map(|(_,p)|p.as_path()).collect();
         self.entries.retain(|path,cached|{let keep=present.contains(path.as_path());if !keep{self.bytes-=cached.bytes;}keep});
         drop(present);
-        let start=before.map_or(0,|before|logs.partition_point(|(id,_)|id.as_str()>=before));
-        let end=start.saturating_add(limit).min(total);
+        let filtered=filter.active();
+        let start=if filtered {0} else {before.map_or(0,|before|logs.partition_point(|(id,_)|id.as_str()>=before))};
+        let end=if filtered {total} else {start.saturating_add(limit).min(total)};
         let next=(end<total && end>start).then(||logs[end-1].0.clone());
-        let mut out=Vec::with_capacity(end-start);
+        let mut out=Vec::with_capacity(limit.min(end-start));
+        let mut matched=0;let mut more=false;
         for (id,path) in logs.drain(start..end) {
             crate::append::check_cancel(cancel)?;guard.verify()?;
             let result=(|| {
-                crate::append::confined_path(root,&path)?;let before=stamp(&path)?;
-                if let Some(cached)=self.entries.get(&path).filter(|c|c.stamp==before){return Ok(cached.summary.clone())}
-                let summary=HistorySummary::of(Journal::load_cancellable(&path,cancel)?);
-                let after=stamp(&path)?;if before!=after{return Err(io::Error::other("读取期间日志已变化，请重试"))}
+                crate::append::confined_path(root,&path)?;let before=file_stamp(&path)?;
+                if let Some(cached)=self.entries.get(&path).filter(|c|c.stamp==before){return Ok((cached.summary.clone(),cached.codes.clone()))}
+                let journal=Journal::load_cancellable(&path,cancel)?;
+                let codes=journal.items.iter().map(|item|item.code.to_lowercase()).collect::<Vec<_>>().join("\n");
+                let summary=HistorySummary::of(journal);
+                let after=file_stamp(&path)?;if before!=after{return Err(io::Error::other("读取期间日志已变化，请重试"))}
                 guard.verify()?;crate::append::check_cancel(cancel)?;
-                self.insert(path.clone(),after,summary.clone());Ok(summary)
+                self.insert(path.clone(),after,summary.clone(),codes.clone());Ok((summary,codes))
             })();
-            match result {Ok(summary)=>out.push(summary),Err(e) if e.kind()==io::ErrorKind::Interrupted=>return Err(e),Err(e)=>{if let Some(old)=self.entries.remove(&path){self.bytes-=old.bytes;}out.push(HistorySummary::failed(id,e));}}
+            let (summary,codes)=match result {Ok(value)=>value,Err(e) if e.kind()==io::ErrorKind::Interrupted=>return Err(e),Err(e)=>{if let Some(old)=self.entries.remove(&path){self.bytes-=old.bytes;}(HistorySummary::failed(id.clone(),e),String::new())}};
+            if !filtered {out.push(summary)} else if filter.matches(&summary,&codes) {
+                matched+=1;
+                if before.is_none_or(|cursor|id.as_str()<cursor) {if out.len()<limit {out.push(summary)} else {more=true}}
+            }
         }
+        let (total,next)=if filtered {(matched,if more {out.last().map(|s|s.id.clone())}else{None})}else{(total,next)};
         guard.verify()?;crate::append::check_cancel(cancel)?;Ok(HistoryPage{items:out,total,next})
     }
 }
@@ -83,8 +106,8 @@ mod tests {
     #[test]
     fn cache_budget_drops_older_summaries_without_lru_scan_thrashing(){
         let root=tempfile::tempdir().unwrap();let mut cache=HistoryCache::default();
-        let j=Journal::new(root.path());j.save().unwrap();let stamp=stamp(&j.path()).unwrap();
-        for i in 0..5000 {let path=root.path().join(format!("journal-{i:08}.json"));let mut row=HistorySummary::of(Journal::new(root.path()));row.id=format!("{i:08}");cache.insert(path,stamp.clone(),row);}
+        let j=Journal::new(root.path());j.save().unwrap();let stamp=file_stamp(&j.path()).unwrap();
+        for i in 0..5000 {let path=root.path().join(format!("journal-{i:08}.json"));let mut row=HistorySummary::of(Journal::new(root.path()));row.id=format!("{i:08}");cache.insert(path,stamp.clone(),row,String::new());}
         assert_eq!(cache.retained().0,4096);assert!(cache.retained().1<=MAX_BYTES);assert!(cache.entries.contains_key(&root.path().join("journal-00004999.json")));assert!(!cache.entries.contains_key(&root.path().join("journal-00000000.json")));
     }
     #[test]
@@ -104,6 +127,19 @@ mod tests {
         fs::write(j.path(),b"broken").unwrap();assert!(cache.read(root.path(),&cancel).unwrap()[0].error.is_some());assert_eq!(cache.retained().0,0);
         let cancelled=CancellationToken::new();cancelled.cancel();assert_eq!(cache.read(root.path(),&cancelled).unwrap_err().kind(),io::ErrorKind::Interrupted);
     }
+    #[test]
+    fn filtered_history_searches_every_code_counts_matches_and_keeps_cursor() {
+        let root=tempfile::tempdir().unwrap();
+        for index in 0..3 {let mut j=Journal::new(root.path());j.ts=1000+index;j.status=if index==0{JournalStatus::RolledBack}else{JournalStatus::Applied};
+          j.items=(0..9).map(|i|super::super::JournalItem{code:format!("SMPL-{i:03}"),dir:root.path().into()}).collect();j.save().unwrap();}
+        let cancel=CancellationToken::new();let mut cache=HistoryCache::default();
+        let filter=HistoryFilter{text:"smpl-008".into(),status:Some(JournalStatus::Applied),from:Some(1001),until:Some(1003)};
+        let first=cache.read_filtered_page(root.path(),None,1,&filter,&cancel).unwrap();assert_eq!(first.total,2);assert_eq!(first.items.len(),1);assert_eq!(first.items[0].codes.len(),6);
+        let second=cache.read_filtered_page(root.path(),first.next.as_deref(),1,&filter,&cancel).unwrap();assert_eq!(second.total,2);assert_eq!(second.items.len(),1);assert_eq!(second.next,None);assert_ne!(first.items[0].id,second.items[0].id);
+        storage::metrics::take_reads();cache.read_filtered_page(root.path(),None,1,&filter,&cancel).unwrap();assert_eq!(storage::metrics::take_reads(),0);
+        assert_eq!(cache.read_page(root.path(),None,1,&cancel).unwrap().total,3);
+    }
+
     #[test]
     fn pages_follow_a_stable_cursor_and_cold_pages_decode_only_their_logs(){
         let root=tempfile::tempdir().unwrap();

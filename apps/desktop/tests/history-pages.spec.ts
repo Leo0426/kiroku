@@ -50,5 +50,5 @@ test('undo on an older page refreshes without collapsing the loaded records', as
   await expect(page.getByText(/已撤销，文件已按操作日志恢复/)).toBeVisible()
   await expect(cards(page)).toHaveCount(100)
   const calls = await page.evaluate(() => (window as any).historyCalls)
-  expect(calls.at(-1)).toEqual({ limit: 100 })
+  expect(calls.at(-1)).toEqual({ limit: 100, filter: { text:'', status:null, from:null, until:null } })
 })

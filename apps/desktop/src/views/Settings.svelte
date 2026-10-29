@@ -11,8 +11,12 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte'
   import { slide } from 'svelte/transition'
+  import { findSettings, type SettingLink } from '../lib/settings-search'
+  import AppearanceSettings from '../components/AppearanceSettings.svelte'
+  import AiSettings from '../components/AiSettings.svelte'
   import NameRules from '../components/NameRules.svelte'
   import Icon from '../components/Icon.svelte'
+  import InfoTip from '../components/InfoTip.svelte'
   import LibraryMaintenance from '../components/LibraryMaintenance.svelte'
   import SourceAuth from '../components/SourceAuth.svelte'
   import SourceChecks from '../components/SourceChecks.svelte'
@@ -53,6 +57,20 @@
   let tab = $state<SettingsTab>(lastTab)
   const tabIndex = $derived(TABS.findIndex((t) => t.key === tab))
   const current = $derived(TABS[tabIndex])
+
+  let search = $state('')
+  const matches = $derived(findSettings(search))
+  async function locate(item: SettingLink) {
+    go(item.tab)
+    if (item.target === 'settings-routes') rulesOpen = true
+    search = ''
+    await tick()
+    const target = item.target ? document.getElementById(item.target) : null
+    const focus = target && !target.matches(':disabled') ? target : document.querySelector<HTMLElement>('.pane-head')
+    if (focus && !focus.matches('input, select, textarea, button')) focus.tabIndex = -1
+    focus?.focus({ preventScroll:true })
+    ;(target ?? focus)?.scrollIntoView({ block:'center' })
+  }
 
   function go(t: SettingsTab) {
     tab = lastTab = t
@@ -228,27 +246,6 @@
     app.toast('info', `「${current.label}」已恢复默认,保存后生效`)
   }
 
-  // ---- AI 汉化 ----
-  let aiTesting = $state(false)
-  let aiResult = $state('')
-  let aiError = $state('')
-  let showKey = $state(false)
-
-  async function testAi() {
-    if (!s) return
-    aiTesting = true
-    aiResult = ''
-    aiError = ''
-    try {
-      const r = await api.aiTest($state.snapshot(s.ai))
-      aiResult = r.title ?? '(没有返回译文)'
-    } catch (e) {
-      aiError = String(e)
-    } finally {
-      aiTesting = false
-    }
-  }
-
   // ---- Plex ----
   let plexTesting = $state(false)
   let plexResult = $state<PlexTest | null>(null)
@@ -311,8 +308,7 @@
   {#if s}
     <header>
       <div>
-        <h1>设置</h1>
-        <p class="faint path">按分类调整，统一保存</p>
+        <div class="tipped"><h1>设置</h1><InfoTip label="设置说明"><p>按分类调整，统一保存。</p></InfoTip></div>
       </div>
       <div class="actions">
         <button class="btn ghost" onclick={reset} disabled={saving || KEYS[tab].length === 0} title="只恢复「{current.label}」分类">恢复本页默认</button>
@@ -322,6 +318,15 @@
       </div>
     </header>
 
+    <div class="settings-search">
+      <input class="input" type="search" aria-label="搜索设置" placeholder="搜索设置，例如代理、字体、模板" bind:value={search} onkeydown={e => { if (e.key === 'Escape') search = ''; if (e.key === 'Enter' && !e.isComposing && matches[0]) void locate(matches[0]) }} />
+      {#if search.trim()}
+        <div class="search-results" aria-label="设置搜索结果">
+          <p class="muted" role="status">{matches.length ? `${matches.length} 项匹配设置` : '没有匹配项，试试类别或功能名称。'}</p>
+          {#each matches as item}<button class="btn ghost" onclick={() => locate(item)}>{item.label}<span class="faint">{TABS.find(t => t.key === item.tab)?.label}</span></button>{/each}
+        </div>
+      {/if}
+    </div>
     {#if error}<div class="error" role="alert" aria-label="保存失败"><Icon name="alert" size={16} />{error}</div>{/if}
 
     <div class="layout">
@@ -345,15 +350,13 @@
       {#key tab}
       <div class="pane stagger" role="tabpanel" aria-label={current.label} in:rise={{ y: 10, duration: 280 }}>
         <div class="pane-head">
-          <h2 class="pane-title">{current.label}</h2>
-          <p class="faint">{current.desc}</p>
+          <div class="tipped"><h2 class="pane-title">{current.label}</h2><InfoTip label="{current.label}说明"><p>{current.desc}</p></InfoTip></div>
         </div>
     {#if tab === 'data'}<LibraryMaintenance {dirty} onpolicySaved={() => { if (s && app.settings) { s.retention = { ...app.settings.retention }; saved = JSON.stringify(s) } }} />{/if}
     {#if tab === 'names'}<NameRules bind:rules={s.name_rules} {dirty}/>{/if}
     {#if tab === 'general'}
     <section class="card">
-      <h2>媒体库</h2>
-      <p class="hint">整理后的影片和海报将保存到此目录。</p>
+      <div class="tipped"><h2>媒体库</h2><InfoTip label="媒体库说明"><p>整理后的影片和海报将保存到此目录。</p></InfoTip></div>
       <div class="row">
         <span class="label">位置</span>
         <span class="grow root mono">{app.settings?.library_root ?? '未设置'}</span>
@@ -364,13 +367,15 @@
       </div>
       {#if flow.step !== 'source' && flow.step !== 'done'}<p class="hint">完成或重置当前导入后，才能更换媒体库。</p>{/if}
       <div class="row">
-        <span class="label">索引</span>
-        <span class="grow faint hint2">从影片信息重建媒体库列表</span>
+        <span class="label with-tip">索引<InfoTip label="索引说明"><p>从影片信息重建媒体库列表。</p></InfoTip></span>
+        <span class="grow"></span>
         <button class="btn sm" onclick={() => app.rebuildIndex()} disabled={!app.settings?.library_root || app.rebuild.running || rootChanging}>
           <Icon name="refresh" size={14} />{app.rebuild.running ? `重建中 ${app.rebuild.done}/${app.rebuild.total}` : '重建索引'}
         </button>
       </div>
     </section>
+
+    <AppearanceSettings />
 
     {:else if tab === 'organize'}
     <section class="card">
@@ -382,26 +387,29 @@
         </select>
       </div>
       {#if s.organize_mode !== 'move'}<p class="hint">视频与字幕保留在原位置，执行和撤销都不会清理源目录。{s.organize_mode === 'hardlink' ? '硬链接共享内容，修改任一文件会影响另一文件；跨卷会明确失败，请选择复制。' : s.organize_mode === 'symlink' ? '软链接依赖源位置，移动、删除或修改源文件会阻止播放；源盘离线时保留库索引。' : '复制需要与媒体大小相同的新增空间。'}</p>{/if}
-      <label class="switch extra">
+      <div class="tipped extra"><label class="switch extra">
         <input class="checkbox" type="checkbox" disabled={s.organize_mode !== 'move'} bind:checked={s.cleanup_source} />
         <span>整理后清理原文件夹</span>
-      </label>
-      <p class="hint">仅将已整理完的源子文件夹移到废纸篓，可找回。</p>
-      <label class="switch extra">
+      </label><InfoTip label="整理后清理原文件夹说明"><p>仅将已整理完的源子文件夹移到废纸篓，可找回。</p></InfoTip></div>
+      <div class="tipped extra"><label class="switch extra">
         <input class="checkbox" type="checkbox" bind:checked={s.download_extrafanart} />
         <span>下载剧照</span>
-      </label>
-      <p class="hint">最多 12 张，开启后整理会更慢。</p>
-      <label class="switch extra">
+      </label><InfoTip label="下载剧照说明"><p>最多 12 张，开启后整理会更慢。</p></InfoTip></div>
+      <div class="tipped extra"><label class="switch extra">
         <input class="checkbox" type="checkbox" bind:checked={s.notify_on_finish} />
         <span>任务完成时发系统通知</span>
-      </label>
-      <p class="hint">批量刮削、整理和重建索引结束时，如果窗口不在前台就提醒。</p>
+      </label><InfoTip label="任务完成时发系统通知说明"><p>批量刮削、整理和重建索引结束时，如果窗口不在前台就提醒。</p></InfoTip></div>
     </section>
 
     {:else if tab === 'naming'}
     <section class="card">
-      <h2>命名模板</h2>
+      <div class="tipped"><h2>命名模板</h2><InfoTip label="模板语法与占位符"><p>actors/actresses 用「、」连接；runtime 为分钟，score 为 0–100 平均分。raw_name 是来源文件无扩展名名称，raw_dir 是来源父文件夹名称；ext 仅能用于目录模板，文件扩展名自动附加。每个名称最多 240 UTF-8 字节，实际截短将在整理预览中显示。</p><p>
+        占位符:{'{code} {number} {title} {original_title} {actor} {actors} {actress} {actresses} {year} {release} {studio} {publisher} {series} {directors} {runtime} {score} {content_type} {prefix} {suffix} {raw_name} {raw_dir} {ext}'};{'{actor}'} 取首个女优;目录模板用 / 分层。
+        文件相位(可空):{'{cd?}'} 分集号、{'{sub?}'} 中字为 C、{'{mosaic?}'} 为 censored / uncensored / cracked / leaked、{'{def?}'} 清晰度。
+        可选组 <span class="mono">[ - {'{series}'}]</span>:值缺失、或组内可空占位符全为空时整段省略;<span class="mono">[[…]]</span> 保留时外加方括号。
+        值映射 <span class="mono">{'{mosaic?|cracked=U,censored=}'}</span> 把原值改写成自定义文字。
+      </p>
+<p>默认文件名保留分集与中字/破解/流出标记,如 <span class="mono">SSIS-001-UC.mp4</span>、<span class="mono">SSIS-001-CD2-C.mp4</span>;整理后再扫描或重建索引仍能识别。</p></InfoTip></div>
       <div class="row">
         <label class="label" for="tpl">目录模板</label>
         <input id="tpl" class="input grow mono" type="text" bind:value={s.dir_template} />
@@ -412,46 +420,35 @@
         <button class="btn sm ghost" type="button" disabled={s.plex.naming || s.file_template === DEFAULT_FILE_TPL} onclick={() => (s!.file_template = DEFAULT_FILE_TPL)}>恢复默认</button>
       </div>
       {#if templateSample}<div aria-label="模板实时预览">{#if templateSample.error}<p role="alert">{templateSample.error}</p>{:else}<p class="hint">样例目录：{templateSample.directory}<br/>样例文件：{templateSample.file}</p>{/if}{#each templateSample.warnings as warning}<p>{warning}</p>{/each}</div>{/if}
-      <details class="help"><summary>模板语法与占位符</summary><p class="hint">actors/actresses 用「、」连接；runtime 为分钟，score 为 0–100 平均分。raw_name 是来源文件无扩展名名称，raw_dir 是来源父文件夹名称；ext 仅能用于目录模板，文件扩展名自动附加。每个名称最多 240 UTF-8 字节，实际截短将在整理预览中显示。</p>      <p class="hint">
-        占位符:{'{code} {number} {title} {original_title} {actor} {actors} {actress} {actresses} {year} {release} {studio} {publisher} {series} {directors} {runtime} {score} {content_type} {prefix} {suffix} {raw_name} {raw_dir} {ext}'};{'{actor}'} 取首个女优;目录模板用 / 分层。
-        文件相位(可空):{'{cd?}'} 分集号、{'{sub?}'} 中字为 C、{'{mosaic?}'} 为 censored / uncensored / cracked / leaked、{'{def?}'} 清晰度。
-        可选组 <span class="mono">[ - {'{series}'}]</span>:值缺失、或组内可空占位符全为空时整段省略;<span class="mono">[[…]]</span> 保留时外加方括号。
-        值映射 <span class="mono">{'{mosaic?|cracked=U,censored=}'}</span> 把原值改写成自定义文字。
-      </p>
-      <p class="hint">默认文件名保留分集与中字/破解/流出标记,如 <span class="mono">SSIS-001-UC.mp4</span>、<span class="mono">SSIS-001-CD2-C.mp4</span>;整理后再扫描或重建索引仍能识别。</p></details>
-      <div class="row"><label class="label" for="nfo-language">新整理 NFO 语言</label><select id="nfo-language" class="input" bind:value={s.nfo_language}><option value="current">当前文本</option><option value="zh-Hans">简体中文</option><option value="original">来源原文</option></select></div>
-      <details class="help"><summary>NFO 语言与播放器说明</summary><p class="hint">设置保存后用于新整理计划。已有影片请在详情中预览并导出；缺少对应语言时回退当前文本，人工锁定字段优先。Plex 使用文件名及海报；Kodi 使用 movie.nfo 时需启用「影片位于匹配标题的独立目录」。</p></details>
+      <div class="row"><span class="label with-tip"><label for="nfo-language">新整理 NFO 语言</label><InfoTip label="NFO 语言与播放器说明"><p>设置保存后用于新整理计划。已有影片请在详情中预览并导出；缺少对应语言时回退当前文本，人工锁定字段优先。Plex 使用文件名及海报；Kodi 使用 movie.nfo 时需启用「影片位于匹配标题的独立目录」。</p></InfoTip></span><select id="nfo-language" class="input" bind:value={s.nfo_language}><option value="current">当前文本</option><option value="zh-Hans">简体中文</option><option value="original">来源原文</option></select></div>
       {#if s.plex.naming}<p class="hint">已开启「Plex 友好命名」,文件名固定为 <span class="mono">番号-标记 标题 - cdN</span>,此模板不生效。</p>{/if}
 
     </section>
     {:else if tab === 'scan'}
     <section class="card">
-      <h2>扫描</h2>
-      <p class="hint">命中规则的视频会跳过，可在扫描结果中查看。</p>
+      <div class="tipped"><h2>扫描</h2><InfoTip label="扫描说明"><p>命中规则的视频会跳过，可在扫描结果中查看。</p></InfoTip></div>
       <div class="row">
-        <label class="label" for="scan-extra">样片 / 预告片</label>
+        <span class="label with-tip"><label for="scan-extra">样片 / 预告片</label><InfoTip label="扫描规则写法"><p>使用正则匹配文件名（含扩展名）；(?i) 表示不分大小写。样片规则留空则不跳过，黑名单每行一条。</p></InfoTip></span>
         <input id="scan-extra" class="input grow mono" type="text" spellcheck="false" placeholder="留空则不跳过" bind:value={s.scan.extra_pattern} />
         <button class="btn sm ghost" type="button" disabled={s.scan.extra_pattern === DEFAULT_EXTRA} onclick={() => (s!.scan.extra_pattern = DEFAULT_EXTRA)}>恢复默认</button>
       </div>
-      <details class="help"><summary>扫描规则写法</summary><p class="hint">使用正则匹配文件名（含扩展名）；(?i) 表示不分大小写。样片规则留空则不跳过，黑名单每行一条。</p></details>
       <div class="row top">
         <label class="label" for="scan-black">黑名单<span class="sub">广告等,每行一条</span></label>
         <textarea id="scan-black" class="input grow mono" rows="3" spellcheck="false" placeholder={'例:最新地址\n(?i)^ads?[-_. ]'} value={s.scan.blacklist.join('\n')} oninput={(e) => (s!.scan.blacklist = e.currentTarget.value.split('\n').map((l) => l.trim()).filter(Boolean))}></textarea>
       </div>
       <div class="row">
-        <label class="label" for="scan-min">最小体积</label>
+        <span class="label with-tip"><label for="scan-min">最小体积</label><InfoTip label="最小体积说明"><p>0 为不限制，短片建议保持 0。</p></InfoTip></span>
         <input id="scan-min" class="input num" type="number" min="0" step="10" value={s.scan.min_video_mb} oninput={(e) => (s!.scan.min_video_mb = Math.max(0, Math.floor(Number(e.currentTarget.value) || 0)))} />
-        <span class="faint hint2">MB · 0 为不限制，短片建议保持 0。</span>
+        <span class="faint hint2">MB</span>
       </div>
     </section>
 
     {:else if tab === 'badges'}
     <section class="card">
-      <label class="switch">
+      <div class="tipped"><label class="switch">
         <input class="checkbox" type="checkbox" bind:checked={s.badges.enabled} />
         <span>给封面加角标</span>
-      </label>
-      <p class="hint">只影响之后整理的封面。</p>
+      </label><InfoTip label="给封面加角标说明"><p>只影响之后整理的封面。同一角的角标自动叠放。</p></InfoTip></div>
       <div class="badge-layout">
         <div class="grow">
           <div class="row">
@@ -460,11 +457,10 @@
             <label class="switch inline" title="fanart.jpg,Plex / Jellyfin 用作背景"><input class="checkbox" type="checkbox" bind:checked={s.badges.fanart} disabled={!s.badges.enabled} /><span>横版封面</span></label>
           </div>
           <div class="row">
-            <label class="label" for="badge-scale">大小</label>
+            <span class="label with-tip"><label for="badge-scale">大小</label><InfoTip label="角标大小说明"><p>按图片高度计算比例。</p></InfoTip></span>
             <input id="badge-scale" class="grow range" type="range" min="0.03" max="0.25" step="0.01" bind:value={s.badges.scale} disabled={!s.badges.enabled} />
             <span class="num-out mono">{Math.round(s.badges.scale * 100)}%</span>
           </div>
-          <p class="hint">按图片高度计算比例。</p>
           {#each KINDS as k (k.key)}
             <div class="row">
               <label class="label" for="badge-{k.key}">{k.label}</label>
@@ -474,12 +470,10 @@
               </select>
             </div>
           {/each}
-          <p class="hint">同一角的角标自动叠放。</p>
-          <label class="switch">
+          <div class="tipped"><label class="switch">
             <input class="checkbox" type="checkbox" bind:checked={s.badges.external_subtitle} disabled={!s.badges.enabled} />
             <span>外挂中文字幕也算中字</span>
-          </label>
-          <p class="hint">视频文件名没有 -C 等标记，但随迁的字幕名带 .chs/.cht/.zh 等或含「中文」时，同样贴中字角标。</p>
+          </label><InfoTip label="外挂中文字幕也算中字说明"><p>视频文件名没有 -C 等标记，但随迁的字幕名带 .chs/.cht/.zh 等或含「中文」时，同样贴中字角标。</p></InfoTip></div>
         </div>
         <div class="badge-preview" class:off={!s.badges.enabled} style="--bh: {(187 * s.badges.scale).toFixed(1)}px" aria-hidden="true">
           {#each CORNERS as c (c.key)}
@@ -489,11 +483,8 @@
           {/each}
         </div>
       </div>
-    </section>
-
-    <details class="card help">
-      <summary>识别规则</summary>
-      <p class="hint">文件名或上级文件夹名中出现以下写法时贴对应角标(不分大小写)。普通有码影片不贴。多分片影片任一分片带标记即贴,清晰度取最高档。</p>
+      <div class="tip-links">
+        <span class="with-tip">识别规则<InfoTip label="识别规则"><p>文件名或上级文件夹名中出现以下写法时贴对应角标(不分大小写)。普通有码影片不贴。多分片影片任一分片带标记即贴,清晰度取最高档。</p>
       <ul class="rules">
         <li><span class="mark subtitle">字幕</span><span class="mono">-C</span><span class="mono">-UC</span><span class="mono">-CH</span><span>字幕 / 中文</span></li>
         <li><span class="mark uncensored">无码</span><span>无码番号(HEYZO、六位日期号等)/ 无码 / uncensored</span></li>
@@ -501,25 +492,21 @@
         <li><span class="mark leaked">流出</span><span class="mono">-LEAK</span><span class="mono">-LEAKED</span><span>流出</span></li>
         <li><span class="mark definition">4K</span><span class="mono">4K</span><span class="mono">8K</span><span class="mono">2160p</span><span>内置 4K / 8K;其他清晰度需自备角标图</span></li>
       </ul>
-      <p class="hint">例:<span class="mono">SSIS-001-UC-4K.mp4</span> → 字幕 + 破解 + 4K;<span class="mono">HEYZO-1234-leak.mp4</span> → 无码 + 流出。破解与流出同时出现时只贴破解。</p>
-    </details>
-
-    <details class="card help">
-      <summary>自定义角标图</summary>
-      <p class="hint">在下面的文件夹里放同名 PNG(透明背景)即可替换内置样式;清晰度还可以补上内置没有的档位。</p>
+      <p>例:<span class="mono">SSIS-001-UC-4K.mp4</span> → 字幕 + 破解 + 4K;<span class="mono">HEYZO-1234-leak.mp4</span> → 无码 + 流出。破解与流出同时出现时只贴破解。</p></InfoTip></span>
+        <span class="with-tip">自定义角标图<InfoTip label="自定义角标图"><p>在下面的文件夹里放同名 PNG(透明背景)即可替换内置样式;清晰度还可以补上内置没有的档位。</p>
       {#if stampDir}<div class="row"><span class="label">文件夹</span><span class="grow root mono">{stampDir}</span></div>{/if}
       <dl class="stamp-files">
         {#each [['subtitle.png', '中字'], ['uncensored.png', '无码'], ['cracked.png', '破解'], ['leaked.png', '流出'], ['4k.png / 8k.png', '清晰度(内置)'], ['1080p.png、720p.png、hd.png…', '其他清晰度,内置没有,放了才贴']] as [f, d] (f)}
           <dt class="mono">{f}</dt><dd>{d}</dd>
         {/each}
-      </dl>
-    </details>
+      </dl></InfoTip></span>
+      </div>
+    </section>
 
     {:else if tab === 'sources'}
     <SourceChecks {dirty} />
     <section class="card">
-      <h2>站点</h2>
-      <p class="hint">启用站点后需加入路线并保存。Cookie 明文保存在本机。</p>
+      <div class="tipped"><h2>站点</h2><InfoTip label="站点说明"><p>启用站点后需加入路线并保存。Cookie 明文保存在本机。</p></InfoTip></div>
       {#each s.sources as src (src.id)}
         <div class="source-entry">
         <div class="row">
@@ -527,10 +514,10 @@
             <input class="checkbox" type="checkbox" bind:checked={src.enabled} />
             <span>{name(src.id)}</span>
           </label>
+          {#if SOURCE_HINTS[src.id]}<InfoTip label="{name(src.id)} 说明"><p>{SOURCE_HINTS[src.id]}</p></InfoTip>{/if}
           <input class="input grow" type="text" bind:value={src.base} disabled={!src.enabled} aria-label="{name(src.id)} 域名" />
         </div>
         {#if SOURCE_HINTS[src.id]}
-          <p class="hint">{SOURCE_HINTS[src.id]}</p>
           {#if src.enabled}
             <div class="row">
               <span class="hint">{sourceRoutes(src.id) ? `已加入路线：${sourceRoutes(src.id)}` : '尚未加入任何路线，启用后仍不会请求。'}</span>
@@ -555,7 +542,7 @@
         {#if src.id === 'javdb' && src.enabled}
           <div class="cookie" transition:slide={{ duration: dur(220) }}>
             <div class="row">
-              <label class="label" for="javdb-cookie">登录 Cookie<span class="sub">可选</span></label>
+              <span class="label with-tip"><label for="javdb-cookie">登录 Cookie<span class="sub">可选</span></label><InfoTip label="Cookie 获取方法"><p>FC2 等影片的详情页要求登录。获取方法:在浏览器登录 JavDB → 打开开发者工具「网络」面板 → 刷新页面 → 点第一个请求,复制请求头里 <span class="mono">Cookie</span> 的整行内容粘贴到这里。Cookie 以明文保存在本机设置文件里;过期后刮削会提示重新填写。</p></InfoTip></span>
               <input
                 id="javdb-cookie" class="input grow mono" type={showCookie ? 'text' : 'password'} autocomplete="off" spellcheck="false"
                 placeholder="_jdb_session=…"
@@ -564,9 +551,6 @@
               <button class="btn sm ghost" type="button" onclick={() => (showCookie = !showCookie)}>{showCookie ? '隐藏' : '显示'}</button>
               <span class="state" class:ok={!!src.cookie}>{src.cookie ? '已填写' : '未登录'}</span>
             </div>
-            <details class="help"><summary>如何获取登录 Cookie</summary><p class="hint">
-              FC2 等影片的详情页要求登录。获取方法:在浏览器登录 JavDB → 打开开发者工具「网络」面板 → 刷新页面 → 点第一个请求,复制请求头里 <span class="mono">Cookie</span> 的整行内容粘贴到这里。Cookie 以明文保存在本机设置文件里;过期后刮削会提示重新填写。
-            </p></details>
           </div>
         {/if}
         {#if src.enabled}
@@ -599,10 +583,9 @@
     <section class="card">
       <h2>网络</h2>
       <div class="row">
-        <label class="label" for="interval">同站点请求间隔(秒)</label>
+        <span class="label with-tip"><label for="interval">同站点请求间隔(秒)</label><InfoTip label="请求间隔说明"><p>建议至少 5 秒，过快可能被站点限制。</p></InfoTip></span>
         <input id="interval" class="input num tnum" type="number" min="1" bind:value={s.min_interval_secs} />
       </div>
-      <p class="hint">建议至少 5 秒，过快可能被站点限制。</p>
       <div class="row">
         <label class="label" for="proxy">代理</label>
         <input
@@ -611,7 +594,7 @@
         />
       </div>
       <div class="row">
-        <label class="label" for="solver">求解器地址<span class="sub">可选</span></label>
+        <span class="label with-tip"><label for="solver">求解器地址<span class="sub">可选</span></label><InfoTip label="求解器说明"><p>给被 Cloudflare 挑战拦住的站点（如 JavLibrary）用。需要你自己运行 FlareSolverr，kiroku 只调用这个地址；在上面的站点里单独开启「经求解器访问」。图片仍直接下载。</p></InfoTip></span>
         <input
           id="solver" class="input grow mono" type="text" placeholder="http://127.0.0.1:8191/v1"
           value={s.solver.url} oninput={(e) => (s!.solver.url = e.currentTarget.value.trim())}
@@ -623,41 +606,33 @@
           <input id="solver-timeout" class="input num tnum" type="number" min="1" bind:value={s.solver.timeout_secs} />
         </div>
       {/if}
-      <p class="hint">给被 Cloudflare 挑战拦住的站点（如 JavLibrary）用。需要你自己运行 FlareSolverr，kiroku 只调用这个地址；在上面的站点里单独开启「经求解器访问」。图片仍直接下载。</p>
     </section>
 
     {:else if tab === 'advanced'}
-    <details class="card help"><summary>设置文件位置</summary><p class="hint mono file-path">{path}</p></details>
     <section class="card">
-      <h2>日志</h2>
-      <p class="hint">记录运行过程，方便排查问题。</p>
-      <label class="switch extra">
+      <div class="tipped"><h2>日志</h2><InfoTip label="日志说明"><p>记录运行过程，方便排查问题。</p></InfoTip><span class="tip-links"><span class="with-tip">设置文件位置<InfoTip label="设置文件位置"><p class="mono file-path">{path}</p></InfoTip></span></span></div>
+      <div class="tipped extra"><label class="switch extra">
         <input class="checkbox" type="checkbox" bind:checked={s.log.app} />
         <span>在 App 内显示</span>
-      </label>
-      <p class="hint">在整理进度中查看、复制日志。</p>
-      <label class="switch extra">
+      </label><InfoTip label="在 App 内显示说明"><p>在整理进度中查看、复制日志。</p></InfoTip></div>
+      <div class="tipped extra"><label class="switch extra">
         <input class="checkbox" type="checkbox" bind:checked={s.log.file} />
         <span>写入日志文件</span>
-      </label>
-      <p class="hint">按天保存为 <span class="mono">kiroku-日期.log</span>{#if logDir},位于 <span class="mono">{logDir}</span>{/if}。</p>
+      </label><InfoTip label="写入日志文件说明"><p>按天保存为 <span class="mono">kiroku-日期.log</span>{#if logDir},位于 <span class="mono">{logDir}</span>{/if}。</p></InfoTip></div>
       <div class="row"><button class="btn sm" type="button" onclick={() => api.openLogDir().catch((e) => (error = String(e)))}><Icon name="folder" size={14} />打开日志文件夹</button></div>
-      <label class="switch extra">
+      <div class="tipped extra"><label class="switch extra">
         <input class="checkbox" type="checkbox" bind:checked={s.log.console} />
         <span>输出到终端</span>
-      </label>
-      <p class="hint">从终端启动应用时可见。</p>
-      <label class="switch extra">
+      </label><InfoTip label="输出到终端说明"><p>从终端启动应用时可见。</p></InfoTip></div>
+      <div class="tipped extra"><label class="switch extra">
         <input class="checkbox" type="checkbox" bind:checked={s.log.verbose} />
         <span>详细模式</span>
-      </label>
-      <p class="hint">记录请求详情，日志会更多。</p>
+      </label><InfoTip label="详细模式说明"><p>记录请求详情，日志会更多。</p></InfoTip></div>
     </section>
 
     <LibraryMaintenance {dirty} onpolicySaved={() => { if (s && app.settings) { s.retention = { ...app.settings.retention }; saved = JSON.stringify(s) } }} />
     <details id="settings-routes" class="card help" open={rulesOpen}>
-      <summary>内容类型路由</summary>
-      <p class="hint">番号会被识别为某种内容类型,只请求该类型路由里启用的站,按顺序排列。</p>
+      <summary>内容类型路由<InfoTip label="内容类型路由说明"><p>番号会被识别为某种内容类型,只请求该类型路由里启用的站,按顺序排列。</p></InfoTip></summary>
       {#each CONTENT_TYPES as ct (ct.key)}
         <div class="field">
           <div class="field-name">{ct.label}<span class="sub">{ct.hint}</span></div>
@@ -667,10 +642,7 @@
     </details>
 
     <details class="card help" open={rulesOpen}>
-      <summary>字段优先级</summary>
-      <p class="hint">
-        每个字段取链上第一个非空来源(封面、预告片等 URL 类字段沿链合并)。「提前」把站点排到路由最前;「屏蔽」让该字段不用某站,与「提前」冲突时屏蔽优先。
-      </p>
+      <summary>字段优先级<InfoTip label="字段优先级说明"><p>每个字段取链上第一个非空来源(封面、预告片等 URL 类字段沿链合并)。「提前」把站点排到路由最前;「屏蔽」让该字段不用某站,与「提前」冲突时屏蔽优先。</p></InfoTip></summary>
       <div class="grid head"><span>字段</span><span>提前</span><span>屏蔽</span></div>
       {#each FIELDS as f (f.key)}
         <div class="field grid">
@@ -683,66 +655,20 @@
 
     {:else if tab === 'ai'}
     <section class="card">
-      <p class="hint">使用 Claude 翻译标题与简介，需要 API Key，按调用量计费。</p>
-      <label class="switch extra">
-        <input class="checkbox" type="checkbox" bind:checked={s.ai.enabled} />
-        <span>启用 AI 汉化</span>
-      </label>
-      {#if s.ai.enabled}
-      <div class="plexbox" transition:slide={{ duration: dur(240) }}>
-        <div class="row">
-          <label class="label" for="ai-key">API Key</label>
-          <input id="ai-key" class="input grow mono" type={showKey ? 'text' : 'password'} autocomplete="off" spellcheck="false" placeholder="sk-ant-…" bind:value={s.ai.api_key} disabled={!s.ai.enabled} />
-          <button class="btn sm ghost" type="button" onclick={() => (showKey = !showKey)} disabled={!s.ai.enabled}>{showKey ? '隐藏' : '显示'}</button>
-          <button class="btn sm" onclick={testAi} disabled={!s.ai.enabled || aiTesting}>
-            <Icon name={aiTesting ? 'loader' : 'check'} size={14} />试译
-          </button>
-        </div>
-        <div class="row">
-          <span class="label">翻译哪些</span>
-          <label class="switch inline"><input class="checkbox" type="checkbox" bind:checked={s.ai.title} disabled={!s.ai.enabled} /><span>标题</span></label>
-          <label class="switch inline"><input class="checkbox" type="checkbox" bind:checked={s.ai.plot} disabled={!s.ai.enabled} /><span>简介</span></label>
-        </div>
-        {#if aiError}<p class="plex-err" role="alert">{aiError}</p>{/if}
-        {#if aiResult}<p class="ai-ok">试译:{aiResult}</p>{/if}
-        <button class="more" type="button" aria-expanded={more} onclick={() => (more = !more)} disabled={!s.ai.enabled}>
-          <Icon name="arrow-right" size={13} class={more ? 'rot' : ''} />更多选项
-          <span class="faint">模型、思考强度、API 地址</span>
-        </button>
-        {#if more}
-          <div transition:slide={{ duration: dur(220) }}>
-            <div class="row">
-              <label class="label" for="ai-model">模型</label>
-              <input id="ai-model" class="input grow mono" type="text" bind:value={s.ai.model} disabled={!s.ai.enabled} />
-              <select class="input" bind:value={s.ai.effort} disabled={!s.ai.enabled} aria-label="思考强度">
-                <option value="low">省钱(low)</option>
-                <option value="medium">均衡(medium)</option>
-                <option value="high">细致(high)</option>
-              </select>
-            </div>
-            <div class="row">
-              <label class="label" for="ai-url">API 地址</label>
-              <input id="ai-url" class="input grow mono" type="text" bind:value={s.ai.base_url} disabled={!s.ai.enabled} />
-            </div>
-            <details class="help"><summary>模型与失败处理说明</summary><p class="hint">默认模型 claude-opus-5-5;翻译是简单任务,默认用 low 档以省钱。使用兼容 Anthropic 协议的中转时改 API 地址。模型因安全策略拒绝时会自动换模型重试;仍失败的保留日文,在刮削列表里提示。</p></details>
-          </div>
-        {/if}
-      </div>
-      {/if}
+      <AiSettings bind:cfg={s.ai} />
       <div class="row">
-        <span class="hint grow">已翻译的标题和简介会缓存在本机，同样的原文、模型和档位不再重复计费。</span>
+        <span class="with-tip grow">译文缓存<InfoTip label="译文缓存说明"><p>已翻译的标题和简介会缓存在本机，同一服务、模型和生成选项下的原文可复用缓存。</p></InfoTip></span>
         <button class="btn sm" type="button" onclick={clearTranslationCache}>清空译文缓存</button>
       </div>
     </section>
 
     {:else if tab === 'plex'}
     <section class="card">
-      <details class="help"><summary>Plex 媒体库配置方法</summary><p class="hint">Plex 不读 NFO:它按文件名识别片名,用目录里的 poster.jpg / fanart.jpg 作封面和背景。建议在 Plex 里把媒体库文件夹建成影片库,代理选「Personal Media / 个人媒体」并勾选「使用本地资源」。</p></details>
-      <label class="switch extra">
+      <div class="tipped"><h2>Plex</h2><InfoTip label="Plex 媒体库配置方法"><p>Plex 不读 NFO:它按文件名识别片名,用目录里的 poster.jpg / fanart.jpg 作封面和背景。建议在 Plex 里把媒体库文件夹建成影片库,代理选「Personal Media / 个人媒体」并勾选「使用本地资源」。</p></InfoTip></div>
+      <div class="tipped extra"><label class="switch extra">
         <input class="checkbox" type="checkbox" bind:checked={s.plex.naming} />
         <span>Plex 友好命名</span>
-      </label>
-      <p class="hint">之后整理的文件名包含标题与分集号，并覆盖自定义文件名模板。</p>
+      </label><InfoTip label="Plex 友好命名说明"><p>之后整理的文件名包含标题与分集号，并覆盖自定义文件名模板。</p></InfoTip></div>
       <label class="switch extra">
         <input class="checkbox" type="checkbox" bind:checked={s.plex.enabled} />
         <span>整理和撤销后通知 Plex 刷新</span>
@@ -754,14 +680,13 @@
           <input id="plex-url" class="input grow" type="text" placeholder="http://127.0.0.1:32400" bind:value={s.plex.url} disabled={!s.plex.enabled} />
         </div>
         <div class="row">
-          <label class="label" for="plex-token">X-Plex-Token</label>
+          <span class="label with-tip"><label for="plex-token">X-Plex-Token</label><InfoTip label="如何获取 Plex Token"><p>在 Plex 网页版任一影片上点「…→ 获取信息 → 查看 XML」,地址栏里 <span class="mono">X-Plex-Token=</span> 后面那串就是。</p></InfoTip></span>
           <input id="plex-token" class="input grow mono" type={showToken ? 'text' : 'password'} autocomplete="off" spellcheck="false" bind:value={s.plex.token} disabled={!s.plex.enabled} />
           <button class="btn sm ghost" type="button" onclick={() => (showToken = !showToken)} disabled={!s.plex.enabled}>{showToken ? '隐藏' : '显示'}</button>
           <button class="btn sm" onclick={testPlex} disabled={!s.plex.enabled || plexTesting}>
             <Icon name={plexTesting ? 'loader' : 'refresh'} size={14} />测试连接
           </button>
         </div>
-        <details class="help"><summary>如何获取 Plex Token</summary><p class="hint">Token 获取:在 Plex 网页版任一影片上点「…→ 获取信息 → 查看 XML」,地址栏里 <span class="mono">X-Plex-Token=</span> 后面那串就是。</p></details>
         {#if plexError}<p class="plex-err" role="alert">{plexError}</p>{/if}
         {#if plexResult}
           <ul class="sections">
@@ -780,7 +705,7 @@
       {/if}
     </section>
     <section class="card" aria-label="Jellyfin 与 Emby">
-      <details class="help"><summary>Jellyfin / Emby 配置方法</summary><p class="hint">Jellyfin 和 Emby 读取影片目录里的 NFO、海报与背景图。在服务器里把媒体库文件夹建成「电影」库并启用 NFO 元数据读取；API Key 在服务器后台「API 密钥」中创建。</p></details>
+      <div class="tipped"><h2>Jellyfin / Emby</h2><InfoTip label="Jellyfin / Emby 配置方法"><p>Jellyfin 和 Emby 读取影片目录里的 NFO、海报与背景图。在服务器里把媒体库文件夹建成「电影」库并启用 NFO 元数据读取；API Key 在服务器后台「API 密钥」中创建。</p></InfoTip></div>
       <label class="switch extra">
         <input class="checkbox" type="checkbox" bind:checked={s.media_server.enabled} />
         <span>整理和撤销后通知 Jellyfin / Emby 刷新</span>
@@ -804,14 +729,13 @@
           </button>
         </div>
         <div class="row">
-          <label class="label" for="server-local">本机路径前缀</label>
+          <span class="label with-tip"><label for="server-local">本机路径前缀</label><InfoTip label="路径前缀说明"><p>服务器在 Docker 或 NAS 上看到的路径与本机不同时填写，两者都留空表示路径相同。</p></InfoTip></span>
           <input id="server-local" class="input grow mono" type="text" placeholder="/Volumes/NAS/av" spellcheck="false" bind:value={s.media_server.local_prefix} />
         </div>
         <div class="row">
           <label class="label" for="server-remote">服务器路径前缀</label>
           <input id="server-remote" class="input grow mono" type="text" placeholder="/media/av" spellcheck="false" bind:value={s.media_server.server_prefix} />
         </div>
-        <p class="hint">服务器在 Docker 或 NAS 上看到的路径与本机不同时填写，两者都留空表示路径相同。</p>
         {#if serverError}<p class="plex-err" role="alert">{serverError}</p>{/if}
         {#if serverResult}
           <p class="hint">已连接 {serverResult.serverName || serverName} {serverResult.version}</p>
@@ -842,6 +766,11 @@
 </div>
 
 <style>
+  .settings-search { position:relative; margin:0 var(--s5) var(--s3); flex-shrink:0; }
+  .settings-search > input { width:100%; }
+  .search-results { position:absolute; top:calc(100% + 4px); left:0; right:0; z-index:10; background:var(--surface-1); border:1px solid var(--line-strong); border-radius:var(--r-md); box-shadow:var(--shadow-2); padding:var(--s3); max-height:45vh; overflow:auto; }
+  .search-results button { width:100%; height:auto; min-height:34px; justify-content:space-between; text-align:left; white-space:normal; }
+
   .page { max-width: 1000px; margin: 0 auto; padding: var(--s6) var(--s5) var(--s7); }
   header { display: flex; justify-content: space-between; align-items: flex-start; gap: var(--s4); margin-bottom: var(--s4); position: sticky; top: 0; z-index: 5; padding: var(--s3) 0; background: linear-gradient(var(--bg) 70%, transparent); }
   h1 { font-size: var(--fs-2xl); font-weight: 700; letter-spacing: -0.01em; }
@@ -887,6 +816,14 @@
   .field:hover { background: color-mix(in srgb, var(--surface-2) 60%, transparent); }
   .hint { color: var(--text-2); font-size: var(--fs-sm); margin: var(--s1) 0 var(--s3); }
   .hint2 { font-size: var(--fs-sm); }
+  /* 标题 / 开关 / 字段名后面跟说明图标 */
+  .tipped { display: flex; align-items: center; gap: var(--s1); }
+  .tipped.extra { margin-top: var(--s3); }
+  .tipped > .switch { min-width: 0; }
+  .tipped > h2 { margin-bottom: 0; }
+  .with-tip { display: inline-flex; align-items: center; gap: var(--s1); }
+  .tip-links { display: flex; flex-wrap: wrap; gap: var(--s1) var(--s4); margin-left: auto; color: var(--text-2); font-size: var(--fs-sm); }
+  .card > .tip-links { margin-top: var(--s3); }
   .row { display: flex; align-items: center; gap: var(--s3); margin: var(--s2) 0; }
   .row.top { align-items: flex-start; }
   textarea.input { resize: vertical; min-height: 64px; padding-top: 6px; line-height: 1.5; }
@@ -906,7 +843,6 @@
   .cookie .label { min-width: 126px; }
   .state { font-size: var(--fs-xs); font-weight: 600; padding: 2px 8px; border-radius: var(--r-pill); background: var(--surface-3); color: var(--text-3); white-space: nowrap; transition: background var(--d-base), color var(--d-base); }
   .state.ok { background: var(--ok-soft); color: var(--ok); animation: pop 300ms var(--ease-back); }
-  .ai-ok { color: var(--ok); font-size: var(--fs-sm); margin-top: var(--s2); animation: rise 240ms var(--ease-out) both; }
   .badge-layout { display: flex; gap: var(--s5); align-items: flex-start; }
   .range { accent-color: var(--accent); }
   .num-out { width: 40px; text-align: right; font-size: var(--fs-sm); color: var(--text-2); }

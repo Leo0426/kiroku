@@ -43,12 +43,12 @@
   --font: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB',
     'Microsoft YaHei UI', 'Microsoft YaHei', system-ui, sans-serif;
   --font-mono: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
-  --fs-xs: 11.5px;
-  --fs-sm: 12.5px;
-  --fs-md: 14px;
-  --fs-lg: 16px;
-  --fs-xl: 20px;
-  --fs-2xl: 28px;
+  --fs-xs: calc(11.5px * var(--text-scale, 1));
+  --fs-sm: calc(12.5px * var(--text-scale, 1));
+  --fs-md: calc(14px * var(--text-scale, 1));
+  --fs-lg: calc(16px * var(--text-scale, 1));
+  --fs-xl: calc(20px * var(--text-scale, 1));
+  --fs-2xl: calc(28px * var(--text-scale, 1));
 
   /* 4px 间距阶梯 */
   --s1: 4px;
@@ -81,8 +81,7 @@
   --poster-ratio: 309 / 438;
 }
 
-@media (prefers-color-scheme: light) {
-  :root:not([data-theme='dark']) {
+:root[data-theme='light'] {
     color-scheme: light;
     --bg: #f5f3ef;
     --surface-1: #ffffff;
@@ -111,7 +110,6 @@
     --shadow-2: 0 8px 24px rgb(30 24 16 / 0.12), 0 2px 6px rgb(30 24 16 / 0.08);
     --shadow-3: 0 24px 60px rgb(30 24 16 / 0.2), 0 6px 16px rgb(30 24 16 / 0.1);
     --inset-edge: inset 0 0 0 1px rgb(30 24 16 / 0.05);
-  }
 }
 
 /* 减少动态效果:时长归零,保留状态变化但不再有位移/缩放过程 */
@@ -130,3 +128,5 @@
 @media (min-width: 1500px) {
   :root { --card-w: 196px; }
 }
+
+:root[data-motion='reduced'] { --d-fast:0.01ms; --d-base:0.01ms; --d-slow:0.01ms; }

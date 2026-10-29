@@ -1,4 +1,6 @@
+import { normalizeAi, selectedAiProvider, validateAi, validateAiProvider } from '../ai'
 import { assetUrl } from '../asset-url'
+import { csvCell } from '../library-browser'
 // 浏览器预览用的后端模拟:实现与 Tauri 相同的 Api 接口,并通过同一条事件总线发事件。
 // 目的是不启动桌面壳也能走通完整闭环(扫描 → 刮削 → 计划 → 执行 → 浏览 → 回滚)。
 
@@ -73,7 +75,7 @@ const DEFAULTS: Settings = {
     enabled: false, scale: 0.08, poster: true, fanart: false, external_subtitle: true,
     corners: { subtitle: 'top_left', uncensored: 'top_left', cracked: 'top_left', leaked: 'top_left', definition: 'top_left' },
   },
-  ai: { enabled: false, api_key: '', model: 'claude-opus-5-5', base_url: 'https://api.anthropic.com', effort: 'low', title: true, plot: true },
+  ai: normalizeAi(),
   library_root: null,
   source_dirs: [],
   notify_on_finish: true,
@@ -109,7 +111,7 @@ let settings: Settings = (() => {
     badges.corners = { ...DEFAULTS.badges.corners, ...saved.badges?.corners }
     const sources = saved.sources ? clone(saved.sources) : clone(DEFAULTS.sources)
     for (const source of DEFAULTS.sources) if (!sources.some(s => s.id === source.id)) sources.push(clone(source))
-    return { ...clone(DEFAULTS), ...saved, sources, badges, name_rules: {...clone(DEFAULTS.name_rules),...saved.name_rules}, media_server: { ...clone(DEFAULTS.media_server), ...saved.media_server }, scan: { ...clone(DEFAULTS.scan), ...saved.scan }, log: { ...clone(DEFAULTS.log), ...saved.log } }
+    return { ...clone(DEFAULTS), ...saved, sources, badges, ai: normalizeAi(saved.ai), name_rules: {...clone(DEFAULTS.name_rules),...saved.name_rules}, media_server: { ...clone(DEFAULTS.media_server), ...saved.media_server }, scan: { ...clone(DEFAULTS.scan), ...saved.scan }, log: { ...clone(DEFAULTS.log), ...saved.log } }
   } catch {
     return clone(DEFAULTS)
   }
@@ -337,6 +339,7 @@ function projectText(input:Metadata){
  }return {meta,warnings}
 }
 let languageBatch:import('../types').LanguageBatchPreview|null=null,languageSettings:Settings|null=null
+let editBatch:import('../types').LanguageBatchPreview|null=null,editSettings:Settings|null=null
 const pendingCache = new Map<string, { key: string; at: number; value: PendingList | PendingSummary }>()
 let pendingRequest: { requestId: string; id: number } | null = null
 void listen('library:changed', () => pendingCache.clear())
@@ -369,12 +372,28 @@ async function readPending(preview: boolean, requestId: string = crypto.randomUU
   } finally { if (pendingRequest?.id === id) pendingRequest = null; end() }
 }
 
+function matchingMovies(q: Query) {
+    const words = (q.text ?? '').toLowerCase().split(/\s+/).filter(Boolean)
+    return movies.filter((m) => {
+      if (q.contentType && m.contentType !== q.contentType) return false
+      if (q.year && m.year !== q.year) return false
+      if (q.minScore !== undefined && (m.score == null || m.score < q.minScore)) return false
+      if (q.missing === 'poster' && !m.missingPoster) return false
+      if (q.missing === 'score' && m.score != null) return false
+      if (q.missing === 'year' && m.year != null) return false
+      const own = facetValues(m)
+      if (!(q.filters ?? []).every((f) => own[f.kind].includes(f.value))) return false
+      const hay = `${m.code} ${m.title} ${m.actors.join(' ')} ${m.studio} ${m.series ?? ''}`.toLowerCase()
+      return words.every((w) => hay.includes(w))
+    })
+}
+
 export const mockApi: Api = {
   async recoveryInspect(){const id=begin();try{if(!settings.library_root)throw '媒体库未设置';const list=history.map(({added:_a,...h})=>({...h}));return {root:settings.library_root,entries:list.filter(j=>j.error||j.status==='partial'||j.pendingOperations).map(j=>({id:j.id,kind:j.error?'corrupt' as const:j.pendingOperations?'pending' as const:'partial' as const,codes:j.codes,pendingOperations:j.pendingOperations,message:j.error?`日志无法安全读取：${j.error}`:j.pendingOperations?'有中断操作待核对':'上次操作部分完成',canUndo:!j.error&&/^\d+$/.test(j.id)}))}}finally{end()}},
 
   async catalogInventory(requestId){const id=begin();try{if(requestId!==undefined)emitMock('job:started',{jobId:id,requestId});emitMock('library:catalog',{jobId:id,phase:'inventory',done:0,total:0,code:''});if(!settings.library_root)throw '请先设置媒体库';const names:Record<string,Record<string,number>>={},list:import('../types').CatalogMovie[]=[];for(const m of movies){if(job?.cancelled)break;const d=await mockApi.libraryGet(m.code);if(!d)continue;const fields={actors:d.meta.actors.map(a=>a.name),tags:d.meta.tags,studio:d.meta.studio?[d.meta.studio]:[],publisher:d.meta.publisher?[d.meta.publisher]:[],series:d.meta.series?[d.meta.series]:[]};list.push({code:m.code,dir:d.dir,names:fields});for(const f of NAME_FIELDS)for(const name of new Set(fields[f])){names[f]??={};names[f][name]=(names[f][name]??0)+1}}return {movies:list,names,errors:[],cancelled:!!job?.cancelled}}finally{end()}},
   async catalogPreview(dirs,requestId){const id=begin();try{if(requestId!==undefined)emitMock('job:started',{jobId:id,requestId});catalogPending=null;emitMock('library:catalog',{jobId:id,phase:'preview',done:0,total:dirs.length,code:''});const items:import('../types').CatalogPreview['items']=[],warnings:string[]=[];for(const dir of new Set(dirs)){if(job?.cancelled)throw '预览已取消';const m=movies.find(m=>(originalDirs.get(m.code)??`${settings.library_root}/${m.actors[0]}/${m.code}`)===dir);if(!m)throw '影片目录不存在';const d=(await mockApi.libraryGet(m.code))!;if(job?.cancelled)throw '预览已取消';const p=projectNames(d.meta,settings.name_rules);warnings.push(...p.warnings);const changes=[...NAME_FIELDS,'title' as const].filter(f=>JSON.stringify(d.meta[f])!==JSON.stringify(p.metadata[f])).map(f=>({field:f,before:clone(d.meta[f]),after:clone(p.metadata[f])}));items.push({root:settings.library_root??'',dir,code:m.code,before:d.meta,after:p.metadata,changes})}catalogSettings=JSON.stringify(settings);catalogPending={token:String(id),root:settings.library_root??'',fingerprint:JSON.stringify(settings.name_rules),items,warnings};return clone(catalogPending)}finally{end()}},
-  async catalogApply(token,requestId){const id=begin();try{if(requestId!==undefined)emitMock('job:started',{jobId:id,requestId});emitMock('library:catalog',{jobId:id,phase:'apply',done:0,total:0,code:''});const p=catalogPending;catalogPending=null;if(!p||p.token!==token||catalogSettings!==JSON.stringify(settings))throw '名称规则或设置已变化，请重新预览';const items:import('../types').CatalogResult['items']=[];for(const item of p.items){await sleep(15);if(job?.cancelled)break;const d=await mockApi.libraryGet(item.code);let error:string|null=null,journalId:string|null=null;if(!d||JSON.stringify(d.meta)!==JSON.stringify(item.before))error='预览后磁盘内容已变化';else if(JSON.stringify(item.before)!==JSON.stringify(item.after)){const m=movies.find(m=>m.code===item.code)!;journalId=`catalog-${Date.now()}-${id}-${items.length}`;history.unshift({id:journalId,ts:Math.floor(Date.now()/1000),status:'applied',itemCount:1,opCount:2,codes:[item.code],trashed:0,pendingOperations:0,error:null,added:[],revision:{root:p.root,code:item.code,before:clone(item.before),after:clone(item.after),movie:clone(m)}});originalDirs.set(item.code,item.dir);edited.set(item.code,clone(item.after));Object.assign(m,{actors:item.after.actors.map(a=>a.name),tags:[...item.after.tags],studio:item.after.studio??'',publisher:item.after.publisher??'',series:item.after.series})}items.push({code:item.code,dir:item.dir,journalId,error});emitMock('library:catalog',{jobId:id,phase:'apply',done:items.length,total:p.items.length,code:item.code})}emitMock('library:changed',{jobId:id});return {jobId:id,items,cancelled:!!job?.cancelled,indexError:null}}finally{end()}},
+  async catalogApply(token,requestId){const id=begin();try{if(requestId!==undefined)emitMock('job:started',{jobId:id,requestId});emitMock('library:catalog',{jobId:id,phase:'apply',done:0,total:0,code:''});const p=catalogPending;catalogPending=null;if(!p||p.token!==token||catalogSettings!==JSON.stringify(settings))throw '名称规则或设置已变化，请重新预览';const items:import('../types').CatalogResult['items']=[];for(const item of p.items){await sleep(15);if(job?.cancelled)break;const d=await mockApi.libraryGet(item.code);let error:string|null=null,journalId:string|null=null;if(!d||JSON.stringify(d.meta)!==JSON.stringify(item.before))error='预览后磁盘内容已变化';else if(JSON.stringify(item.before)!==JSON.stringify(item.after)){const m=movies.find(m=>m.code===item.code)!;journalId=`catalog-${Date.now()}-${id}-${items.length}`;history.unshift({id:journalId,ts:Date.now(),status:'applied',itemCount:1,opCount:2,codes:[item.code],trashed:0,pendingOperations:0,error:null,added:[],revision:{root:p.root,code:item.code,before:clone(item.before),after:clone(item.after),movie:clone(m)}});originalDirs.set(item.code,item.dir);edited.set(item.code,clone(item.after));Object.assign(m,{actors:item.after.actors.map(a=>a.name),tags:[...item.after.tags],studio:item.after.studio??'',publisher:item.after.publisher??'',series:item.after.series})}items.push({code:item.code,dir:item.dir,journalId,error});emitMock('library:catalog',{jobId:id,phase:'apply',done:items.length,total:p.items.length,code:item.code})}emitMock('library:changed',{jobId:id});return {jobId:id,items,cancelled:!!job?.cancelled,indexError:null}}finally{end()}},
 
   async maintenancePreview(includeRecent=false,requestId){const id=begin();try{if(requestId!==undefined)emitMock('job:started',{jobId:id,requestId});await sleep(20);if(job?.cancelled)throw '预览已取消';maintenanceToken=String(id);maintenanceSettings=JSON.stringify(settings);return {token:maintenanceToken,root:settings.library_root??'',logDir:'/mock/logs',policy:includeRecent?{historyDays:0,logDays:0}:clone(settings.retention),scannedAt:Math.floor(Date.now()/1000),candidateBytes:maintenanceCleaned?0:2048,protected:['现有影片原图与有效撤销记录受到保护'],candidates:maintenanceCleaned?[]:[{id:'original:unused',kind:'original',paths:[`${settings.library_root}/.kiroku-original-unused.png`],bytes:2048,description:'无引用的旧原图（模拟）'}]}}finally{end()}},
   async maintenanceApply(token,selected,requestId){const id=begin();try{if(requestId!==undefined)emitMock('job:started',{jobId:id,requestId});await sleep(20);if(token!==maintenanceToken||maintenanceSettings!==JSON.stringify(settings))throw '预览已过期或设置变化';maintenanceToken='';if(selected.some(s=>s!=='original:unused'))throw '未知候选';if(job?.cancelled)return {removed:0,skipped:[],failed:[],cancelled:true};maintenanceCleaned=!!selected.length;return {removed:selected.length,skipped:[],failed:[],cancelled:false}}finally{end()}},
@@ -433,6 +452,7 @@ export const mockApi: Api = {
   },
   async saveSettings(s) {
     validateNames(s.name_rules)
+    validateAi(s.ai)
     if (s.min_interval_secs < 1) throw '请求间隔不能为 0'
     const badProxy = s.sources.find((c) => c.proxy?.mode === 'custom' && !/^(https?|socks5h?):\/\/\S+$/.test(c.proxy.url.trim()))
     if (badProxy) throw `数据源 ${badProxy.id} 的自定义代理地址无效`
@@ -444,8 +464,8 @@ export const mockApi: Api = {
     if (rootChanged && job) throw '有任务正在运行,请等待完成后再更换媒体库'
     const updated = clone(s)
     localStorage.setItem(KEY, JSON.stringify(updated))
-    if(JSON.stringify(settings)!==JSON.stringify(s)){catalogPending=null;pendingAppend=null;maintenanceToken='';plans=[]}
-    if (rootChanged) { invalidateHistory(updated.library_root); catalogPending=null; pendingAppend=null;maintenanceToken=''; plans = []; revision = null; openedArtwork=null; croppedArtwork=null }
+    if(JSON.stringify(settings)!==JSON.stringify(s)){editBatch=null;editSettings=null;catalogPending=null;pendingAppend=null;maintenanceToken='';plans=[]}
+    if (rootChanged) { invalidateHistory(updated.library_root); editBatch=null;editSettings=null;catalogPending=null; pendingAppend=null;maintenanceToken=''; plans = []; revision = null; openedArtwork=null; croppedArtwork=null }
     settings = updated
   },
   async setLibraryRoot(path, _create) {
@@ -454,7 +474,7 @@ export const mockApi: Api = {
     if (job) throw '有任务正在运行,请等待完成后再更换媒体库'
     const updated = { ...settings, library_root: path }
     localStorage.setItem(KEY, JSON.stringify(updated))
-    if (rootChanged) { invalidateHistory(updated.library_root); catalogPending=null; pendingAppend=null;maintenanceToken=''; plans = []; revision = null; openedArtwork=null; croppedArtwork=null }
+    if (rootChanged) { invalidateHistory(updated.library_root); editBatch=null;editSettings=null;catalogPending=null; pendingAppend=null;maintenanceToken=''; plans = []; revision = null; openedArtwork=null; croppedArtwork=null }
     settings = updated
     emitMock('library:changed', {jobId:0})
     return clone(settings)
@@ -464,7 +484,7 @@ export const mockApi: Api = {
   },
   async aiTest(cfg) {
     await sleep(800)
-    if (!cfg.api_key.trim()) throw 'API Key 无效(401)'
+    validateAiProvider(selectedAiProvider(cfg))
     return { title: '在港町度过的三天。', plot: null }
   },
   async mediaServerTest(cfg) {
@@ -526,18 +546,19 @@ export const mockApi: Api = {
     const lib = settings.library_root
     const bad = lib && dirs.find((d) => d.startsWith(lib))
     if (bad) throw `「${bad}」在媒体库目录里面。请选择媒体库之外的文件夹。`
+    if(JSON.stringify(settings.source_dirs)!==JSON.stringify(dirs)){editBatch=null;editSettings=null}
     settings = { ...settings, source_dirs: dirs }
     localStorage.setItem(KEY, JSON.stringify(settings))
     return clone(settings)
   },
 
-  async scanStart(dirs) {
+  async scanStart(dirs, rememberSources = true) {
     const lib = settings.library_root
     const bad = lib && dirs.find((d) => d.startsWith(lib))
     if (bad) throw `「${bad}」在媒体库目录里面。请选择媒体库之外的文件夹(库内的影片已经整理过了)。`
     const id = begin()
     // 单个视频文件只用于本次导入,不记为待整理文件夹
-    settings = { ...settings, source_dirs: dirs.filter((d) => !isVideoPath(d)) }
+    if (rememberSources) settings = { ...settings, source_dirs: dirs.filter((d) => !isVideoPath(d)) }
     localStorage.setItem(KEY, JSON.stringify(settings))
     const folder = dirs.find((d) => !isVideoPath(d))
     const split = folder ? splitScan(folder.replace(/\/$/, '')) : { kept: [] as ScanItem[], skipped: [] as SkippedFile[] }
@@ -628,7 +649,7 @@ export const mockApi: Api = {
           const rawMeta=movieMetadata(m)
           const texts:import('../types').TextVersions={original:{title:m.originalTitle??m.title,plot:m.plot,provenance:{title:route[0],plot:route[0]}},localized:{}}
           sourceText.set(c.id,texts)
-          if (settings.ai.enabled && settings.ai.api_key) {
+          if (settings.ai.enabled && selectedAiProvider(settings.ai)?.api_key) {
             ev({ kind: 'translating' }, i)
             await sleep(450)
             m.originalTitle = texts.original.title??m.title
@@ -840,7 +861,30 @@ export const mockApi: Api = {
   async historyList(requestId=crypto.randomUUID(), page={}) {
     if(!requestId||requestId.length>100)throw '无效的读取请求';if(historyReads.has(requestId)||historyReads.size>=16)throw '历史读取繁忙，请稍后重试';
     const read={cancelled:stoppedHistory.delete(requestId)};historyReads.set(requestId,read);const root=settings.library_root,generation=historyGeneration;
-    try{await sleep(20);if(read.cancelled)throw '历史读取已取消';if(root!==settings.library_root||generation!==historyGeneration)throw '媒体库已变化，请重新读取';const rows=history.map(({ added: _a, ...h }) => ({ ...h }));const limit=Math.min(Math.max(page.limit??50,1),1000);const at=page.before?rows.findIndex(h=>h.id===page.before):-1;const from=page.before?(at<0?rows.length:at+1):0;const items=rows.slice(from,from+limit);const end=from+items.length;return {items,total:rows.length,next:end<rows.length&&items.length?items[items.length-1].id:null}}finally{historyReads.delete(requestId)}
+    try {
+      await sleep(20)
+      if(read.cancelled)throw '历史读取已取消'
+      if(root!==settings.library_root||generation!==historyGeneration)throw '媒体库已变化，请重新读取'
+      const f=page.filter??{},words=(f.text??'').trim().toLowerCase().split(/\s+/).filter(Boolean)
+      if((f.text?.length??0)>512 || (f.from!=null && f.until!=null && f.from>=f.until))throw '历史筛选范围无效'
+      const rows=history.filter(h=>(!f.status||h.status===f.status)&&(f.from==null||h.ts>=f.from)&&(f.until==null||h.ts<f.until)&&words.every(w=>h.id.includes(w)||h.codes.join(' ').toLowerCase().includes(w))).sort((a,b)=>b.ts-a.ts||b.id.localeCompare(a.id))
+      const cursor=page.before?history.find(h=>h.id===page.before):null
+      const limit=Math.min(Math.max(page.limit??50,1),1000),after=page.before?rows.filter(h=>cursor?(h.ts<cursor.ts||h.ts===cursor.ts&&h.id<cursor.id):false):rows,items=after.slice(0,limit).map(h=>({id:h.id,ts:h.ts,status:h.status,itemCount:h.itemCount,opCount:h.opCount,codes:h.codes.slice(0,6),trashed:h.trashed,pendingOperations:h.pendingOperations,error:h.error}))
+      return {items,total:rows.length,next:after.length>items.length&&items.length?items[items.length-1].id:null}
+    } finally {historyReads.delete(requestId)}
+  },
+  async historyDetail(requestId,journalId,offset=0) {
+    if(!requestId||requestId.length>100||historyReads.has(requestId)||historyReads.size>=16)throw '无效的读取请求'
+    const read={cancelled:stoppedHistory.delete(requestId)};historyReads.set(requestId,read);const root=settings.library_root,generation=historyGeneration
+    try {
+      await sleep(30)
+      if(read.cancelled)throw '历史读取已取消'
+      if(root!==settings.library_root||generation!==historyGeneration)throw '媒体库已变化，请重新读取'
+      const h=history.find(h=>h.id===journalId);if(!h)throw '日志不存在';if(h.error)throw h.error
+      const total=h.opCount+(h.pendingOperations??0)+h.trashed
+      const operations=Array.from({length:Math.max(0,Math.min(100,total-offset))},(_,i)=>({index:offset+i,description:`示例操作 ${offset+i+1} · ${h.codes[(offset+i)%Math.max(1,h.codes.length)]??journalId}`,state:h.status==='rolledBack'?'undone' as const:offset+i<h.opCount?'recorded' as const:offset+i<h.opCount+(h.pendingOperations??0)?'pending' as const:'trashed' as const}))
+      return {id:journalId,status:h.status,operations,total,next:offset+operations.length<total?offset+operations.length:null}
+    }finally{historyReads.delete(requestId)}
   },
   async historyCancel(requestId){return stopHistory(requestId)},
   async revealJournal(id) { console.info('[mock] reveal journal', id) },
@@ -873,27 +917,64 @@ export const mockApi: Api = {
     return { indexError: null, failures: [], status: 'rolledBack' }
   },
 
+  async libraryOverview(query) {
+    const list = clone(matchingMovies(query))
+    const scores = list.flatMap(m => m.score == null ? [] : [m.score])
+    const result = { movies:list.length, files:list.reduce((n,m) => n + m.parts,0), bytes:list.reduce((n,m) => n + Array.from({length:m.parts},(_,i) => Math.round((1.6 + i * 0.4) * GB)).reduce((a,b) => a+b,0),0), favorites:list.filter(m => facetValues(m).favorite.length > 0).length, averageScore:scores.length ? scores.reduce((a,b) => a+b,0)/scores.length : null, missingPoster:list.filter(m => m.missingPoster).length, missingScore:list.filter(m => m.score == null).length, missingYear:list.filter(m => m.year == null).length }
+    await sleep(40)
+    return result
+  },
   async libraryList(q: Query): Promise<Page> {
-    const words = (q.text ?? '').toLowerCase().split(/\s+/).filter(Boolean)
-    let list = movies.filter((m) => {
-      if (q.contentType && m.contentType !== q.contentType) return false
-      if (q.year && m.year !== q.year) return false
-      const own = facetValues(m)
-      if (!(q.filters ?? []).every((f) => own[f.kind].includes(f.value))) return false
-      const hay = `${m.code} ${m.title} ${m.actors.join(' ')} ${m.studio} ${m.series ?? ''}`.toLowerCase()
-      return words.every((w) => hay.includes(w))
-    })
+    let list = matchingMovies(q)
     const sort = q.sort ?? 'added'
-    list = [...list].sort((a, b) =>
-      sort === 'title' ? a.title.localeCompare(b.title, 'ja') :
-      sort === 'year' ? b.year - a.year || a.code.localeCompare(b.code) :
-      sort === 'score' ? b.score - a.score :
-      b.addedAt - a.addedAt,
-    )
+    const bytes = new Map<string, Uint8Array>()
+    const binary = (a: string, b: string) => {
+      if (!bytes.has(a)) bytes.set(a, new TextEncoder().encode(a))
+      if (!bytes.has(b)) bytes.set(b, new TextEncoder().encode(b))
+      const x = bytes.get(a)!, y = bytes.get(b)!
+      for (let i = 0; i < Math.min(x.length, y.length); i++) if (x[i] !== y[i]) return x[i] - y[i]
+      return x.length - y.length
+    }
+    const nocase = (text: string) => text.replace(/[A-Z]/g, c => c.toLowerCase())
+    list = [...list].sort((a, b) => {
+      const av = sort === 'year' ? a.year : sort === 'score' ? a.score : 0
+      const bv = sort === 'year' ? b.year : sort === 'score' ? b.score : 0
+      if (av == null || bv == null) {
+        if (av != bv) return av == null ? 1 : -1
+      }
+      const compare = sort === 'title' ? binary(nocase(a.title), nocase(b.title)) : sort === 'year' || sort === 'score' ? (bv ?? 0) - (av ?? 0) : b.addedAt - a.addedAt
+      return (compare || binary(a.code, b.code)) * (q.reverse ? -1 : 1)
+    })
     const off = q.offset ?? 0
     const lim = q.limit || 60
+    const selected = list.slice(off, off + lim).map(m => clone(m))
     await sleep(40) // 模拟 IPC 延迟,让占位/骨架可见
-    return { total: list.length, items: await Promise.all(list.slice(off, off + lim).map(toCard)) }
+    return { total: list.length, items: await Promise.all(selected.map(toCard)) }
+  },
+
+  async libraryExportCsv(query, requestId) {
+    const jobId = begin(requestId)
+    try {
+      // Capture before yielding so later mock mutations cannot mix snapshots.
+      const pending = mockApi.libraryList({ ...query, offset: 0, limit: Math.max(1, movies.length) })
+      const page = await pending
+      const chunks = ['\ufeff编号,标题,年份,演员,评分,分片数,收藏\r\n']
+      for (let i = 0; i < page.items.length; i++) {
+        if (i % 500 === 0) {
+          emitMock('library:export', { jobId, root: settings.library_root ?? '', done: i, total: page.total })
+          await sleep(0)
+        }
+        if (job?.cancelled) throw '导出已停止'
+        const m = page.items[i]
+        chunks.push([m.code, m.title ?? '', String(m.year ?? ''), m.actors.join(' / '), m.score === null ? '' : (m.score / 10).toFixed(1), String(m.parts), m.favorite ? '是' : '否'].map(csvCell).join(',') + '\r\n')
+      }
+      if (job?.cancelled) throw '导出已停止'
+      emitMock('library:export', { jobId, root: settings.library_root ?? '', done: page.total, total: page.total })
+      const url = URL.createObjectURL(new Blob(chunks, { type: 'text/csv;charset=utf-8' }))
+      const a = document.createElement('a'); a.href = url; a.download = 'kiroku-library.csv'; a.click()
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+      return page.total
+    } finally { end() }
   },
 
   async libraryGet(code): Promise<MovieDetail | null> {
@@ -1001,7 +1082,7 @@ export const mockApi: Api = {
       try{const detail=await mockApi.libraryGet(preview.code);if(!detail||detail.dir!==preview.dir||JSON.stringify(detail.meta)!==JSON.stringify(preview.before))throw '预览后磁盘内容已变化'
        if(JSON.stringify(captured)!==JSON.stringify(settings))throw '设置已变化，请重新预览'
        const m=movies.find(m=>m.code===preview.code)!,journalId=`language-${Date.now()}-${jobId}-${results.length}`
-       history.unshift({id:journalId,ts:Math.floor(Date.now()/1000),status:'applied',itemCount:1,opCount:2,codes:[preview.code],trashed:0,pendingOperations:0,error:null,added:[],revision:{root,code:preview.code,before:clone(preview.before),after:clone(preview.after),movie:clone(m)}})
+       history.unshift({id:journalId,ts:Date.now(),status:'applied',itemCount:1,opCount:2,codes:[preview.code],trashed:0,pendingOperations:0,error:null,added:[],revision:{root,code:preview.code,before:clone(preview.before),after:clone(preview.after),movie:clone(m)}})
        originalDirs.set(preview.code,detail.dir);edited.set(preview.code,clone(preview.after));results.push({jobId,root,code:preview.code,journalId,error:null,indexError:null})
        emitMock('library:changed',{jobId});emitMock('nfo:export',{jobId,completed:results.length,failed:failed.length})
       }catch(e){failed.push(`${preview.code}：${e}`)}
@@ -1009,9 +1090,60 @@ export const mockApi: Api = {
      return {jobId,results,failed,cancelled:job?.cancelled??false}
     }finally{end()}
   },
+  async batchEditPreview(codes,edit,requestId) {
+    const id=begin(requestId)
+    editBatch=null;editSettings=null
+    try {
+      if(!codes.length||codes.length>200)throw '请选择 1–200 部影片'
+      const captured=clone(settings),items:RevisionPreview[]=[],root=settings.library_root??'/Library',token=String(id)
+      let add:string[]=[],remove:string[]=[]
+      if(edit.kind==='tags'){
+        const clean=(values:string[])=>{if(values.length>50||values.some(v=>!v.trim()||new TextEncoder().encode(v.trim()).length>200||/[\x00-\x1f\x7f]/.test(v.trim())))throw '标签格式无效';return [...new Set(values.map(v=>v.trim()))]}
+        add=clean(edit.add);remove=clean(edit.remove)
+        if(!add.length&&!remove.length||add.some(v=>remove.includes(v)))throw '请填写有效且不重叠的增删标签'
+      }
+      for(const code of [...new Set(codes)]) {
+        if(job?.cancelled)throw '已取消'
+        const detail=await mockApi.libraryGet(code);if(!detail)throw '影片不在媒体库中'
+        const after=clone(detail.meta),changes:RevisionPreview['changes']=[]
+        if(edit.kind==='favorite') {if(!!after.favorite!==edit.favorite){changes.push({field:'favorite',before:!!after.favorite,after:edit.favorite});after.favorite=edit.favorite}}
+        else {
+          const tags=after.tags.filter(v=>!remove.includes(v));for(const value of add)if(!tags.includes(value))tags.push(value)
+          if(JSON.stringify(tags)!==JSON.stringify(after.tags)){changes.push({field:'tags',before:[...after.tags],after:tags});after.tags=tags;after.locked_fields=[...new Set([...(after.locked_fields??[]),'tags'])];after.provenance={...after.provenance,tags:'manual'};if(after.name_projection)delete after.name_projection.tags}
+        }
+        items.push({token,root,dir:detail.dir,code,before:clone(detail.meta),after,changes})
+      }
+      if(job?.cancelled)throw '已取消'
+      if(JSON.stringify(settings)!==JSON.stringify(captured))throw '设置已变化，请重新预览'
+      editSettings=captured;editBatch={token,root,items};return {token,root,items:items.map(({code,changes,warnings})=>({code,changes:clone(changes),warnings:clone(warnings)}))}
+    }finally{end()}
+  },
+  async batchEditApply(token,root,requestId){
+    const jobId=begin(requestId)
+    const p=editBatch?.token===token?editBatch:null,captured=editSettings
+    if(p){editBatch=null;editSettings=null}
+    try{
+     if(!p||p.token!==token||p.root!==root||JSON.stringify(captured)!==JSON.stringify(settings))throw '预览已过期，请重新预览'
+     const results:import('../types').RevisionResult[]=[],failed:string[]=[],skipped:string[]=[]
+     for(const preview of p.items){await sleep(40);if(job?.cancelled)break
+      if(JSON.stringify(preview.before)===JSON.stringify(preview.after)){skipped.push(preview.code);continue}
+      try{const detail=await mockApi.libraryGet(preview.code);if(!detail||detail.dir!==preview.dir||JSON.stringify(detail.meta)!==JSON.stringify(preview.before))throw '预览后磁盘内容已变化'
+       if(JSON.stringify(captured)!==JSON.stringify(settings))throw '设置已变化，请重新预览'
+       const m=movies.find(m=>m.code===preview.code)!,journalId=`batch-${Date.now()}-${jobId}-${results.length}`
+       history.unshift({id:journalId,ts:Date.now(),status:'applied',itemCount:1,opCount:2,codes:[preview.code],trashed:0,pendingOperations:0,error:null,added:[],revision:{root,code:preview.code,before:clone(preview.before),after:clone(preview.after),movie:clone(m)}})
+       originalDirs.set(preview.code,detail.dir);edited.set(preview.code,clone(preview.after));m.tags=[...preview.after.tags];m.favorite=!!preview.after.favorite;results.push({jobId,root,code:preview.code,journalId,error:null,indexError:null})
+       emitMock('library:changed',{jobId});emitMock('batch:edit',{jobId,completed:results.length,failed:failed.length})
+      }catch(e){failed.push(`${preview.code}：${e}`)}
+     }
+     return {jobId,results,failed,skipped,cancelled:job?.cancelled??false}
+    }finally{end()}
+  },
   async templatePreview(directory,file) {
     const {previewTemplate}=await import('../template-preview')
     return previewTemplate(directory,file)
+  },
+  async batchEditDiscard(token) {
+    if(editBatch?.token===token){editBatch=null;editSettings=null}
   },
   async metadataSourceCandidates(code) {
     const detail=await mockApi.libraryGet(code)
@@ -1120,7 +1252,7 @@ export const mockApi: Api = {
       if (!detail || JSON.stringify(detail.meta) !== JSON.stringify(p.before)) throw '预览后磁盘内容已变化'
       const m = movies.find(m => m.code === code)!
       const journalId = `revision-${Date.now()}-${jobId}`
-      history.unshift({ id: journalId, ts: Math.floor(Date.now()/1000), status: 'applied', itemCount: 1, opCount: 2, codes: [code], trashed: 0, pendingOperations: 0, error: null, added: [], revision: { root, code, before: clone(p.before), after: clone(p.after), movie: clone(m), imageBefore:artworkImages.get(code), imageAfter:croppedArtwork?.token===token?croppedArtwork.image:undefined } })
+      history.unshift({ id: journalId, ts:Date.now(), status: 'applied', itemCount: 1, opCount: 2, codes: [code], trashed: 0, pendingOperations: 0, error: null, added: [], revision: { root, code, before: clone(p.before), after: clone(p.after), movie: clone(m), imageBefore:artworkImages.get(code), imageAfter:croppedArtwork?.token===token?croppedArtwork.image:undefined } })
       if(croppedArtwork?.token===token){artworkImages.set(code,croppedArtwork.image);artworkOriginals.set(code,croppedArtwork.original);croppedArtwork=null}
       originalDirs.set(code, detail.dir); edited.set(code, clone(p.after))
       m.title = p.after.title ?? ''; m.plot = p.after.plot ?? ''; m.actors = p.after.actors.map(a => a.name); m.tags = [...p.after.tags]; m.studio = p.after.studio ?? ''; m.publisher = p.after.publisher ?? ''; m.series = p.after.series; m.releaseDate = p.after.release_date ?? ''; m.runtime = p.after.runtime_min ?? 0; m.favorite = !!p.after.favorite
@@ -1146,7 +1278,7 @@ export const mockApi: Api = {
       if (m && written) {
         m.missingPoster = false; m.missingFanart = false
         journalId = `repair-${Date.now()}-${id}`
-        history.unshift({ id: journalId, ts: Math.floor(Date.now() / 1000), status: 'applied', itemCount: 1, opCount: written, codes: [code], trashed: 0, pendingOperations: 0, error: null, added: [], repaired: { code, poster, fanart } })
+        history.unshift({ id: journalId, ts:Date.now(), status: 'applied', itemCount: 1, opCount: written, codes: [code], trashed: 0, pendingOperations: 0, error: null, added: [], repaired: { code, poster, fanart } })
         emitMock('library:changed', {jobId:job?.id??0})
       }
       end()
@@ -1174,6 +1306,17 @@ export const mockApi: Api = {
       tags: count('tag'), actors: count('actor'), studios: count('studio'), series: count('series'), badges: count('badge'),
       favorites: movies.filter((m) => m.favorite).length,
     }
+  },
+
+  async libraryPruneMissing(root, automatic, requestId) {
+    if (root !== settings.library_root) throw '媒体库已变化，请重新刷新'
+    if (job && automatic) return { root, removed: 0, skipped: true }
+    begin(requestId)
+    try {
+      // Preview has no filesystem; all synthetic movie files remain present.
+      if (job?.cancelled) throw '刷新已取消'
+      return { root, removed: 0, skipped: false }
+    } finally { end() }
   },
 
   async libraryRebuild() {

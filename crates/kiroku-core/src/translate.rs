@@ -1,6 +1,7 @@
 //! AI 汉化:把刮削到的日文标题、简介翻译成简体中文。
 //!
-//! 调用 Claude Messages API(Rust 没有官方 SDK,直接发 HTTP):
+//! 通过 OpenAI Chat Completions 或 Anthropic Messages 直接发 HTTP。
+//! Anthropic 官方预设保留以下默认行为,自定义 provider 可调整:
 //! - 用 `output_config.format`(JSON Schema)约束输出,保证能解析;
 //! - 翻译是简单任务,`effort` 默认 `low` 以节省费用(Claude Opus 5.5 的思考无法关闭,只能调 effort);
 //! - 默认带 `fallbacks: "default"`:模型因安全策略拒绝时,服务端自动换合适的模型重跑同一请求;
@@ -9,43 +10,15 @@
 //! 请求体构造与响应解析是纯函数,便于测试;网络部分在 [`Translator::translate`]。
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 use std::{collections::HashMap, path::{Path, PathBuf}, sync::Mutex, time::Duration};
 
-/// AI 汉化设置。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct AiCfg {
-    pub enabled: bool,
-    pub api_key: String,
-    pub model: String,
-    /// API 地址;使用兼容 Anthropic 协议的中转时修改
-    pub base_url: String,
-    /// low / medium / high
-    pub effort: String,
-    pub title: bool,
-    pub plot: bool,
-}
-
-impl Default for AiCfg {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            api_key: String::new(),
-            model: "claude-opus-5-5".into(),
-            base_url: "https://api.anthropic.com".into(),
-            effort: "low".into(),
-            title: true,
-            plot: true,
-        }
-    }
-}
-
-impl AiCfg {
-    pub fn usable(&self) -> bool {
-        self.enabled && !self.api_key.trim().is_empty() && (self.title || self.plot)
-    }
-}
+mod config;
+mod protocol;
+pub use config::{AiCfg, AiProtocol, AiProvider, OutputFormat};
+pub use protocol::{build_request, parse_response};
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Translated {
@@ -56,63 +29,6 @@ pub struct Translated {
 /// 是否含假名(平假名/片假名)。只有日文才需要翻译;已经是中文的直接跳过,省钱。
 pub fn has_kana(s: &str) -> bool {
     s.chars().any(|c| matches!(c, '\u{3040}'..='\u{309F}' | '\u{30A0}'..='\u{30FF}' | '\u{31F0}'..='\u{31FF}'))
-}
-
-const SYSTEM: &str = "你是专业的日译中翻译。把用户给出的日本影片标题和简介翻译成自然、通顺的简体中文。\
-要求:忠实原意,不增删内容,不加解释或注释;演员名、番号、厂牌名保留原文;\
-输入里为空的字段在输出里也给空字符串。";
-
-/// 构造 Messages API 请求体。只翻译传入的非空字段。
-pub fn build_request(cfg: &AiCfg, title: Option<&str>, plot: Option<&str>) -> Value {
-    let input = json!({ "title": title.unwrap_or(""), "plot": plot.unwrap_or("") });
-    json!({
-        "model": cfg.model,
-        "max_tokens": 16000,
-        "fallbacks": "default",
-        "system": SYSTEM,
-        "output_config": {
-            "effort": cfg.effort,
-            "format": {
-                "type": "json_schema",
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "title": { "type": "string", "description": "标题的简体中文译文" },
-                        "plot": { "type": "string", "description": "简介的简体中文译文" }
-                    },
-                    "required": ["title", "plot"],
-                    "additionalProperties": false
-                }
-            }
-        },
-        "messages": [{ "role": "user", "content": format!("请翻译以下 JSON 中的字段:\n{input}") }]
-    })
-}
-
-/// 解析响应。拒绝、被截断或没有文本时返回错误,不使用半截输出。
-pub fn parse_response(v: &Value) -> Result<Translated, String> {
-    match v["stop_reason"].as_str() {
-        Some("refusal") => {
-            let why = v["stop_details"]["explanation"].as_str().unwrap_or("");
-            return Err(format!("模型拒绝翻译这条内容{}", if why.is_empty() { String::new() } else { format!(":{why}") }));
-        }
-        Some("max_tokens") => return Err("输出被截断(max_tokens)".into()),
-        _ => {}
-    }
-    // 内容里可能还有 thinking、fallback 等块,只取文本块
-    let text: String = v["content"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|b| b["type"] == "text")
-        .filter_map(|b| b["text"].as_str())
-        .collect();
-    if text.trim().is_empty() {
-        return Err("模型没有返回译文".into());
-    }
-    let out: Value = serde_json::from_str(text.trim()).map_err(|e| format!("译文不是合法 JSON:{e}"))?;
-    let pick = |k: &str| out[k].as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
-    Ok(Translated { title: pick("title"), plot: pick("plot") })
 }
 
 /// 把 HTTP 错误翻成人话(状态码 → 原因),附上 API 返回的 message。
@@ -132,7 +48,7 @@ fn http_error(status: u16, body: &str) -> String {
 }
 
 /// 提示词或输出格式变化时递增,使旧译文缓存全部失效。
-const PROMPT_VERSION: u32 = 1;
+const PROMPT_VERSION: u32 = 2;
 /// 译文缓存最多保留的条目数(标题、简介各算一条)。
 const CACHE_ENTRIES: usize = 4096;
 
@@ -141,10 +57,10 @@ pub fn cache_path(settings_path: &Path) -> PathBuf {
     settings_path.parent().unwrap_or(Path::new(".")).join("cache").join("translations.json")
 }
 
-/// 原文 + 模型 + effort + 提示词版本 + 字段共同决定一条译文。
-fn cache_key(cfg: &AiCfg, field: &str, text: &str) -> String {
+/// 原文、协议、端点、模型、生成选项、提示词版本和字段共同决定译文;不含密钥。
+fn cache_key(cfg: &AiProvider, field: &str, text: &str) -> String {
     use sha2::Digest;
-    let identity = serde_json::to_string(&(PROMPT_VERSION, &cfg.model, &cfg.effort, field, text)).expect("plain tuple");
+    let identity = serde_json::to_string(&(PROMPT_VERSION, cfg.protocol, cfg.endpoint().ok().map(|u| u.to_string()), cfg.model.trim(), &cfg.effort, cfg.output_format, cfg.anthropic_fallback, field, text)).expect("plain tuple");
     format!("{:x}", sha2::Sha256::digest(identity.as_bytes()))
 }
 
@@ -193,15 +109,19 @@ impl TranslationCache {
 
 pub struct Translator {
     cfg: AiCfg,
+    provider: AiProvider,
     client: reqwest::Client,
     cache: Option<Mutex<TranslationCache>>,
 }
 
 impl Translator {
     pub fn new(cfg: AiCfg) -> Result<Self, String> {
+        cfg.validate()?;
+        let provider = cfg.selected()?.clone();
+        provider.validate()?;
         // 低 effort 的翻译通常几秒到十几秒;给足余量
-        let client = reqwest::Client::builder().timeout(Duration::from_secs(120)).build().map_err(|e| e.to_string())?;
-        Ok(Self { cfg, client, cache: None })
+        let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).timeout(Duration::from_secs(120)).build().map_err(|e| e.to_string())?;
+        Ok(Self { cfg, provider, client, cache: None })
     }
 
     /// 启用译文缓存(桌面与 CLI 使用设置目录下的文件;测试默认不启用,不碰真实目录)。
@@ -212,7 +132,7 @@ impl Translator {
 
     fn cached(&self, field: &str, text: Option<&str>) -> Option<String> {
         let cache = self.cache.as_ref()?.lock().unwrap_or_else(|e| e.into_inner());
-        cache.get(&cache_key(&self.cfg, field, text?)).map(String::from)
+        cache.get(&cache_key(&self.provider, field, text?)).map(String::from)
     }
 
     /// 只翻译设置里勾选、且含日文假名的字段;都不需要时直接返回空结果,不发请求。
@@ -232,34 +152,36 @@ impl Translator {
         if let Some(cache) = &self.cache {
             let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
             for (field, source, out) in [("title", title, &fresh.title), ("plot", plot, &fresh.plot)] {
-                if let (Some(source), Some(out)) = (source, out) { cache.insert(cache_key(&self.cfg, field, source), out.clone()) }
+                if let (Some(source), Some(out)) = (source, out) { cache.insert(cache_key(&self.provider, field, source), out.clone()) }
             }
             if let Err(e) = cache.save() { log::warn!(target: "kiroku::scrape", "译文缓存写入失败: {e}") }
         }
         Ok(Translated { title: cached_title.or(fresh.title), plot: cached_plot.or(fresh.plot) })
     }
 
-    /// 实际请求 Messages API;只翻译传入的字段。
+    /// 按所选协议请求;只翻译传入的字段。
     async fn request(&self, title: Option<&str>, plot: Option<&str>) -> Result<Translated, String> {
-        let url = format!("{}/v1/messages", self.cfg.base_url.trim_end_matches('/'));
-        let r = self
-            .client
-            .post(url)
-            .header("x-api-key", self.cfg.api_key.trim())
-            .header("anthropic-version", "2023-06-01")
-            .header("anthropic-beta", "server-side-fallback-2026-07-01")
-            .header("content-type", "application/json")
-            .body(build_request(&self.cfg, title, plot).to_string())
-            .send()
-            .await
-            .map_err(|e| if e.is_timeout() { "请求超时".to_string() } else { format!("连不上 AI 服务:{e}") })?;
+        let url = self.provider.endpoint()?;
+        let mut request = self.client.post(url).header("content-type", "application/json");
+        request = match self.provider.protocol {
+            AiProtocol::Anthropic => {
+                let r = request.header("x-api-key", self.provider.api_key.trim()).header("anthropic-version", "2023-06-01");
+                if self.provider.anthropic_fallback { r.header("anthropic-beta", "server-side-fallback-2026-07-01") } else { r }
+            },
+            AiProtocol::Openai => request.bearer_auth(self.provider.api_key.trim()),
+        };
+        let r = request.body(build_request(&self.provider, title, plot).to_string()).send().await
+            .map_err(|e| if e.is_timeout() { "请求超时".to_string() } else { "连不上 AI 服务，请检查地址、网络和 API Key 格式".to_string() })?;
         let status = r.status().as_u16();
         let body = r.text().await.map_err(|e| e.to_string())?;
         if status != 200 {
             return Err(http_error(status, &body));
         }
         let v: Value = serde_json::from_str(&body).map_err(|e| format!("响应不是 JSON:{e}"))?;
-        let mut t = parse_response(&v)?;
+        let mut t = parse_response(self.provider.protocol, &v)?;
+        if (title.is_some() && t.title.is_none()) || (plot.is_some() && t.plot.is_none()) {
+            return Err("模型没有返回请求字段的译文".into());
+        }
         // 没请求翻译的字段不回填
         if title.is_none() {
             t.title = None;
@@ -306,7 +228,12 @@ mod tests {
         });
         (address, seen)
     }
-    fn cfg(base_url: &str) -> AiCfg { AiCfg { enabled: true, api_key: "k".into(), base_url: base_url.into(), ..AiCfg::default() } }
+    fn cfg(base_url: &str) -> AiCfg {
+        let mut c = AiCfg { enabled: true, ..Default::default() };
+        c.providers[0].api_key = "k".into();
+        c.providers[0].base_url = base_url.into();
+        c
+    }
 
     #[tokio::test]
     async fn cached_fields_are_not_sent_again_and_only_misses_are_requested() {
@@ -331,14 +258,41 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("translations.json");
         Translator::new(cfg(&url)).unwrap().with_cache(path.clone()).translate(Some("タイトル"), None).await.unwrap();
-        let other = AiCfg { model: "claude-sonnet-5-5".into(), ..cfg(&url) };
+        let mut other = cfg(&url);
+        other.providers[0].model = "other-model".into();
         Translator::new(other).unwrap().with_cache(path.clone()).translate(Some("タイトル"), None).await.unwrap();
         assert_eq!(seen.lock().unwrap().len(), 2, "a different model is a different key");
-        assert_ne!(cache_key(&cfg(&url), "title", "タイトル"), cache_key(&cfg(&url), "plot", "タイトル"));
+        assert_ne!(cache_key(&cfg(&url).providers[0], "title", "タイトル"), cache_key(&cfg(&url).providers[0], "plot", "タイトル"));
         std::fs::write(&path, b"{broken").unwrap();
         let t = Translator::new(cfg(&url)).unwrap().with_cache(path.clone());
         assert_eq!(t.translate(Some("タイトル"), None).await.unwrap().title.as_deref(), Some("译:タイトル"));
         assert!(serde_json::from_slice::<Value>(&std::fs::read(&path).unwrap()).is_ok(), "rebuilt as valid JSON");
+    }
+
+    #[tokio::test]
+    async fn provider_endpoint_changes_miss_but_key_rotation_reuses_cache() {
+        let (first, seen_first) = fake_api();
+        let (second, seen_second) = fake_api();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("translations.json");
+        Translator::new(cfg(&first)).unwrap().with_cache(path.clone()).translate(Some("海辺の町"), None).await.unwrap();
+        Translator::new(cfg(&second)).unwrap().with_cache(path.clone()).translate(Some("海辺の町"), None).await.unwrap();
+        assert_eq!(seen_first.lock().unwrap().len(), 1);
+        assert_eq!(seen_second.lock().unwrap().len(), 1, "same model at a new service must not reuse old translations");
+        let mut rotated = cfg(&second);
+        rotated.providers[0].api_key = "rotated-key".into();
+        Translator::new(rotated).unwrap().with_cache(path.clone()).translate(Some("海辺の町"), None).await.unwrap();
+        assert_eq!(seen_second.lock().unwrap().len(), 1);
+        let base = cfg(&second).providers.remove(0);
+        let mut changed = base.clone();
+        changed.protocol = AiProtocol::Openai;
+        assert_ne!(cache_key(&base,"title","海辺の町"),cache_key(&changed,"title","海辺の町"));
+        changed = base.clone();
+        changed.output_format = OutputFormat::Prompt;
+        assert_ne!(cache_key(&base,"title","海辺の町"),cache_key(&changed,"title","海辺の町"));
+        changed = base.clone();
+        changed.effort = "high".into();
+        assert_ne!(cache_key(&base,"title","海辺の町"),cache_key(&changed,"title","海辺の町"));
     }
 
     #[test]
@@ -365,8 +319,8 @@ mod tests {
 
     #[test]
     fn request_shape() {
-        let cfg = AiCfg { enabled: true, api_key: "k".into(), ..Default::default() };
-        let r = build_request(&cfg, Some("海辺の約束"), None);
+        let cfg = AiCfg::default();
+        let r = build_request(&cfg.providers[0], Some("海辺の約束"), None);
         assert_eq!(r["model"], "claude-opus-5-5");
         assert_eq!(r["fallbacks"], "default");
         assert_eq!(r["output_config"]["effort"], "low");
@@ -386,18 +340,18 @@ mod tests {
                 {"type": "text", "text": "{\"title\": \"海边的约定\", \"plot\": \"  \"}"}
             ]
         });
-        assert_eq!(parse_response(&v).unwrap(), Translated { title: Some("海边的约定".into()), plot: None });
+        assert_eq!(parse_response(AiProtocol::Anthropic, &v).unwrap(), Translated { title: Some("海边的约定".into()), plot: None });
     }
 
     #[test]
     fn refusal_truncation_and_garbage_are_errors() {
         let refusal = json!({"stop_reason": "refusal", "stop_details": {"explanation": "policy"}, "content": []});
-        assert!(parse_response(&refusal).unwrap_err().contains("拒绝"));
+        assert!(parse_response(AiProtocol::Anthropic, &refusal).unwrap_err().contains("拒绝"));
         let cut = json!({"stop_reason": "max_tokens", "content": [{"type": "text", "text": "{\"title\": \"x"}]});
-        assert!(parse_response(&cut).unwrap_err().contains("截断"));
+        assert!(parse_response(AiProtocol::Anthropic, &cut).unwrap_err().contains("截断"));
         let bad = json!({"stop_reason": "end_turn", "content": [{"type": "text", "text": "不是 JSON"}]});
-        assert!(parse_response(&bad).is_err());
-        assert!(parse_response(&json!({"stop_reason": "end_turn", "content": []})).is_err());
+        assert!(parse_response(AiProtocol::Anthropic, &bad).is_err());
+        assert!(parse_response(AiProtocol::Anthropic, &json!({"stop_reason": "end_turn", "content": []})).is_err());
     }
 
     #[test]

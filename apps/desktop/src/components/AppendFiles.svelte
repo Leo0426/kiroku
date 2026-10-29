@@ -4,7 +4,7 @@
  import {cancellableJob,type CancellableJob} from '../lib/cancellable-job'
  import {app} from '../lib/state.svelte'
  import type {AppendPreview,AppendResult} from '../lib/types'
- let {code,onsaved}:{code:string;onsaved:()=>void}=$props()
+ let {code,onsaved,onactive}:{code:string;onsaved:()=>void;onactive?:(active:boolean)=>void}=$props()
  let opened=$state(false),busy=$state(false),error=$state(''),inputs=$state<string[]>([]),targets=$state<string[]>([]),target=$state(''),preview=$state<AppendPreview|null>(null),result=$state<AppendResult|null>(null),notice=$state('')
  let videos=$state<string[]>([]),video=$state('')
  let task=$state<CancellableJob<unknown>|null>(null)
@@ -43,6 +43,7 @@
   catch(e){if(g===generation){error=String(e);preview=null}}finally{if(g===generation){task=null;busy=false}}
  }
  async function undo(){if(!result)return;const g=generation;busy=true;try{const r=await api.rollback(result.journalId);if(g!==generation)return;if(r.failures.length||r.indexError)throw r.failures.join('; ')+String(r.indexError??'');result=null;notice='本次追加已撤销';onsaved()}catch(e){if(g===generation)error=String(e)}finally{if(g===generation)busy=false}}
+  $effect(() => onactive?.(opened))
 </script>
 <section class:expanded={opened} aria-label="追加影片文件">
  {#if !opened}<button class="btn" onclick={start}>追加视频或字幕</button>{:else}

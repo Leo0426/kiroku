@@ -139,8 +139,14 @@ impl LibraryReader {
         transaction.commit()?;
         Ok(value)
     }
+    pub fn overview(&self, query: &Query) -> Result<super::Overview> {
+        self.snapshot(|library| library.overview(query))
+    }
     pub fn list(&self, query: &Query) -> Result<Page> {
         self.snapshot(|library| library.list(query))
+    }
+    pub fn export_csv(&self, query: &Query, out: &mut impl io::Write, cancel: &tokio_util::sync::CancellationToken, progress: &mut impl FnMut(usize, usize)) -> Result<usize> {
+        self.snapshot(|library| library.export_csv(query, out, cancel, progress))
     }
     pub fn get(&self, code: &str) -> Result<Option<MovieDetail>> {
         self.snapshot(|library| library.get(code))

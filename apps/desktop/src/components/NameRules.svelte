@@ -1,5 +1,6 @@
 <script lang="ts">
  import {onDestroy,untrack} from 'svelte'
+ import InfoTip from './InfoTip.svelte'
  import {api} from '../lib/api'
  import {listen} from '../lib/events'
  import {cancellableJob,type CancellableJob} from '../lib/cancellable-job'
@@ -49,7 +50,7 @@
 </script>
 <section class="card" aria-label="名称规则管理">
  <p>规则保存后用于新整理。已有影片需明确选择并预览；人工锁定字段优先。</p>
- <div class="preset"><button class="btn" onclick={preset} disabled={busy||editIndex!==null}>导入内置标签译名</button><span class="muted">把常见的繁体、日文标签统一成简体，不改动已有规则。</span></div>
+ <div class="preset"><button class="btn" onclick={preset} disabled={busy||editIndex!==null}>导入内置标签译名</button><InfoTip label="内置标签译名说明"><p>把常见的繁体、日文标签统一成简体，不改动已有规则。</p></InfoTip></div>
  <label class="toggle"><input type="checkbox" checked={!!rules.strip_actor_names_from_title} disabled={busy} onchange={e=>{rules={...rules,strip_actor_names_from_title:e.currentTarget.checked};preview=null}} /><span>标题剔除演员名<small>在 AI 汉化之前，从标题里删掉本片演员的规范名和别名；原题保留来源原文。只有一个字的名字不处理，删完为空时保留原题。</small></span></label>
  <label>名称类别 <select class="input" bind:value={field} disabled={busy||editIndex!==null}>{#each NAME_FIELDS as key}<option value={key}>{labels[key]}</option>{/each}</select></label>
  <label>规范名 <input class="input" bind:value={canonical} disabled={busy} list="catalog-names" /></label>

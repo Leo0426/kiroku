@@ -30,7 +30,7 @@
 - 编号口径跟随 amane:`FC2-PPV-n` → `FC2-n`,不去前导零(站点检索时用 `Code::search_key` 归一)
 - 文件操作默认 dry-run;执行产出操作日志可回滚;跨盘先复制校验再删源
 - 整理后清理原文件夹只用 `pipeline::trash_to_system`(移到废纸篓,不永久删除),且只限待整理根目录之内;测试必须注入假的 `TrashFn`,不能碰真实废纸篓
-- AI 汉化(`translate.rs`)走 Claude Messages API 原始 HTTP:`output_config.format` 约束 JSON、默认 `claude-opus-5-5` + effort `low`、`fallbacks: "default"`;读内容前先查 `stop_reason`
+- AI 汉化(`translate.rs`)按所选 provider 走 OpenAI Chat Completions / Anthropic Messages 原始 HTTP;`translate/config.rs` 管迁移与校验,`translate/protocol.rs` 管请求/响应。Anthropic 官方预设保留 `claude-opus-5-5` + effort `low` + `fallbacks: "default"`;自定义服务可选提示词 JSON、默认思考强度并关闭 fallback。读内容前检查 `stop_reason` / `finish_reason` 与拒绝字段;失败不跨 provider 重试。旧单组配置仅在读取时迁移,缓存身份包含协议、端点与生成选项。
 - Jellyfin/Emby(`media_server.rs`)按路径 `POST /Library/Media/Updated` 通知,可配本机→服务器路径前缀映射;Key 只放请求头
 - Plex(`plex.rs`)不读 NFO:靠文件名(`PlanOpts::plex_naming`)和 poster/fanart;整理/撤销后按路径匹配分区做局部刷新
 - 磁盘 I/O 不阻塞 UI 线程

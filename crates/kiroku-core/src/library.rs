@@ -100,11 +100,19 @@ pub struct Query {
     pub content_type: Option<String>,
     pub year: Option<i32>,
     pub sort: Sort,
+    pub reverse: bool,
+    /// Score uses the same 0–100 scale as MovieCard.
+    pub min_score: Option<u8>,
+    pub missing: Option<MissingField>,
     pub offset: usize,
     pub limit: usize,
     /// 维度筛选,全部满足(AND)
     pub filters: Vec<FacetFilter>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MissingField { Poster, Score, Year }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -195,6 +203,10 @@ pub struct Library {
 mod reader;
 mod query;
 mod rebuild;
+mod prune;
+mod export;
+mod overview;
+pub use overview::Overview;
 pub use reader::{LibraryReadHandle, LibraryReader};
 
 fn rel_str(p: &Path) -> String {
@@ -271,6 +283,9 @@ impl Library {
             }
             transaction.execute_batch("PRAGMA user_version=4;")?;
             transaction.commit()?;
+        }
+        if v < 5 {
+            conn.execute_batch(&format!("BEGIN; {} PRAGMA user_version=5; COMMIT;", query::REVERSE_INDEXES))?;
         }
         let library = Self { root_identity: binding.root_identity, db_identity: binding.db_identity, root: binding.root, conn, read_cache: binding.read_cache };
         library.verify_binding()?;
@@ -478,32 +493,9 @@ impl Library {
         let shared_cache = self.conn.is_readonly("main")? || self.conn.is_autocommit();
         let transaction = if self.conn.is_autocommit() { Some(self.conn.unchecked_transaction()?) } else { None };
         let revision: i64 = self.conn.query_row("SELECT revision FROM library_state WHERE id=1", [], |row|row.get(0))?;
-        let count_key = serde_json::to_string(&(&q.text, &q.content_type, q.year, &q.filters)).map_err(io::Error::other)?;
-        let page_key = format!("{:?}:{count_key}",q.sort);
-        let (mut wh, mut args): (Vec<String>, Vec<Value>) = (vec![], vec![]);
-        for w in q.text.as_deref().unwrap_or("").split_whitespace() {
-            // FTS narrows long literal substrings; LIKE remains the final authority
-            // for wildcard escaping, Unicode and multiple-word semantics.
-            if w.to_lowercase().chars().count() >= 3 && !w.contains('\0') {
-                wh.push("rowid IN (SELECT rowid FROM movie_search WHERE movie_search MATCH ?)".into());
-                args.push(Value::Text(format!("\"{}\"", w.to_lowercase().replace('"', "\"\""))));
-            }
-            wh.push("search LIKE ? ESCAPE '\\'".into());
-            args.push(Value::Text(like_pattern(w)));
-        }
-        if let Some(ct) = q.content_type.as_deref().filter(|c| !c.is_empty()) {
-            wh.push("content_type = ?".into());
-            args.push(Value::Text(ct.into()));
-        }
-        if let Some(y) = q.year {
-            wh.push("year = ?".into());
-            args.push(Value::Integer(y as i64));
-        }
-        for filter in &q.filters {
-            wh.push("code IN (SELECT code FROM movie_facet WHERE kind = ? AND value = ?)".into());
-            args.push(Value::Text(filter.kind.as_str().into()));
-            args.push(Value::Text(filter.value.clone()));
-        }
+        let count_key = serde_json::to_string(&(&q.text, &q.content_type, q.year, &q.filters, q.min_score, q.missing)).map_err(io::Error::other)?;
+        let page_key = format!("{:?}:{}:{count_key}",q.sort,q.reverse);
+        let (wh, args) = query::filters(q);
         let count_clause = if wh.is_empty() { String::new() } else { format!("WHERE {}", wh.join(" AND ")) };
         let total = match shared_cache.then(||self.read_cache.count(revision,&count_key)).flatten() {
             Some(count)=>count,
@@ -514,7 +506,7 @@ impl Library {
         };
         let anchor=shared_cache.then(||self.read_cache.anchor(revision,&page_key,q.offset)).flatten();
         let limit=if q.limit==0{60}else{q.limit.clamp(1,500)};
-        let (sql,args)=query::page_sql(&wh,args,q.sort,q.offset,limit,anchor);
+        let (sql,args)=query::page_sql(&wh,args,q.sort,q.reverse,q.offset,limit,anchor);
         let mut statement=self.conn.prepare(&sql)?;
         let rows=statement.query_map(params_from_iter(args.iter()),|row|Ok((self.card(row),row.get::<_,Value>(10)?)))?
             .collect::<std::result::Result<Vec<_>,_>>()?;
@@ -650,6 +642,80 @@ mod tests {
     }
 
     #[test]
+    fn completeness_filters_distinguish_zero_missing_and_combine_with_facets() {
+        let (_temporary, root, library) = lib();
+        for i in 0..4 {
+            let code = format!("CHECK-{i:03}");
+            let mut metadata = meta(&code, "Example", "Person", if i == 0 { "" } else { "2025-01-01" });
+            if i == 1 { metadata.scores.clear(); } else { metadata.scores[0].score = (i * 30) as f32; }
+            let dir = place(&root, &metadata, &format!("{code}.mp4"));
+            if i == 2 { fs::write(dir.join(format!("{code}-poster.jpg")), b"poster").unwrap(); }
+            library.reindex_dir(&dir).unwrap();
+        }
+        let reader = library.reader_handle().open().unwrap();
+        assert_eq!(reader.list(&Query { missing: Some(MissingField::Poster), ..Default::default() }).unwrap().total, 3);
+        let missing_score = reader.list(&Query { missing: Some(MissingField::Score), ..Default::default() }).unwrap();
+        assert_eq!(missing_score.items[0].code, "CHECK-001"); assert_eq!(missing_score.total, 1);
+        assert_eq!(reader.list(&Query { missing: Some(MissingField::Year), ..Default::default() }).unwrap().items[0].code, "CHECK-000");
+        assert_eq!(reader.list(&Query { min_score: Some(0), ..Default::default() }).unwrap().total, 3);
+        let combined = Query { min_score: Some(60), missing: Some(MissingField::Poster), filters: vec![FacetFilter { kind: FacetKind::Actor, value: "Person".into() }], ..Default::default() };
+        assert_eq!(reader.list(&combined).unwrap().items[0].code, "CHECK-003");
+        let mut csv = Vec::new();
+        assert_eq!(reader.export_csv(&combined, &mut csv, &CancellationToken::new(), &mut |_, _| {}).unwrap(), 1);
+        assert!(String::from_utf8(csv).unwrap().contains("CHECK-003"));
+        assert_eq!(reader.list(&Query { min_score: Some(60), missing: Some(MissingField::Score), ..Default::default() }).unwrap().total, 0);
+    }
+
+    #[test]
+    fn csv_exports_all_pages_of_one_snapshot_and_honors_cancellation() {
+        let (_temporary, root, library) = lib();
+        for i in 0..505 {
+            let code = format!("EXPORT-{i:03}");
+            let dir = root.join(&code); fs::create_dir(&dir).unwrap();
+            fs::write(dir.join(SIDECAR), serde_json::to_vec(&meta(&code, "=1+1", "Person", "2025-01-01")).unwrap()).unwrap();
+            fs::write(dir.join(format!("{code}.mp4")), b"video").unwrap();
+            library.reindex_dir(&dir).unwrap();
+        }
+        let reader = library.reader_handle().open().unwrap();
+        let query = Query { sort: Sort::Title, reverse: true, offset: 400, limit: 1, ..Default::default() };
+        let mut csv = Vec::new(); let mut updated = false;
+        let count = reader.export_csv(&query, &mut csv, &CancellationToken::new(), &mut |done, _| {
+            if done == 500 && !updated {
+                let dir = root.join("EXPORT-000");
+                fs::write(dir.join(SIDECAR), serde_json::to_vec(&meta("EXPORT-000", "Changed later", "Person", "2025-01-01")).unwrap()).unwrap();
+                library.reindex_dir(&dir).unwrap(); updated = true;
+            }
+        }).unwrap();
+        let csv = String::from_utf8(csv).unwrap();
+        assert_eq!(count, 505); assert_eq!(csv.lines().count(), 506);
+        assert!(csv.lines().nth(1).unwrap().starts_with("\"EXPORT-504\""));
+        assert!(csv.lines().last().unwrap().starts_with("\"EXPORT-000\""));
+        assert_eq!(csv.matches("\"'=1+1\"").count(), 505);
+        assert!(!csv.contains("Changed later"));
+        let cancel = CancellationToken::new();
+        let mut partial = Vec::new();
+        assert!(reader.export_csv(&query, &mut partial, &cancel, &mut |done, _| { if done == 500 { cancel.cancel(); } }).is_err());
+        assert_eq!(reader.list(&Query::default()).unwrap().total, 505);
+    }
+
+    #[test]
+    fn overview_uses_full_filtered_membership_and_logical_file_sizes() {
+        let (_d,root,library)=lib();
+        for i in 0..5 {let mut m=meta(&format!("SMPL-{i:03}"),"Example","Person","2025-01-01");m.favorite=i%2==0;
+          m.fields.tags=vec![if i<3{"Group A"}else{"Group B"}.into()];
+          if i==0 {m.fields.release_date=None;m.scores.clear();} else {m.scores=vec![crate::metadata::SourcedScore{site:"sample".into(),score:80.0}];}
+          let dir=place(&root,&m,&format!("SMPL-{i:03}.mp4"));library.reindex_dir(&dir).unwrap();}
+        let reader=library.reader_handle().open().unwrap();
+        for query in [Query::default(),Query{text:Some("SMPL-00".into()),filters:vec![f(FacetKind::Tag,"Group A")],offset:99,limit:1,..Default::default()},Query{missing:Some(MissingField::Score),..Default::default()},Query{min_score:Some(90),..Default::default()}] {
+          let stats=reader.overview(&query).unwrap();assert_eq!(stats.movies,reader.list(&query).unwrap().total);
+          let all=reader.list(&Query{offset:0,limit:500,..query.clone()}).unwrap();
+          let mut bytes=0;let mut files=0;for item in &all.items {let detail=reader.get(&item.code).unwrap().unwrap();files+=detail.files.len();bytes+=detail.files.iter().map(|f|f.size).sum::<u64>();}
+          assert_eq!(stats.bytes,bytes);assert_eq!(stats.files,files);assert_eq!(stats.favorites,all.items.iter().filter(|m|m.favorite).count());
+        }
+        let stats=reader.overview(&Query::default()).unwrap();assert_eq!(stats.missing_score,1);assert_eq!(stats.missing_year,1);assert_eq!(stats.average_score,Some(80.0));
+    }
+
+    #[test]
     fn artwork_versions_follow_content_across_reindex_edit_and_restore() {
         let (_d, root, library) = lib();
         let dir = place(&root, &meta("AAA-111", "Alpha", "Foo", "2021-03-04"), "AAA-111.mp4");
@@ -750,7 +816,7 @@ mod tests {
         drop(library);
         let library = Library::open(&root).unwrap();
         assert_eq!(codes(&library, vec![f(FacetKind::Tag, "Drama"), f(FacetKind::Badge, "subtitle")]), ["AAA-111"]);
-        assert_eq!(library.conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 4);
+        assert_eq!(library.conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 5);
     }
 
     #[test]
@@ -768,7 +834,7 @@ mod tests {
         assert_eq!(page.total, 1, "migration must retain cached rows without scanning disk");
         assert_eq!(page.items[0].code, "OLD-001");
         assert!(page.items[0].poster_version.is_none());
-        assert_eq!(library.conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 4);
+        assert_eq!(library.conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0)).unwrap(), 5);
         drop(library);
         assert_eq!(Library::open(root).unwrap().list(&Query::default()).unwrap().total, 1);
     }
@@ -914,6 +980,9 @@ mod tests {
             for (label, query) in [
                 ("first", Query { limit:120, ..Default::default() }),
                 ("deep_random", Query { limit:120, offset:size-120, ..Default::default() }),
+                ("reverse_year_first", Query { sort:Sort::Year, reverse:true, limit:120, ..Default::default() }),
+                ("reverse_year_deep", Query { sort:Sort::Year, reverse:true, limit:120, offset:size-120, ..Default::default() }),
+                ("reverse_score_deep", Query { sort:Sort::Score, reverse:true, limit:120, offset:size-120, ..Default::default() }),
                 ("contains", Query { text:Some("needle".into()), limit:120, ..Default::default() }),
             ] {
                 let mut times=vec![];
@@ -950,11 +1019,11 @@ mod tests {
         }
         let handle=writer.reader_handle();
         for sort in [Sort::Added,Sort::Title,Sort::Year,Sort::Score] {
-            for text in [None,Some("alpha".to_string())] {
-                let all=handle.open().unwrap().list(&Query{sort,text:text.clone(),limit:500,..Default::default()}).unwrap();
+            for (text, reverse) in [None,Some("alpha".to_string())].into_iter().flat_map(|text| [false, true].map(|reverse| (text.clone(), reverse))) {
+                let all=handle.open().unwrap().list(&Query{sort,reverse,text:text.clone(),limit:500,..Default::default()}).unwrap();
                 let mut codes=vec![];
                 for offset in (0..all.total).step_by(7) {
-                    let page=handle.open().unwrap().list(&Query{sort,text:text.clone(),offset,limit:7,..Default::default()}).unwrap();
+                    let page=handle.open().unwrap().list(&Query{sort,reverse,text:text.clone(),offset,limit:7,..Default::default()}).unwrap();
                     assert_eq!(page.total,all.total);codes.extend(page.items.into_iter().map(|card|card.code));
                 }
                 assert_eq!(codes,all.items.into_iter().map(|card|card.code).collect::<Vec<_>>(),"{sort:?} {text:?}");
@@ -978,14 +1047,39 @@ mod tests {
     }
 
     #[test]
+    fn reverse_nullable_indexes_migrate_and_avoid_cold_page_sorting() {
+        let (_temporary, root, writer) = lib();
+        let dir = place(&root, &meta("SMPL-001", "Example", "Person", "2021-01-01"), "SMPL-001.mp4");
+        writer.reindex_dir(&dir).unwrap();
+        writer.conn.execute_batch("DROP INDEX movie_year_reverse_code; DROP INDEX movie_score_reverse_code; PRAGMA user_version=4;").unwrap();
+        drop(writer);
+        let writer = Library::open(&root).unwrap();
+        assert_eq!(writer.list(&Query::default()).unwrap().total, 1);
+        for sort in [Sort::Year, Sort::Score] {
+            for reverse in [false, true] {
+                for offset in [0, 80_000] {
+                    let (sql, args) = query::page_sql(&[], vec![], sort, reverse, offset, 120, None);
+                    let details = writer.conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap()
+                        .query_map(params_from_iter(args.iter()), |r| r.get::<_,String>(3)).unwrap()
+                        .collect::<std::result::Result<Vec<_>,_>>().unwrap();
+                    assert!(!details.iter().any(|d| d.contains("TEMP B-TREE")), "{sort:?}/{reverse}: {details:?}");
+                    assert!(details.iter().any(|d| d.contains("USING INDEX movie_")), "{details:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn deep_seek_queries_use_index_ranges_instead_of_scanning_past_old_rows() {
         let(_temporary,_root,writer)=lib();
         for (sort,value) in [(Sort::Added,Value::Integer(-100)),(Sort::Title,Value::Text("Alpha".into())),(Sort::Year,Value::Integer(-2021)),(Sort::Score,Value::Real(-80.0))] {
-            let(sql,args)=query::page_sql(&[],vec![],sort,100000,120,Some(query::Anchor{offset:100000,value,code:"AAA-111".into()}));
+          for reverse in [false,true] {
+            let(sql,args)=query::page_sql(&[],vec![],sort,reverse,100000,120,Some(query::Anchor{offset:100000,value:value.clone(),code:"AAA-111".into()}));
             let mut statement=writer.conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
             let details=statement.query_map(params_from_iter(args.iter()),|row|row.get::<_,String>(3)).unwrap().collect::<std::result::Result<Vec<_>,_>>().unwrap();
-            assert!(details.iter().any(|detail|detail.contains("SEARCH movie USING INDEX")&&detail.contains("code>?")),"{sort:?}: {details:?}");
+            assert!(details.iter().any(|detail|detail.contains("SEARCH movie USING INDEX")&&detail.contains(if reverse {"code<?"} else {"code>?"})),"{sort:?}/{reverse}: {details:?}");
             assert!(!details.iter().any(|detail|detail.starts_with("SCAN movie")),"{sort:?}: {details:?}");
+          }
         }
     }
 
@@ -1116,6 +1210,73 @@ mod tests {
         // 目录整个不存在也不报错
         fs::remove_dir_all(&dir).unwrap();
         assert_eq!(l.reindex_dir(&dir).unwrap(), None);
+    }
+
+    #[test]
+    fn prune_missing_removes_only_movies_with_no_video_and_keeps_disk_metadata() {
+        let (_d, root, l) = lib();
+        let removed = place(&root, &meta("AAA-111", "Alpha", "Foo", "2021-03-04"), "AAA-111.mp4");
+        let partial = place(&root, &meta("BBB-222", "Beta", "Bar", "2021-03-04"), "BBB-222-CD1.mp4");
+        place(&root, &meta("BBB-222", "Beta", "Bar", "2021-03-04"), "BBB-222-CD2.mp4");
+        let moved = place(&root, &meta("CCC-333", "Gamma", "Baz", "2021-03-04"), "CCC-333.mp4");
+        for dir in [&removed, &partial, &moved] { l.reindex_dir(dir).unwrap(); }
+        let reader = l.reader_handle();
+        assert_eq!(reader.open().unwrap().list(&Query::default()).unwrap().total, 3);
+        fs::remove_file(removed.join("AAA-111.mp4")).unwrap();
+        fs::write(removed.join("poster.jpg"), b"poster").unwrap();
+        fs::remove_file(partial.join("BBB-222-CD1.mp4")).unwrap();
+        // Broken metadata must not remove a movie while one video still exists.
+        fs::write(partial.join(SIDECAR), b"broken").unwrap();
+        fs::rename(&moved, root.parent().unwrap().join("moved-out")).unwrap();
+        assert_eq!(l.prune_missing(&CancellationToken::new(), &mut |_, _| {}).unwrap(), 2);
+        assert!(l.get("AAA-111").unwrap().is_none());
+        assert!(l.get("CCC-333").unwrap().is_none());
+        assert!(l.get("BBB-222").unwrap().is_some());
+        assert!(removed.join(SIDECAR).is_file());
+        assert_eq!(fs::read(removed.join("poster.jpg")).unwrap(), b"poster");
+        assert_eq!(reader.open().unwrap().list(&Query::default()).unwrap().total, 1);
+        assert_eq!(l.facets().unwrap().total, 1);
+    }
+
+    #[test]
+    fn prune_missing_cancellation_and_root_loss_roll_back_all_removals() {
+        let (_d, root, l) = lib();
+        for code in ["AAA-111", "BBB-222"] {
+            let dir = place(&root, &meta(code, "Title", "Name", "2021-03-04"), &format!("{code}.mp4"));
+            l.reindex_dir(&dir).unwrap();
+            fs::remove_file(dir.join(format!("{code}.mp4"))).unwrap();
+        }
+        let cancel = CancellationToken::new();
+        assert!(l.prune_missing(&cancel, &mut |_, _| cancel.cancel()).is_err());
+        assert_eq!(l.list(&Query::default()).unwrap().total, 2);
+        let offline = root.with_extension("offline");
+        assert!(l.prune_missing(&CancellationToken::new(), &mut |done, total| {
+            if done == total { fs::rename(&root, &offline).unwrap(); }
+        }).is_err());
+        fs::rename(&offline, &root).unwrap();
+        assert_eq!(l.list(&Query::default()).unwrap().total, 2);
+        fs::rename(&root, &offline).unwrap();
+        assert!(l.prune_missing(&CancellationToken::new(), &mut |_, _| {}).is_err());
+        assert!(!root.exists());
+        fs::rename(&offline, &root).unwrap();
+        assert_eq!(l.list(&Query::default()).unwrap().total, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prune_missing_keeps_dangling_video_links_and_fails_closed_on_redirected_directories() {
+        let (_d, root, l) = lib();
+        let dir = place(&root, &meta("AAA-111", "Alpha", "Foo", "2021-03-04"), "AAA-111.mp4");
+        l.reindex_dir(&dir).unwrap();
+        fs::remove_file(dir.join("AAA-111.mp4")).unwrap();
+        std::os::unix::fs::symlink(root.join("offline/video.mp4"), dir.join("AAA-111.mp4")).unwrap();
+        assert_eq!(l.prune_missing(&CancellationToken::new(), &mut |_, _| {}).unwrap(), 0);
+        assert_eq!(l.list(&Query::default()).unwrap().total, 1);
+        let moved = root.parent().unwrap().join("elsewhere");
+        fs::rename(&dir, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &dir).unwrap();
+        assert!(l.prune_missing(&CancellationToken::new(), &mut |_, _| {}).is_err());
+        assert_eq!(l.list(&Query::default()).unwrap().total, 1);
     }
 
     #[test]

@@ -1,3 +1,4 @@
+pub mod batch;
 use crate::state::{allow_library_assets, emit, AppState, JobGuard, PendingRevision};
 use kiroku_core::{
     journal::{Journal, JournalStatus},
@@ -7,6 +8,7 @@ use kiroku_core::{
     settings::Settings,
 };
 use serde::Serialize;
+use tokio_util::sync::CancellationToken;
 use std::{
     path::{Path, PathBuf},
     time::Instant,
@@ -22,7 +24,7 @@ fn library_change(state: &AppState, root: Option<&str>) -> CmdResult<bool> {
     if changed && state.job_running() {
         return Err("有任务正在运行,请等待完成后再更换媒体库".into());
     }
-    if changed {*state.catalog.lock().unwrap_or_else(|e|e.into_inner())=None; *state.append.lock().unwrap_or_else(|e|e.into_inner())=None; *state.maintenance.lock().unwrap_or_else(|e|e.into_inner())=None; *state.revision.lock().unwrap_or_else(|e|e.into_inner())=None; *state.artwork.lock().unwrap_or_else(|e|e.into_inner())=None;}
+    if changed {*state.batch_edit.lock().unwrap_or_else(|e|e.into_inner())=None; *state.catalog.lock().unwrap_or_else(|e|e.into_inner())=None; *state.append.lock().unwrap_or_else(|e|e.into_inner())=None; *state.maintenance.lock().unwrap_or_else(|e|e.into_inner())=None; *state.revision.lock().unwrap_or_else(|e|e.into_inner())=None; *state.artwork.lock().unwrap_or_else(|e|e.into_inner())=None;}
     Ok(changed)
 }
 
@@ -83,7 +85,7 @@ fn persist_to(state: &AppState, settings: Settings, path: &Path, root_owner: Opt
     kiroku_core::logging::configure(&settings.log);
     *state.settings.lock().unwrap_or_else(|e| e.into_inner()) = settings;
     if scan_changed { state.pending.lock().unwrap_or_else(|e| e.into_inner()).invalidate(); }
-    if config_changed {let mut session=state.session();session.plans.clear();session.plan_settings=None;*state.append.lock().unwrap_or_else(|e|e.into_inner())=None;*state.maintenance.lock().unwrap_or_else(|e|e.into_inner())=None;}
+    if config_changed {*state.batch_edit.lock().unwrap_or_else(|e|e.into_inner())=None;let mut session=state.session();session.plans.clear();session.plan_settings=None;*state.append.lock().unwrap_or_else(|e|e.into_inner())=None;*state.maintenance.lock().unwrap_or_else(|e|e.into_inner())=None;}
     Ok(())
 }
 
@@ -270,7 +272,7 @@ struct ScanDone {
 const SKIPPED_MAX: usize = 500;
 
 #[tauri::command]
-pub async fn scan_start(app: AppHandle, state: State<'_, AppState>, dirs: Vec<String>) -> CmdResult<u64> {
+pub async fn scan_start(app: AppHandle, state: State<'_, AppState>, dirs: Vec<String>, remember_sources: Option<bool>) -> CmdResult<u64> {
     if dirs.is_empty() {
         return Err("请选择要整理的文件夹".into());
     }
@@ -282,10 +284,10 @@ pub async fn scan_start(app: AppHandle, state: State<'_, AppState>, dirs: Vec<St
     }
     let (id, cancel) = state.begin_job("scan")?;
     let mut s = state.settings();
-    s.source_dirs = remembered_sources(&dirs);
+    if remember_sources.unwrap_or(true) { s.source_dirs = remembered_sources(&dirs); }
     let exclude = state.library_root();
     let filter = s.video_filter();
-    let _ = persist(&state, s);
+    if remember_sources.unwrap_or(true) { let _ = persist(&state, s); }
     {
         let mut session = state.session();
         session.roots = dirs.iter().map(PathBuf::from).collect();
@@ -682,7 +684,9 @@ pub async fn media_server_test(state: State<'_, AppState>, cfg: kiroku_core::med
 
 /// 用当前(未保存的)AI 设置试译一句,验证 Key、模型和网络。
 #[tauri::command]
-pub async fn ai_test(cfg: kiroku_core::translate::AiCfg) -> CmdResult<kiroku_core::translate::Translated> {
+pub async fn ai_test(mut cfg: kiroku_core::translate::AiCfg) -> CmdResult<kiroku_core::translate::Translated> {
+    cfg.title = true;
+    cfg.plot = false;
     let t = kiroku_core::translate::Translator::new(cfg)?;
     t.translate(Some("海辺の町で、古い友人と過ごした3日間。"), None).await
 }
@@ -787,8 +791,107 @@ async fn query_lib<T: Send + 'static>(app: AppHandle, f: impl FnOnce(&kiroku_cor
 }
 
 #[tauri::command]
+pub async fn library_overview(app: AppHandle, query: Query) -> CmdResult<kiroku_core::library::Overview> {
+    query_lib(app, move |l| l.overview(&query)).await
+}
+
+#[tauri::command]
 pub async fn library_list(app: AppHandle, query: Query) -> CmdResult<Page> {
     query_lib(app, move |l| l.list(&query)).await
+}
+
+fn export_library_snapshot(
+    state: &AppState,
+    snapshot: &crate::state::LibraryReadSnapshot,
+    query: &Query,
+    path: &Path,
+    cancel: &CancellationToken,
+    progress: &mut impl FnMut(usize, usize),
+) -> CmdResult<usize> {
+    use std::io::Write;
+    state.validate_read(snapshot)?;
+    if cancel.is_cancelled() { return Err("导出已停止".into()); }
+    let parent = path.parent().ok_or("导出路径无效")?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
+    let count = {
+        let mut output = std::io::BufWriter::new(temp.as_file_mut());
+        let count = with_read_snapshot(state, snapshot, |reader| reader.export_csv(query, &mut output, cancel, progress))?;
+        output.flush().map_err(|e| e.to_string())?;
+        count
+    };
+    temp.as_file().sync_all().map_err(|e| e.to_string())?;
+    state.validate_read(snapshot)?;
+    if cancel.is_cancelled() { return Err("导出已停止".into()); }
+    // Never overwrite a media file or an earlier report.
+    temp.persist_noclobber(path).map_err(|e| format!("无法保存，请选择尚不存在的文件：{e}"))?;
+    Ok(count)
+}
+
+/// Export only the captured library snapshot; the native dialog owns the output
+/// path. A private temporary file is published only after a complete export.
+#[tauri::command]
+pub async fn library_export_csv(app: AppHandle, query: Query, request_id: Option<String>) -> CmdResult<Option<usize>> {
+    let snapshot = app.state::<AppState>().read_snapshot()?;
+    // A chooser is not a disk task: do not hold the shutdown/job guard while
+    // waiting for human input in a native modal. The captured root is revalidated.
+    let picker_app = app.clone();
+    let path = tauri::async_runtime::spawn_blocking(move || picker_app.dialog().file()
+        .set_title("导出媒体库清单（请选择新文件）").set_file_name("kiroku-library.csv")
+        .add_filter("CSV", &["csv"]).blocking_save_file()).await.map_err(|e| e.to_string())?;
+    let Some(path) = path else { return Ok(None) };
+    let path = path.into_path().map_err(|e| e.to_string())?;
+    let state = app.state::<AppState>();
+    state.validate_read(&snapshot)?;
+    let (id, cancel) = reliability::begin_reported_job(&state, "library-export", request_id, |id, request_id| {
+        emit(&app, "job:started", id, serde_json::json!({"requestId":request_id}));
+    })?;
+    let guard = JobGuard { app: app.clone(), id };
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = guard;
+        if cancel.is_cancelled() { return Err("导出已停止".into()); }
+        let count = export_library_snapshot(&app.state::<AppState>(), &snapshot, &query, &path, &cancel, &mut |done, total| emit(&app, "library:export", id, serde_json::json!({"root":snapshot.handle.root().to_string_lossy(),"done":done,"total":total})))?;
+        Ok(Some(count))
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryPruned { root: String, removed: usize, skipped: bool }
+
+fn prune_library_snapshot(state: &AppState, snapshot: &crate::state::LibraryReadSnapshot, cancel: &CancellationToken) -> CmdResult<usize> {
+    state.validate_read(snapshot)?;
+    let slot = state.lib();
+    state.validate_read(snapshot)?;
+    let library = slot.as_ref().ok_or("媒体库索引已关闭")?;
+    library.prune_missing(cancel, &mut |_, _| {}).map_err(|e| e.to_string())
+}
+
+/// Check only known movie directories, off the UI thread. Auto checks yield to
+/// existing jobs; explicit refresh reports contention. No media files are deleted.
+#[tauri::command]
+pub async fn library_prune_missing(app: AppHandle, root: String, automatic: bool, request_id: Option<String>) -> CmdResult<LibraryPruned> {
+    let state = app.state::<AppState>();
+    let snapshot = state.read_snapshot()?;
+    state.validate_read(&snapshot)?;
+    if snapshot.handle.root() != Path::new(&root) { return Err("媒体库已变化，请重新刷新".into()); }
+    let (id, cancel) = match state.begin_job("library-prune") {
+        Ok(job) => job,
+        Err(_) if automatic => return Ok(LibraryPruned { root, removed: 0, skipped: true }),
+        Err(error) => return Err(error),
+    };
+    let guard = JobGuard { app: app.clone(), id };
+    if let Some(request_id) = request_id {
+        emit(&app, "job:started", id, serde_json::json!({"requestId":request_id}));
+    }
+    let app2 = app.clone();
+    // The worker retains the guard until its transaction has committed/rolled back,
+    // even if the caller drops the invoke future during shutdown.
+    let removed = tauri::async_runtime::spawn_blocking(move || {
+        let _guard = guard;
+        prune_library_snapshot(&app2.state::<AppState>(), &snapshot, &cancel)
+    }).await.map_err(|e| e.to_string())??;
+    if removed > 0 { emit(&app, "library:changed", id, serde_json::json!({"root":root})); }
+    Ok(LibraryPruned { root, removed, skipped: false })
 }
 
 #[tauri::command]
@@ -1124,6 +1227,55 @@ mod tests {
         left.sort();
         assert_eq!(left, ["ABC-123.mp4", "ABC-123.zh.srt"]);
         assert_eq!(library.reindex_dir(&target).unwrap(), None, "资料删掉后移出索引");
+    }
+
+    #[test]
+    fn queued_prune_cannot_modify_a_replacement_library() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root_a = temporary.path().join("a");
+        let root_b = temporary.path().join("b");
+        let first = Library::open(&root_a).unwrap();
+        let second = Library::open(&root_b).unwrap();
+        let dir = root_b.join("ABC-123");
+        movie(&dir, "ABC-123");
+        second.reindex_dir(&dir).unwrap();
+        std::fs::remove_file(dir.join("ABC-123.mp4")).unwrap();
+        let state = AppState::new(Settings { library_root: Some(root_a.display().to_string()), ..Default::default() });
+        state.replace_library(Some(first));
+        let old = state.read_snapshot().unwrap();
+        state.settings.lock().unwrap().library_root = Some(root_b.display().to_string());
+        state.replace_library(Some(second));
+        assert!(prune_library_snapshot(&state, &old, &CancellationToken::new()).is_err());
+        assert_eq!(with_lib(&state, |l| l.list(&Query::default())).unwrap().total, 1);
+        let current = state.read_snapshot().unwrap();
+        assert_eq!(prune_library_snapshot(&state, &current, &CancellationToken::new()).unwrap(), 1);
+        assert_eq!(with_lib(&state, |l| l.list(&Query::default())).unwrap().total, 0);
+    }
+
+    #[test]
+    fn csv_publication_is_complete_exclusive_and_cancelled_exports_leave_no_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("library");
+        let dir = root.join("ABC-123"); movie(&dir, "ABC-123");
+        let library = Library::open(&root).unwrap(); library.reindex_dir(&dir).unwrap();
+        let state = AppState::new(Settings { library_root: Some(root.display().to_string()), ..Default::default() });
+        state.replace_library(Some(library));
+        let snapshot = state.read_snapshot().unwrap();
+        let path = temp.path().join("report.csv");
+        let query = Query::default();
+        assert_eq!(export_library_snapshot(&state, &snapshot, &query, &path, &CancellationToken::new(), &mut |_, _| {}).unwrap(), 1);
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("ABC-123"));
+        assert!(export_library_snapshot(&state, &snapshot, &query, &path, &CancellationToken::new(), &mut |_, _| {}).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let cancel = CancellationToken::new(); let cancelled = temp.path().join("cancelled.csv");
+        assert!(export_library_snapshot(&state, &snapshot, &query, &cancelled, &cancel, &mut |done, _| { if done > 0 { cancel.cancel(); } }).is_err());
+        assert!(!cancelled.exists());
+        state.settings.lock().unwrap().library_root = Some(temp.path().join("other").display().to_string());
+        assert!(export_library_snapshot(&state, &snapshot, &query, &cancelled, &CancellationToken::new(), &mut |_, _| {}).is_err());
+        assert!(!cancelled.exists());
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 2, "temporary output files are removed on every failure");
+        assert_eq!(std::fs::read(dir.join("ABC-123.mp4")).unwrap(), b"video");
     }
 
     #[test]

@@ -19,10 +19,13 @@
   import LanguageExport from './LanguageExport.svelte'
   import LoadingStatus from './LoadingStatus.svelte'
 
-  let { code, onclose }: { code: string; onclose: () => void } = $props()
+  let { code, onclose, navigation }: { code: string; onclose: () => void; navigation?: { position: number; total: number; busy: boolean; stale: boolean; move: (step: number) => void } } = $props()
 
   /** 海报裁剪弹窗;换影片时收起 */
   let cropping = $state(false)
+  let activeTools = $state<Record<string, boolean>>({})
+  const toolActive = $derived(Object.values(activeTools).some(Boolean))
+  $effect(() => { code; activeTools = {} })
   $effect(() => { code; cropping = false })
 
   let detail = $state<MovieDetail | null>(null)
@@ -146,6 +149,7 @@
 <div class="scrim" role="presentation" onclick={closeDetails} transition:fade={{ duration: dur(200) }}></div>
 
 <aside class="panel" class:armed bind:this={panel} tabindex="-1" aria-label="影片详情" aria-busy={loading} transition:slideIn onintroend={() => (armed = true)}>
+  {#if navigation}<div class="sequence" aria-label="连续浏览" title={navigation.stale ? '列表已更新，请返回列表重新选择影片' : toolActive ? '请先结束当前编辑或工具操作' : '按当前筛选顺序浏览'}><button class="btn sm" aria-label="上一部影片" disabled={navigation.stale || navigation.busy || navigation.position <= 0 || cropping || mediaBusy || toolActive || favoriteBusy} onclick={() => navigation?.move(-1)}>← 上一部</button><span aria-live="polite">{#if navigation.stale}列表已更新，请重新选择{:else}{navigation.position + 1} / {navigation.total}{/if}</span><button class="btn sm" aria-label="下一部影片" disabled={navigation.stale || navigation.busy || navigation.position >= navigation.total - 1 || cropping || mediaBusy || toolActive || favoriteBusy} onclick={() => navigation?.move(1)}>下一部 →</button></div>{/if}
   <button class="close btn icon ghost" aria-label="关闭详情" onclick={closeDetails}><Icon name="x" size={18} /></button>
 
   {#if loading}
@@ -155,7 +159,8 @@
   {:else if !detail || !meta}
     <div class="gone"><p class="muted">这部影片已不在媒体库中。</p></div>
   {:else}
-    <div class="hero" style:background-image={fanart ? `url("${fanart}")` : 'none'}>
+    <div class="hero">
+      <div class="hero-img" style:background-image={fanart ? `url("${fanart}")` : 'none'}></div>
       <div class="hero-fade"></div>
     </div>
 
@@ -200,11 +205,11 @@
         <h3>影片工具</h3>
         <div class="tool-grid">
           {#key `${code}:${app.settings?.library_root}`}
-            <MetadataEditor {meta} onsaved={() => attempt++} />
-            <MetadataUpdater {meta} onsaved={() => attempt++} />
+            <MetadataEditor onactive={active => activeTools.MetadataEditor = active} {meta} onsaved={() => attempt++} />
+            <MetadataUpdater onactive={active => activeTools.MetadataUpdater = active} {meta} onsaved={() => attempt++} />
             <section aria-label="海报裁剪"><button class="btn" onclick={() => (cropping = true)}>裁剪海报</button></section>
-            <AppendFiles {code} onsaved={() => attempt++} />
-            <LanguageExport {meta} onsaved={() => attempt++} />
+            <AppendFiles onactive={active => activeTools.AppendFiles = active} {code} onsaved={() => attempt++} />
+            <LanguageExport onactive={active => activeTools.LanguageExport = active} {meta} onsaved={() => attempt++} />
           {/key}
         </div>
       </div>
@@ -216,14 +221,14 @@
       {#if meta.actors.length}
         <section>
           <h3>演员</h3>
-          <div class="chips">{#each meta.actors as a}<span class="chip" class:male={a.gender === 'male'}>{#if a.thumb}<img class="avatar" src={a.thumb} alt="" referrerpolicy="no-referrer" loading="lazy" onerror={e => e.currentTarget.remove()} />{/if}{a.name}</span>{/each}</div>
+          <div class="chips">{#each meta.actors as a, i}<span class="chip" style:--n={Math.min(i, 12)} class:male={a.gender === 'male'}>{#if a.thumb}<img class="avatar" src={a.thumb} alt="" referrerpolicy="no-referrer" loading="lazy" onerror={e => e.currentTarget.remove()} />{/if}{a.name}</span>{/each}</div>
         </section>
       {/if}
 
       {#if meta.tags.length}
         <section>
           <h3>类别</h3>
-          <div class="chips">{#each meta.tags as t}<span class="chip subtle">{t}</span>{/each}</div>
+          <div class="chips">{#each meta.tags as t, i}<span class="chip subtle" style:--n={Math.min(i, 12)}>{t}</span>{/each}</div>
         </section>
       {/if}
 
@@ -267,13 +272,19 @@
   }
   .close:hover :global(svg) { transform: rotate(90deg); }
   .close { position: absolute; z-index: 3; top: var(--s3); right: var(--s3); background: rgb(12 12 16 / 0.5); backdrop-filter: blur(10px); color: #fff; }
-  .hero { height: 220px; background-size: cover; background-position: center 30%; position: relative; filter: saturate(1.1); }
+  .sequence { position:relative; z-index:3; display:flex; flex-wrap:wrap; align-items:center; gap:8px; padding:12px 56px 12px 16px; background:var(--surface-1); font-size:var(--fs-xs); }
+  /* 背景图慢慢推近落定(Ken Burns),溢出部分由 .hero 裁掉 */
+  .hero { height: 220px; position: relative; overflow: hidden; filter: saturate(1.1); }
+  .hero-img { position: absolute; inset: 0; background-size: cover; background-position: center 30%; animation: heroIn 1400ms var(--ease-out) both; }
+  @keyframes heroIn { from { opacity: 0; transform: scale(1.14); } }
   .hero::after { content: ''; position: absolute; inset: 0; backdrop-filter: blur(22px) brightness(0.7); }
   .hero-fade { position: absolute; inset: 0; z-index: 1; background: linear-gradient(to bottom, transparent 30%, var(--surface-1)); }
   .content { position: relative; z-index: 2; margin-top: -92px; padding: 0 var(--s5) var(--s7); display: flex; flex-direction: column; gap: var(--s4); }
   .top { display: flex; gap: var(--s4); align-items: flex-end; }
   .poster { flex-shrink: 0; width: 132px; aspect-ratio: var(--poster-ratio); border-radius: var(--r-md); overflow: hidden; background: var(--surface-3); box-shadow: var(--shadow-3); transition: transform var(--d-slow) var(--ease-back); }
   .poster:hover { transform: translateY(-4px) rotate(-1.5deg) scale(1.03); }
+  .poster { animation: posterIn 620ms 80ms var(--ease-back) both; }
+  @keyframes posterIn { from { opacity: 0; transform: translateY(18px) rotate(-4deg) scale(0.9); } }
   .poster img { width: 100%; height: 100%; object-fit: cover; display: block; }
   .poster { position: relative; padding: 0; border: 0; cursor: pointer; }
   .crop-hint { position: absolute; left: 50%; bottom: var(--s2); transform: translateX(-50%); display: inline-flex; align-items: center; gap: 4px; padding: 3px 9px; border-radius: var(--r-pill); font-size: var(--fs-xs); color: #fff; background: rgb(12 12 16 / 0.62); backdrop-filter: blur(8px); opacity: 0; transition: opacity var(--d-base) var(--ease-out); }
@@ -294,11 +305,17 @@
   .tool-grid :global(p), .tool-grid :global(ins), .tool-grid :global(del) { overflow-wrap: anywhere; }
   .tool-grid :global(button) { max-width: 100%; white-space: normal; }
   .cta { display: flex; gap: var(--s2); flex-wrap: wrap; }
+  /* 收藏:星标转一圈弹出 */
+  .cta .on { color: var(--warn); }
+  .cta .on :global(svg) { animation: starPop 560ms var(--ease-back); }
+  @keyframes starPop { 0% { transform: scale(0.4) rotate(-90deg); } 60% { transform: scale(1.35) rotate(12deg); } 100% { transform: scale(1) rotate(0); } }
   h3 { font-size: var(--fs-xs); font-weight: 600; letter-spacing: 0.06em; color: var(--text-3); margin-bottom: var(--s2); text-transform: uppercase; }
   .plot { color: var(--text-1); font-size: var(--fs-md); line-height: 1.75; white-space: pre-wrap; }
   .chips { display: flex; flex-wrap: wrap; gap: var(--s2); }
   .chip { padding: 4px 11px; border-radius: var(--r-pill); background: var(--accent-soft); color: var(--accent); font-size: var(--fs-sm); font-weight: 500; transition: transform var(--d-base) var(--ease-back), background var(--d-fast); }
   .chip:hover { transform: translateY(-2px); }
+  .chip { animation: chipIn 360ms var(--ease-back) both; animation-delay: calc(240ms + var(--n, 0) * 28ms); }
+  @keyframes chipIn { from { opacity: 0; transform: translateY(6px) scale(0.85); } }
   .chip.male { background: var(--info-soft); color: var(--info); }
   .chip:has(.avatar) { display: inline-flex; align-items: center; gap: 6px; padding-left: 4px; }
   .avatar { width: 20px; height: 20px; border-radius: 50%; object-fit: cover; }

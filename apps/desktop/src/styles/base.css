@@ -168,3 +168,6 @@ svg.icon { transition: transform var(--d-base) var(--ease-back); }
   .ripple { display: none; }
   svg.icon, .btn { transition-duration: 0.01ms; }
 }
+
+:root[data-motion='reduced'] *, :root[data-motion='reduced'] *::before, :root[data-motion='reduced'] *::after { animation:none !important; transition-duration:0.01ms !important; scroll-behavior:auto !important; }
+:root[data-motion='reduced'] .ripple { display:none; }

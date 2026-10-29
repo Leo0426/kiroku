@@ -4,7 +4,7 @@
  import { api } from '../lib/api'
  import { app } from '../lib/state.svelte'
  import { EDITABLE_FIELDS, FIELDS, type Metadata, type MetadataUpdate, type SourceCandidate, type RevisionPreview } from '../lib/types'
- let {meta,onsaved}:{meta:Metadata;onsaved:()=>void}=$props()
+ let {meta,onsaved,onactive}:{meta:Metadata;onsaved:()=>void;onactive?:(active:boolean)=>void}=$props()
  let opened=$state(false),busy=$state(false),error=$state(''),replace=$state(false),force=$state(false),url=$state('')
  let selected=$state<string[]>(EDITABLE_FIELDS.map(f=>f.key)),sources=$state<Record<string,string>>({}),preview=$state<RevisionPreview|null>(null)
  let candidates=$state<Record<string,SourceCandidate[]>>({})
@@ -32,6 +32,7 @@
    else{opened=false;app.toast('ok','更新已保存，可从历史撤销');onsaved()}
   }catch(e){if(current===generation){error=String(e);preview=null}}finally{if(current===generation)busy=false}
  }
+  $effect(() => onactive?.(opened))
 </script>
 <section class:expanded={opened} aria-label="元数据更新">
  {#if !opened}<button class="btn" onclick={start}>更新与来源</button>{:else}

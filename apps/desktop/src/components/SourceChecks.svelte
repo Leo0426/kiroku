@@ -1,5 +1,6 @@
 <script lang="ts">
  import {onDestroy,untrack} from 'svelte'
+ import InfoTip from './InfoTip.svelte'
  import {api} from '../lib/api'
  import {cancellableJob,type CancellableJob} from '../lib/cancellable-job'
  import {app} from '../lib/state.svelte'
@@ -17,9 +18,9 @@
   catch(e){if(g===generation)error=String(e)}finally{if(g===generation){busy=false;task=null}}
  }
 </script>
-<section aria-label="来源自检"><h2>来源自检</h2><p class="muted">使用已保存的路由、代理与 Cookie。可达不保证每个番号都能找到。</p>
+<section aria-label="来源自检"><div class="tipped"><h2>来源自检</h2><InfoTip label="来源自检说明"><p>使用已保存的路由、代理与 Cookie。可达不保证每个番号都能找到。</p></InfoTip></div>
  <button class="btn" disabled={busy||dirty} onclick={()=>check()}>检测已用来源</button>{#if dirty}<p>请先保存配置，再检测来源。</p>{/if}{#if busy}<button class="btn" onclick={()=>task?.cancel()}>停止检测</button>{/if}
  {#if snapshot&&snapshot!==JSON.stringify(app.settings)}<p>配置已变化，请重新检测。</p>{/if}
  {#each checks as c}<div class="row"><strong>{SOURCE_NAMES[c.sourceId]??c.sourceId}</strong><span>{reasons[c.outcome.reason]??c.outcome.reason}</span><span class="muted">{c.elapsedMs} ms · {new Date(c.checkedAt*1000).toLocaleString()}</span><button class="btn sm" disabled={busy||dirty} onclick={()=>check([c.sourceId])}>重测 {SOURCE_NAMES[c.sourceId]??c.sourceId}</button></div>{/each}
  {#if error}<p role="alert">{error}</p>{/if}</section>
-<style>section{padding:20px;background:var(--surface-2);border-radius:12px}.row{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:12px}</style>
+<style>.tipped{display:flex;align-items:center;gap:4px}section{padding:20px;background:var(--surface-2);border-radius:12px}.row{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:12px}</style>

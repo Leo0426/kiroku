@@ -2,11 +2,13 @@
   import { untrack } from 'svelte'
   import { flip } from 'svelte/animate'
   import { fly } from 'svelte/transition'
+  import HistoryOperations from '../components/HistoryOperations.svelte'
   import LibraryMaintenance from '../components/LibraryMaintenance.svelte'
   import Empty from '../components/Empty.svelte'
   import LoadingRows from '../components/LoadingRows.svelte'
   import LoadingStatus from '../components/LoadingStatus.svelte'
   import Icon from '../components/Icon.svelte'
+  import InfoTip from '../components/InfoTip.svelte'
   import StatusPill from '../components/StatusPill.svelte'
   import { api } from '../lib/api'
   import { fmtDateTime } from '../lib/format'
@@ -14,6 +16,14 @@
   import { app } from '../lib/state.svelte'
   import type { JournalStatus, JournalSummary } from '../lib/types'
 
+  let search = $state('')
+  let status = $state<JournalStatus | ''>('')
+  let from = $state('')
+  let until = $state('')
+  let detail = $state<string | null>(null)
+  let filter = $state<import('../lib/types').HistoryFilter>({text:'',status:null,from:null,until:null})
+  const filtering = $derived(!!(search.trim() || status || from || until))
+  const invalidDates = $derived(!!(from && until && from > until))
   let maintenanceOpen = $state(false)
   let list = $state<JournalSummary[] | null>(null)
   let confirming = $state<string | null>(null)
@@ -29,6 +39,11 @@
   let shownRoot:string|null=null
 
   async function load() {
+    if (invalidDates) {
+      if (requestId) void api.historyCancel(requestId).catch(()=>{})
+      requestId=null; generation++; loading=false; loadingMore=false
+      return
+    }
     if(requestId)void api.historyCancel(requestId).catch(()=>{});
     const id=crypto.randomUUID();requestId=id;
     const current = ++generation
@@ -37,7 +52,7 @@
     loadError = ''
     try {
       // 刷新时保留已加载的条数,撤销或删除后不跳回第一页;不让调用它的 $effect 依赖 list
-      const result = await api.historyList(id, { limit: Math.min(Math.max(PAGE, untrack(() => list?.length ?? 0)), 1000) })
+      const result = await api.historyList(id, { filter: $state.snapshot(filter), limit: Math.min(Math.max(PAGE, untrack(() => list?.length ?? 0)), 1000) })
       if (current === generation) ({ items: list, total, next } = result)
     } catch (e) {
       if (current === generation) loadError = String(e)
@@ -52,7 +67,7 @@
     const current = generation
     loadingMore = true
     try {
-      const result = await api.historyList(id, { before: next, limit: PAGE })
+      const result = await api.historyList(id, { before: next, limit: PAGE, filter: $state.snapshot(filter) })
       if (current !== generation) return
       const seen = new Set(list.map((j) => j.id))
       list = [...list, ...result.items.filter((j) => !seen.has(j.id))]
@@ -70,8 +85,23 @@
     const root=app.settings?.library_root??null;
     if(root!==shownRoot){shownRoot=root;list=null;next=null;total=0;confirming=null;}
     app.libraryVersion
-    load()
+    filter
+    untrack(() => void load())
     return () => { generation++;if(requestId){void api.historyCancel(requestId).catch(()=>{});requestId=null;} }
+  })
+
+  $effect(() => {
+    const text = search.trim(), state = status, start = from, end = until
+    const timer = setTimeout(() => {
+      const fromDate = start ? new Date(`${start}T00:00:00`) : null
+      const untilDate = end ? new Date(`${end}T00:00:00`) : null
+      if (untilDate) untilDate.setDate(untilDate.getDate()+1)
+      const nextFilter = {text,status:state || null,from:fromDate?.getTime()??null,until:untilDate?.getTime()??null}
+      if (JSON.stringify(nextFilter) === JSON.stringify(untrack(() => filter))) return
+      list = null; next = null; detail = null
+      filter = nextFilter
+    },200)
+    return () => clearTimeout(timer)
   })
 
   const STATUS: Record<JournalStatus, { tone: 'ok' | 'warn' | 'neutral'; label: string }> = {
@@ -125,21 +155,33 @@
 
 <div class="page" in:rise>
   <header>
-    <h1>历史</h1>
-    <div><p class="muted">查看整理与修订记录，按批次安全撤销。</p><details class="help"><summary>撤销范围与注意事项</summary><p>修订撤销会恢复原 NFO、元数据和图片；发现外部改动时保留内容并报告冲突。原文件夹里的其他文件需要从废纸篓手动找回。</p></details></div>
+    <div class="tipped"><h1>历史</h1><InfoTip label="历史说明"><p>查看整理与修订记录，按批次安全撤销。</p><p><b>撤销范围与注意事项</b><br />修订撤销会恢复原 NFO、元数据和图片；发现外部改动时保留内容并报告冲突。原文件夹里的其他文件需要从废纸篓手动找回。</p></InfoTip></div>
     <button class="btn" aria-expanded={maintenanceOpen} aria-controls="history-maintenance" onclick={()=>maintenanceOpen=!maintenanceOpen}><Icon name="sliders" size={14}/>空间维护</button>
   </header>
   <div id="history-maintenance" class="maintenance" hidden={!maintenanceOpen}><LibraryMaintenance /></div>
 
+  <div class="history-filters" aria-label="历史筛选">
+    <input class="input" type="search" aria-label="搜索历史编号" maxlength="512" placeholder="搜索全部影片编号或日志编号" bind:value={search} />
+    <select class="input" aria-label="历史状态" bind:value={status}><option value="">全部状态</option><option value="applied">已完成</option><option value="partial">部分完成</option><option value="rolledBack">已撤销</option></select>
+    <label>开始日期<input class="input" type="date" aria-label="历史开始日期" bind:value={from} /></label>
+    <label>结束日期<input class="input" type="date" aria-label="历史结束日期" bind:value={until} /></label>
+    {#if filtering}<button class="btn ghost" onclick={() => { search='';status='';from='';until='' }}>清除历史筛选</button>{/if}
+  </div>
+  {#if invalidDates}<p role="alert">结束日期不能早于开始日期。</p>{/if}
+  {#if !loading && list}<p class="muted" role="status">{total} 条{filtering ? '匹配记录' : '记录'}</p>{/if}
   {#if loading}<button class="btn" onclick={stopRead}>停止读取</button>{/if}
   {#if loading && list !== null}<LoadingStatus label="正在更新操作记录…" />{/if}
   {#if loadError}
     <div role="alert"><p class="muted">无法读取整理历史：{loadError}</p><button class="btn" onclick={load} disabled={loading}>重试</button></div>
   {/if}
-  {#if list === null && !loadError}
+  {#if invalidDates}
+    <p class="muted">调整日期范围后会自动重新查询。</p>
+  {:else if list === null && !loadError}
     <LoadingRows label="正在读取整理与修订记录…" />
   {:else if list === null}
     <p class="muted">请确认媒体库可访问，再重试。</p>
+  {:else if list.length === 0 && filtering}
+    <Empty icon="search" title="没有匹配的历史记录" description="试试其他编号、状态或日期。" />
   {:else if list.length === 0}
     <Empty icon="history" title="还没有操作记录" description="整理影片或保存信息修订后，可以在这里查看记录并撤销。">
       <button class="btn primary" onclick={() => app.navigate('import')}><Icon name="download" size={15} />去导入</button>
@@ -160,6 +202,7 @@
             </div>
           </div>
           <div class="act">
+          <button class="btn sm" aria-expanded={detail === j.id} onclick={() => detail = detail === j.id ? null : j.id}>{detail === j.id ? '收起详情' : '操作详情'}</button>
           <button class="btn sm" onclick={() => revealLog(j.id)}>查看日志</button>
           {#if j.status === 'rolledBack' && !j.error}
             <button class="btn danger sm" disabled={busyId !== null} onclick={() => deleteRecord(j)}>{busyId === j.id ? '检查中…' : '删除记录'}</button>
@@ -173,6 +216,7 @@
               {/if}
           {/if}
           </div>
+          {#if detail === j.id}<HistoryOperations id={j.id} />{/if}
           {#if j.pendingOperations}<p class="muted">有 {j.pendingOperations} 项中断操作待核对；撤销时将先检查磁盘状态。</p>{/if}
           {#if j.error}<p class="muted" role="alert">日志无法读取：{j.error}。请保留日志与文件，修复日志后再尝试。</p>{/if}
         </li>
@@ -187,13 +231,15 @@
 </div>
 
 <style>
+  .history-filters { display:flex; align-items:end; gap:var(--s2); flex-wrap:wrap; margin-bottom:var(--s4); }
+  .history-filters > input { flex:1; min-width:200px; }
+  .history-filters label { display:grid; gap:4px; font-size:var(--fs-xs); }
+
   .page { max-width: 860px; margin: 0 auto; padding: var(--s6) var(--s5) var(--s7); }
   header { margin-bottom:var(--s5); display:grid; grid-template-columns:1fr auto; gap:8px 20px; align-items:start; }
   header h1 { grid-column:1; }
-  header>.btn { grid-column:2; grid-row:1/3; }
-  .help { font-size:var(--fs-sm); color:var(--text-2); margin-top:8px; }
-  .help summary { cursor:pointer; }
-  .help p { padding-top:8px; }
+  header>.btn { grid-column:2; grid-row:1; }
+  .tipped { display:flex; align-items:center; gap:var(--s2); }
   .maintenance[hidden] { display:none; }
   h1 { font-size: var(--fs-2xl); font-weight: 700; letter-spacing: -0.015em; }
   header p { font-size: var(--fs-sm); max-width: 560px; }

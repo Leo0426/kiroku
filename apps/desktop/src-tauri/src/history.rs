@@ -1,6 +1,6 @@
 //! Read-only history requests: separate from the single mutation job slot.
 use crate::state::AppState;
-use kiroku_core::journal::{HistoryCache,HistoryPage};
+use kiroku_core::journal::{HistoryCache,HistoryPage,HistoryFilter,HistoryDetail};
 use std::{collections::{HashMap,VecDeque},sync::{Arc,Mutex,atomic::{AtomicU64,Ordering}}};
 use tauri::{AppHandle,Manager,State};
 use tokio_util::sync::CancellationToken;
@@ -33,7 +33,7 @@ struct Lease {app:AppHandle,id:String}
 impl Drop for Lease {fn drop(&mut self){self.app.state::<AppState>().history.requests.lock().unwrap_or_else(|e|e.into_inner()).active.remove(&self.id);}}
 #[tauri::command]
 /// 一页历史摘要：`before` 为上一页返回的游标，`limit` 默认 50、最多 1000。
-pub async fn history_list(app:AppHandle,state:State<'_,AppState>,request_id:Option<String>,before:Option<String>,limit:Option<usize>)->Result<HistoryPage,String>{
+pub async fn history_list(app:AppHandle,state:State<'_,AppState>,request_id:Option<String>,before:Option<String>,limit:Option<usize>,filter:Option<HistoryFilter>)->Result<HistoryPage,String>{
     let limit=limit.unwrap_or(50).clamp(1,1000);
     static NEXT:AtomicU64=AtomicU64::new(0);
     let id=request_id.unwrap_or_else(||format!("history-{}",NEXT.fetch_add(1,Ordering::Relaxed)));
@@ -44,9 +44,22 @@ pub async fn history_list(app:AppHandle,state:State<'_,AppState>,request_id:Opti
     tauri::async_runtime::spawn_blocking(move||{
         let _permit=permit;let _lease=lease;let state=app.state::<AppState>();
         state.validate_history(&snapshot)?;
-        let result=state.history.cache.lock().unwrap_or_else(|e|e.into_inner()).read_page(&snapshot.root,before.as_deref(),limit,&cancel).map_err(|e|e.to_string());
+        let result=state.history.cache.lock().unwrap_or_else(|e|e.into_inner()).read_filtered_page(&snapshot.root,before.as_deref(),limit,&filter.unwrap_or_default(),&cancel).map_err(|e|e.to_string());
         if let Err(error)=state.validate_history(&snapshot){state.history.cache.lock().unwrap_or_else(|e|e.into_inner()).clear();return Err(error)}
         let result=result?;if cancel.is_cancelled(){return Err("历史读取已取消".into())}Ok(result)
+    }).await.map_err(|e|e.to_string())?
+}
+#[tauri::command]
+pub async fn history_detail(app:AppHandle,state:State<'_,AppState>,request_id:String,journal_id:String,offset:usize)->Result<HistoryDetail,String>{
+    let snapshot=state.history_snapshot()?;
+    let cancel=state.history.requests.lock().unwrap_or_else(|e|e.into_inner()).begin(request_id.clone())?;
+    let lease=Lease{app:app.clone(),id:request_id};let queue=state.history.queue.clone();
+    let permit=tokio::select!{_ = cancel.cancelled()=>return Err("历史读取已取消".into()),permit=queue.acquire_owned()=>permit.map_err(|e|e.to_string())?};
+    tauri::async_runtime::spawn_blocking(move||{
+        let _permit=permit;let _lease=lease;let state=app.state::<AppState>();
+        state.validate_history(&snapshot)?;
+        let result=HistoryDetail::read(&snapshot.root,&journal_id,offset,&cancel).map_err(|e|e.to_string())?;
+        state.validate_history(&snapshot)?;if cancel.is_cancelled(){return Err("历史读取已取消".into())}Ok(result)
     }).await.map_err(|e|e.to_string())?
 }
 #[tauri::command]

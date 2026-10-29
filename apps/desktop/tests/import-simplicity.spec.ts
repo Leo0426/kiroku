@@ -8,7 +8,7 @@ test('scan prioritizes unknown files while recognized files remain editable on d
   await page.goto('/')
   await page.getByRole('button', { name: '导入整理', exact: true }).click()
   await expect(page.getByText(/mp4 \/ mkv/)).not.toBeVisible()
-  await page.getByText('支持的视频格式', { exact: true }).click()
+  await page.getByRole('button', { name: '待整理的文件夹说明', exact: true }).hover()
   await expect(page.getByText(/mp4 \/ mkv/)).toBeVisible()
   await page.getByRole('button', { name: '开始扫描', exact: true }).click()
   await expect(page.getByRole('button', { name: /查找影片信息/ })).toBeEnabled()

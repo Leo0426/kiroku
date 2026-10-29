@@ -35,6 +35,7 @@
     {/each}
   </ul>
 
+  <button class="quick btn ghost" onclick={() => app.commandsOpen = true} aria-label="快捷操作" title="快捷操作 · Ctrl / ⌘ K"><Icon name="search" size={16}/><span class="label">快捷操作</span></button>
   {#if app.settings?.library_root}
     <div class="foot" title={app.settings.library_root}>
       <span class="faint">媒体库</span>
@@ -53,6 +54,7 @@
     width: var(--sidebar-w); flex-shrink: 0; padding: var(--s5) var(--s3) var(--s4);
     background: var(--surface-1); border-right:1px solid var(--line);
   }
+  .quick { margin-top:auto; }.quick + .foot { margin-top:0; }
   .brand { display: flex; align-items: center; gap: var(--s3); padding: 0 var(--s2); height: 32px; cursor: default; }
   .word { font-weight: 700; font-size: var(--fs-lg); letter-spacing: 0.02em; transition: letter-spacing var(--d-slow) var(--ease-out); }
   .brand:hover .word { letter-spacing: 0.08em; }
@@ -101,7 +103,7 @@
       padding: var(--s2) var(--s2) calc(var(--s2) + env(safe-area-inset-bottom)); border-top: 1px solid var(--line);
       background: color-mix(in srgb, var(--surface-1) 88%, transparent); backdrop-filter: blur(16px);
     }
-    .brand, .thumb { display: none; }
+    .brand, .thumb, .quick { display: none; }
     ul { flex-direction: row; width: 100%; justify-content: space-around; }
     .item { flex-direction: column; gap: 2px; width: auto; flex: 1; height: 48px; font-size: 10.5px; }
     .item .label { display: block; }

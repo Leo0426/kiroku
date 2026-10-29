@@ -29,6 +29,7 @@ interface RebuildTask {
 class AppStore {
   recovery=new RecoveryStore(()=>this.settings?.library_root??null)
   view = $state<View>('library')
+  commandsOpen = $state(false)
   settings = $state<Settings | null>(null)
   ready = $state(false)
   /** 媒体库有变化时 +1,列表据此重新加载 */
@@ -59,7 +60,8 @@ class AppStore {
     try {
       this.settings = await api.getSettings()
       this.media = await api.mediaDirs().catch(() => null)
-      unlisten.push(await listen('library:changed', () => {
+      unlisten.push(await listen('library:changed', (e) => {
+        if (e.root !== undefined && e.root !== this.settings?.library_root) return
         this.libraryVersion++
       }))
       unlisten.push(await listen('library:progress', (e) => this.onRebuildEvent(e)))

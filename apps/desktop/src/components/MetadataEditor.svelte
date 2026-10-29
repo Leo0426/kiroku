@@ -3,7 +3,7 @@
   import { api } from '../lib/api'
   import { app } from '../lib/state.svelte'
   import { EDITABLE_FIELDS, type Actor, type Metadata, type RevisionPreview, type RevisionResult } from '../lib/types'
-  let { meta, onsaved }: { meta: Metadata; onsaved: () => void } = $props()
+  let { meta, onsaved, onactive }: { meta: Metadata; onsaved: () => void; onactive?: (active: boolean) => void } = $props()
   let editing = $state(false), busy = $state(false), error = $state('')
   let values = $state<Record<string, string>>({})
   let actors = $state<Actor[]>([])
@@ -54,6 +54,7 @@
     } catch (e) { if (current === generation) { error = String(e); preview = null } }
     finally { if (current === generation) busy = false }
   }
+  $effect(() => onactive?.(editing))
 </script>
 <section class:expanded={editing} aria-label="人工编辑">
   {#if !editing}<button class="btn" onclick={start}>编辑元数据</button>{:else}

@@ -26,6 +26,11 @@ INSERT INTO movie_search(movie_search) VALUES('rebuild');
 "#;
 
 use super::Sort;
+// Reverse only the value/code keys: unknown values still sort last.
+pub(super) const REVERSE_INDEXES: &str = "
+CREATE INDEX IF NOT EXISTS movie_year_reverse_code ON movie((-year IS NULL),-year DESC,code DESC);
+CREATE INDEX IF NOT EXISTS movie_score_reverse_code ON movie((-score IS NULL),-score DESC,code DESC);
+";
 use rusqlite::types::Value;
 use std::{collections::VecDeque, sync::Mutex};
 
@@ -165,11 +170,13 @@ pub(super) fn page_sql(
     filters: &[String],
     filter_args: Vec<Value>,
     sort: Sort,
+    reverse: bool,
     offset: usize,
     limit: usize,
     anchor: Option<Anchor>,
 ) -> (String, Vec<Value>) {
     let (key, nullable) = key(sort);
+    let compare = if reverse { "<" } else { ">" };
     let select=format!("SELECT code,title,year,actors,poster,content_type,score,added_at,(SELECT COUNT(*) FROM file WHERE file.code=movie.code),poster_version,{key} AS sort_key,({key} IS NULL) AS sort_null FROM movie");
     let mut sql_parts = Vec::new();
     let mut args = Vec::new();
@@ -192,7 +199,7 @@ pub(super) fn page_sql(
         remaining -= anchor.offset;
         if anchor.value == Value::Null {
             branch(
-                Some(format!("({key} IS NULL)=1 AND {key} IS NULL AND code>?")),
+                Some(format!("({key} IS NULL)=1 AND {key} IS NULL AND code{compare}?")),
                 vec![Value::Text(anchor.code)],
             );
         } else {
@@ -202,10 +209,10 @@ pub(super) fn page_sql(
                 String::new()
             };
             branch(
-                Some(format!("{prefix}{key}=? AND code>?")),
+                Some(format!("{prefix}{key}=? AND code{compare}?")),
                 vec![anchor.value.clone(), Value::Text(anchor.code)],
             );
-            branch(Some(format!("{prefix}{key}>?")), vec![anchor.value]);
+            branch(Some(format!("{prefix}{key}{compare}?")), vec![anchor.value]);
             if nullable {
                 branch(Some(format!("({key} IS NULL)=1 AND {key} IS NULL")), vec![]);
             }
@@ -213,11 +220,8 @@ pub(super) fn page_sql(
     } else {
         branch(None, vec![]);
     }
-    let order = if nullable {
-        "sort_null,sort_key,code"
-    } else {
-        "sort_key,code"
-    };
+    let direction = if reverse { "DESC" } else { "ASC" };
+    let order = format!("{}sort_key {direction},code {direction}", if nullable { "sort_null," } else { "" });
     args.push(Value::Integer(limit as i64));
     args.push(Value::Integer(i64::try_from(remaining).unwrap_or(i64::MAX)));
     (
@@ -241,4 +245,45 @@ mod tests {
         assert!(cache.anchor(1,"query",621).is_none());
         assert!(cache.anchor(1,"query",100000).is_none());
     }
+}
+
+/// Shared authority for list, CSV and overview membership.
+pub(super) fn filters(q: &super::Query) -> (Vec<String>, Vec<Value>) {
+    use super::{like_pattern, MissingField};
+        let (mut wh, mut args): (Vec<String>, Vec<Value>) = (vec![], vec![]);
+        for w in q.text.as_deref().unwrap_or("").split_whitespace() {
+            // FTS narrows long literal substrings; LIKE remains the final authority
+            // for wildcard escaping, Unicode and multiple-word semantics.
+            if w.to_lowercase().chars().count() >= 3 && !w.contains('\0') {
+                wh.push("rowid IN (SELECT rowid FROM movie_search WHERE movie_search MATCH ?)".into());
+                args.push(Value::Text(format!("\"{}\"", w.to_lowercase().replace('"', "\"\""))));
+            }
+            wh.push("search LIKE ? ESCAPE '\\'".into());
+            args.push(Value::Text(like_pattern(w)));
+        }
+        if let Some(ct) = q.content_type.as_deref().filter(|c| !c.is_empty()) {
+            wh.push("content_type = ?".into());
+            args.push(Value::Text(ct.into()));
+        }
+        if let Some(y) = q.year {
+            wh.push("year = ?".into());
+            args.push(Value::Integer(y as i64));
+        }
+        if let Some(score) = q.min_score {
+            wh.push("score >= ?".into());
+            args.push(Value::Integer(score as i64));
+        }
+        if let Some(missing) = q.missing {
+            wh.push(match missing {
+                MissingField::Poster => "(poster IS NULL OR poster = '')",
+                MissingField::Score => "score IS NULL",
+                MissingField::Year => "year IS NULL",
+            }.into());
+        }
+        for filter in &q.filters {
+            wh.push("code IN (SELECT code FROM movie_facet WHERE kind = ? AND value = ?)".into());
+            args.push(Value::Text(filter.kind.as_str().into()));
+            args.push(Value::Text(filter.value.clone()));
+        }
+    (wh,args)
 }

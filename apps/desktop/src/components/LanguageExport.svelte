@@ -3,7 +3,7 @@
  import { api } from '../lib/api'
  import { app } from '../lib/state.svelte'
  import type { Metadata, NfoLanguage, RevisionPreview } from '../lib/types'
- let {meta,onsaved}:{meta:Metadata;onsaved:()=>void}=$props()
+ let {meta,onsaved,onactive}:{meta:Metadata;onsaved:()=>void;onactive?:(active:boolean)=>void}=$props()
  let language=$state<NfoLanguage>('current'),preview=$state<RevisionPreview|null>(null),error=$state(''),busy=$state(false),journalId=$state<string|null>(null)
  let opened=$state(false)
  let editVersions=$state(false)
@@ -16,6 +16,7 @@
  async function undo(){if(!journalId)return;const current=generation;busy=true;error='';try{const result=await api.rollback(journalId);if(result.failures.length||result.indexError)throw [...result.failures,result.indexError].filter(Boolean).join('；');if(current===generation){journalId=null;onsaved()}}catch(e){if(current===generation)error=String(e)}finally{if(current===generation)busy=false}}
  async function inspectText(){const current=generation;busy=true;error='';try{const p=await api.metadataUpdatePreview(meta.code,{kind:'textVersion',language:languageTag,text:{...(includeTitle?{title:versionTitle}:{}),...(includePlot?{plot:versionPlot}:{})},select:selectVersion});if(current===generation)preview=p}catch(e){if(current===generation)error=String(e)}finally{if(current===generation)busy=false}}
  async function selectSaved(tag:string){const current=generation;busy=true;error='';try{const p=await api.metadataUpdatePreview(meta.code,{kind:'textVersion',language:tag,text:meta.text_versions?.localized[tag]??{},select:true});if(current===generation)preview=p}catch(e){if(current===generation)error=String(e)}finally{if(current===generation)busy=false}}
+  $effect(() => onactive?.(opened))
 </script>
 <section class:expanded={opened} aria-label="NFO 语言导出">
  <button class="btn" type="button" aria-expanded={opened} disabled={busy} onclick={()=>opened=!opened}>语言与 NFO</button>

@@ -48,3 +48,5 @@ pub mod placement;
 pub mod localization;
 
 pub mod recovery;
+
+pub mod batch_edit;

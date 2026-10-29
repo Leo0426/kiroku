@@ -68,7 +68,12 @@ export interface Settings {
 
 export interface SolverCfg { url: string; timeout_secs: number }
 
-export interface AiCfg { enabled: boolean; api_key: string; model: string; base_url: string; effort: string; title: boolean; plot: boolean }
+export type AiProtocol = 'openai' | 'anthropic'
+export interface AiProvider {
+  id: string; name: string; protocol: AiProtocol; api_key: string; model: string; base_url: string
+  effort: string; output_format: 'json_schema' | 'prompt'; anthropic_fallback: boolean
+}
+export interface AiCfg { enabled: boolean; providers: AiProvider[]; selected_provider: string | null; title: boolean; plot: boolean }
 
 /** 运行日志输出位置;verbose 额外记录每个网络请求 */
 export interface LogCfg { console: boolean; app: boolean; file: boolean; verbose: boolean }
@@ -280,9 +285,11 @@ export interface RepairDone {
 }
 
 export interface EventMap {
+  'library:export': { jobId: number; root: string; done: number; total: number }
   'job:started': { jobId: number; requestId: string }
   /** Progress only; catalog request ownership is established by job:started. */
   'library:catalog': {jobId:number; phase:string; done:number; total:number; code:string}
+  'batch:edit': {jobId:number;completed:number;failed:number}
   'nfo:export': {jobId:number;completed:number;failed:number}
   /** Progress cannot claim a media request; use its matching job:started event. */
   'media:progress': {jobId:number;root:string;code:string;kind:'play'|'reveal';doneBytes:number;totalBytes:number}
@@ -300,7 +307,7 @@ export interface EventMap {
   'log:line': LogLineEvent
   'library:progress': ProgressEvent
   'library:rebuilt': RebuiltEvent
-  'library:changed': {jobId:number}
+  'library:changed': {jobId:number; root?:string}
   'plex:refreshed': { jobId: number; root: string; ok: boolean; message: string }
   'server:refreshed': { jobId: number; root: string; ok: boolean; message: string }
 }
@@ -325,7 +332,9 @@ export interface JournalSummary {
 
 /** 历史分页:next 是下一页游标(本页最后一条 id),没有更多时为 null */
 export interface HistoryPage { items: JournalSummary[]; total: number; next: string | null }
-export interface HistoryPageRequest { before?: string | null; limit?: number }
+export interface HistoryFilter { text?:string; status?:JournalStatus | null; from?:number | null; until?:number | null }
+export interface HistoryPageRequest { before?: string | null; limit?: number; filter?:HistoryFilter }
+export interface HistoryDetail { id:string; status:JournalStatus; operations:{index:number; description:string; state:'undone'|'recorded'|'pending'|'trashed'}[]; total:number; next:number | null }
 
 export interface RollbackResult { indexError: string | null; failures: string[]; status: JournalStatus }
 
@@ -346,6 +355,9 @@ export interface Query {
   contentType?: string
   year?: number
   sort?: Sort
+  reverse?: boolean
+  minScore?: number
+  missing?: 'poster' | 'score' | 'year'
   offset?: number
   limit?: number
   /** 维度筛选,全部满足 */
@@ -486,6 +498,7 @@ export interface CatalogInventory {movies:CatalogMovie[]; names:Record<string,Re
 export interface CatalogPreview {token:string; root:string; fingerprint:string; items:Omit<RevisionPreview,'token'>[]; warnings:string[]}
 export interface CatalogResult {jobId:number; items:{code:string;dir:string;journalId:string|null;error:string|null}[];cancelled:boolean;indexError:string|null}
 export interface LanguageBatchPreview { token:string; root:string; items:RevisionPreview[] }
+export interface BatchEditPreview { token:string; root:string; items:Pick<RevisionPreview,'code'|'changes'|'warnings'>[] }
 export interface LanguageBatchResult { jobId:number; results:RevisionResult[]; failed:string[]; cancelled:boolean }
 
 export interface RecoveryEntry {id:string;kind:'partial'|'pending'|'corrupt';codes:string[];pendingOperations:number;message:string;canUndo:boolean}
@@ -496,3 +509,10 @@ export type HistoryRequestId = string
 
 /** 删除影片的结果;missing 表示目录早已不在磁盘上,只清了索引 */
 export interface TrashResult { missing: boolean; trashed: number }
+
+export interface LibraryPruned { root: string; removed: number; skipped: boolean }
+
+export type LibraryOverview = { movies: number; files: number; bytes: number; favorites: number; averageScore: number | null; missingPoster: number; missingYear: number; missingScore: number }
+
+export type BatchEdit = {kind:"favorite";favorite:boolean} | {kind:"tags";add:string[];remove:string[]}
+export type BatchEditResult = LanguageBatchResult & {skipped:string[]}

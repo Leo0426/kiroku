@@ -1,5 +1,11 @@
 <script lang="ts">
-  import { onMount } from 'svelte'
+  import { onDestroy, untrack, tick } from 'svelte'
+  import BatchEditor from '../components/BatchEditor.svelte'
+  import LibraryOverview from '../components/LibraryOverview.svelte'
+  import LibraryBrowserControls from '../components/LibraryBrowserControls.svelte'
+  import { readBrowser, writeBrowser, cleanQuery } from '../lib/library-browser'
+  import { cancellableJob, type CancellableJob } from '../lib/cancellable-job'
+  import LibraryRefresh from '../components/LibraryRefresh.svelte'
   import LibraryHealth from '../components/LibraryHealth.svelte'
   import LanguageBatchExport from '../components/LanguageBatchExport.svelte'
   import DetailPanel from '../components/DetailPanel.svelte'
@@ -11,33 +17,46 @@
   import PendingListView from '../components/PendingList.svelte'
   import PosterWall from '../components/PosterWall.svelte'
   import { api } from '../lib/api'
+  import { listen } from '../lib/events'
   import { pendingRead } from '../lib/pending'
   import { rise } from '../lib/motion'
   import { app } from '../lib/state.svelte'
-  import { CONTENT_TYPE_LABEL, FACET_LABEL, badgeLabel, type FacetFilter, type FacetKind, type Facets, type MovieCard, type PendingList, type PendingSummary, type Query, type Sort } from '../lib/types'
+  import type { Facets, MovieCard, PendingList, PendingSummary, Query } from '../lib/types'
 
   let utilitiesOpen = $state(false)
-  let text = $state('')
-  let debounced = $state('')
-  let contentType = $state('')
-  let year = $state('')
-  let sort = $state<Sort>('added')
-  /** 维度筛选(全部满足);切换媒体库时清空 */
-  let filters = $state<FacetFilter[]>([])
-  let facetsOpen = $state(false)
-  let shownRoot = app.settings?.library_root ?? null
-  $effect(() => {
-    const root = app.settings?.library_root ?? null
-    if (root !== shownRoot) { shownRoot = root; filters = [] }
-  })
-  const FACET_GROUPS: { kind: FacetKind; key: 'tags' | 'actors' | 'studios' | 'series' | 'badges' }[] = [
-    { kind: 'actor', key: 'actors' }, { kind: 'tag', key: 'tags' }, { kind: 'studio', key: 'studios' }, { kind: 'series', key: 'series' }, { kind: 'badge', key: 'badges' },
-  ]
-  const valueLabel = (f: FacetFilter) => (f.kind === 'badge' ? badgeLabel(f.value) : f.kind === 'favorite' ? '是' : f.value)
-  function addFilter(kind: FacetKind, value: string) {
-    if (value && !filters.some((f) => f.kind === kind && f.value === value)) filters = [...filters, { kind, value }]
+  let shownRoot = app.settings?.library_root ?? ''
+  let browser = $state(readBrowser(shownRoot))
+  let debounced = $state(untrack(() => browser.query.text ?? ''))
+  let randomBusy = $state(false)
+  let exportTask = $state.raw<CancellableJob<number | null> | null>(null)
+  let exportProgress = $state({ done: 0, total: 0 })
+  let position = $state<number | null>(null)
+  let openedVersion = $state(0)
+  let navigationBusy = $state(false)
+  let sequence = 0
+  let storageWarned = false
+  function persistBrowser() {
+    if (!writeBrowser(shownRoot, $state.snapshot(browser)) && !storageWarned) {
+      storageWarned = true; app.toast('info', '浏览偏好暂时无法保存，本次会话仍可继续使用')
+    }
   }
-  const removeFilter = (f: FacetFilter) => (filters = filters.filter((x) => x !== f))
+  $effect(() => {
+    const root = app.settings?.library_root ?? ''
+    untrack(() => {
+      if (root !== shownRoot) {
+        persistBrowser(); shownRoot = root; browser = readBrowser(root); debounced = browser.query.text ?? ''
+        open = null; menu = null; cropping = null; position = null
+        sequence++; randomBusy = false; navigationBusy = false
+        void exportTask?.cancel()
+      }
+    })
+  })
+  $effect(() => {
+    JSON.stringify(browser)
+    const timer = setTimeout(persistBrowser, 250)
+    return () => clearTimeout(timer)
+  })
+  onDestroy(() => { persistBrowser(); sequence++; void exportTask?.cancel() })
   let total = $state<number | null>(null)
   let listLoading = $state(true)
   let facets = $state<Facets | null>(null)
@@ -53,28 +72,93 @@
   let pendingComplete = $state(false)
   let pendingCached = $state(false)
   let pendingError = $state('')
+  /** 第一处读取失败的待整理文件夹;是已保存的来源时可直接移除 */
+  let pendingIssue = $state<{ path: string; message: string; more: number } | null>(null)
+  const issueIsSource = $derived(!!pendingIssue && !!app.settings?.source_dirs.includes(pendingIssue.path))
+  function readIssues(p: Pick<PendingSummary, 'cancelled' | 'errors' | 'errorsTotal'>) {
+    pendingError = p.cancelled ? '待整理检查已停止。' : ''
+    const first = p.errors[0]
+    pendingIssue = !p.cancelled && first ? { path: first.path, message: first.message, more: p.errorsTotal - 1 } : null
+  }
+  async function removeSource(path: string) {
+    try {
+      app.settings = await api.setSourceDirs((app.settings?.source_dirs ?? []).filter((d) => d !== path))
+      app.toast('ok', '已从待整理中移除该文件夹')
+    } catch (e) {
+      app.toast('error', String(e), 5000)
+    }
+  }
   let countRequest: ReturnType<typeof pendingRead<PendingSummary>> | null = null
   let autoPicked = false
-  let searchEl: HTMLInputElement
 
-  const query = $derived<Query>({
-    text: debounced || undefined,
-    contentType: contentType || undefined,
-    year: year ? Number(year) : undefined,
-    sort,
-    filters: filters.length ? filters.map((f) => ({ ...f })) : undefined,
-  })
-  const filtered = $derived(!!(debounced || contentType || year || filters.length))
-
-  // 输入停顿 200ms 后才真正查询
+  // Preserve identity while raw typing leaves the debounced query unchanged.
+  const queryKey = $derived(JSON.stringify({ ...browser.query, text: debounced || undefined }))
+  const query = $derived<Query>(JSON.parse(queryKey))
+  const filtered = $derived(!!(debounced || query.contentType || query.year || query.minScore !== undefined || query.missing || query.filters?.length))
   $effect(() => {
-    const t = text
-    const h = setTimeout(() => (debounced = t.trim()), 200)
-    return () => clearTimeout(h)
+    const text = browser.query.text ?? ''
+    const timer = setTimeout(() => debounced = text.trim(), 200)
+    return () => clearTimeout(timer)
   })
-
+  $effect(() => { JSON.stringify(query); untrack(() => { sequence++; open = null; position = null; randomBusy = false; navigationBusy = false }) })
+  let returnFocus: HTMLElement | null = null
+  function closeDetail() { sequence++; open = null; position = null; navigationBusy = false; randomBusy = false; void tick().then(() => { if (returnFocus?.isConnected) returnFocus.focus() }) }
+  function openCard(code: string, index?: number) { if (!open) returnFocus = document.activeElement as HTMLElement; open = code; position = index ?? null; openedVersion = app.libraryVersion }
+  async function openAt(index: number, random = false) {
+    const current = ++sequence
+    const root = shownRoot
+    const version = app.libraryVersion
+    if (random) randomBusy = true; else navigationBusy = true
+    try {
+      let page = await api.libraryList({ ...$state.snapshot(query), offset: Math.max(0, index), limit: 1 })
+      if (current !== sequence || root !== shownRoot) return
+      // A concurrent library edit may shrink the last page.
+      if (!page.items.length && page.total > 0) {
+        index = page.total - 1
+        page = await api.libraryList({ ...$state.snapshot(query), offset: index, limit: 1 })
+      }
+      if (current !== sequence || root !== shownRoot) return
+      if (version !== app.libraryVersion) throw '媒体库列表已更新，请重新选择影片'
+      total = page.total
+      if (page.items[0]) openCard(page.items[0].code, index)
+      else app.toast('info', '当前筛选没有可浏览的影片')
+    } catch (e) { if (current === sequence) app.toast('error', String(e), 5000) }
+    finally { if (current === sequence) { randomBusy = false; navigationBusy = false } }
+  }
+  async function randomPick() {
+    if (randomBusy) return
+    // Get a fresh count; do not rely on the loaded viewport or an old count.
+    const current = ++sequence, version = app.libraryVersion; randomBusy = true
+    try {
+      const page = await api.libraryList({ ...$state.snapshot(query), offset: 0, limit: 1 })
+      if (current !== sequence) return
+      if (version !== app.libraryVersion) throw '媒体库列表已更新，请重新挑选'
+      if (!page.total) { app.toast('info', '当前筛选没有可挑选的影片'); return }
+      await openAt(Math.floor(Math.random() * page.total), true)
+    } catch (e) { if (current === sequence) app.toast('error', String(e), 5000) }
+    finally { if (current === sequence) randomBusy = false }
+  }
+  async function exportCsv() {
+    if (exportTask) return
+    const root = shownRoot
+    const captured = $state.snapshot(query)
+    exportProgress = { done: 0, total: 0 }
+    let off: (() => void) | undefined
+    const task = cancellableJob(async id => {
+      off = await listen('library:export', event => { if (event.jobId === task.jobId && event.root === root) exportProgress = event })
+      if (task.cancelled) throw '导出已停止'
+      return api.libraryExportCsv(captured, id)
+    }, e => app.toast('error', `停止导出失败：${e}`, 0, { label: '重试停止', run: () => void task.cancel() }))
+    exportTask = task
+    try {
+      const count = await task.promise
+      if (root === shownRoot && count !== null) app.toast('ok', `已导出 ${count} 部影片的 CSV 清单`)
+    } catch (e) { app.toast(task.cancelled ? 'info' : 'error', String(e), 5000) }
+    finally { off?.(); if (exportTask === task) exportTask = null }
+  }
   $effect(() => {
     app.libraryVersion
+    app.settings?.library_root
     let alive = true
     api.libraryFacets().then((f) => { if (alive) facets = f }).catch(() => {})
     return () => { alive = false }
@@ -84,7 +168,7 @@
     pendingCount = p.total
     pendingComplete = p.complete
     pendingCached = p.cached
-    pendingError = p.cancelled ? '待整理检查已停止。' : p.errorsTotal ? `待整理目录读取失败：${p.errors[0]?.path ?? ''} ${p.errors[0]?.message ?? ''}` : ''
+    readIssues(p)
   }
 
   // 库总数和待整理数都到齐后决定一次默认标签:库是空的而有待整理的视频,就先看待整理
@@ -104,106 +188,63 @@
     pendingComplete = false
     pendingCached = false
     pendingError = ''
+    pendingIssue = null
     countRequest = pendingRead(id => api.pendingSummary(id))
     countRequest.promise.then(p => {
       if (!alive) return
       pendingCount = p.total
       pendingComplete = p.complete
       pendingCached = p.cached
-      pendingError = p.cancelled ? '待整理检查已停止。' : p.errorsTotal ? `待整理目录读取失败：${p.errors[0]?.path ?? ''} ${p.errors[0]?.message ?? ''}` : ''
+      readIssues(p)
     }).catch(error => { if (alive) pendingError = String(error) })
       .finally(() => { if (alive) countLoading = false })
     return () => { alive = false; countRequest?.cancel() }
   })
 
-  function clearFilters() {
-    text = ''
-    debounced = ''
-    contentType = ''
-    year = ''
-    filters = []
-  }
-
-  onMount(() => {
-    // 按 / 聚焦搜索
-    const onkey = (e: KeyboardEvent) => {
-      const tag = (e.target as HTMLElement | null)?.tagName
-      if (e.key === '/' && tag !== 'INPUT' && tag !== 'SELECT' && tag !== 'TEXTAREA') {
-        e.preventDefault()
-        searchEl?.focus()
-      }
-    }
-    window.addEventListener('keydown', onkey)
-    return () => window.removeEventListener('keydown', onkey)
-  })
+  function clearFilters() { browser.query = cleanQuery({}); browser.scroll = 0; debounced = '' }
 </script>
+
+{#snippet libraryTabs()}
+<div class="tabs" role="tablist" aria-label="媒体库内容" style="--i:{tab === 'done' ? 0 : 1}">
+      <span class="thumb" aria-hidden="true"></span>
+      <button role="tab" aria-selected={tab === 'done'} class:on={tab === 'done'} onclick={() => (tab = 'done')}>已整理{#if total !== null}<span class="n"><Count value={total} /></span>{/if}</button>
+      <button role="tab" title={pendingCached ? '上次检查的数量，可在待整理页刷新' : undefined} aria-selected={tab === 'pending'} class:on={tab === 'pending'} onclick={() => (tab = 'pending')}>待整理{#if pendingCount !== null}<span class="n" class:hot={pendingCount > 0}><Count value={pendingCount} />{!pendingComplete ? "+" : ""}</span>{/if}</button>
+    </div>
+{/snippet}
 
 <div class="lib" in:rise>
   <header>
     <div class="title">
       <h1>媒体库</h1>
-      {#if total !== null && !listLoading && text.trim() === debounced}<span class="count"><Count value={total} />{filtered ? ' 个结果' : ' 部'}</span>{/if}
+      <span class="count" role="status" aria-live="polite">{#if total !== null && !listLoading && (browser.query.text ?? '').trim() === debounced}<Count value={total} />{filtered ? ' 个结果' : ' 部'}{/if}</span>
       {#if app.rebuild.running}<span class="count"><Icon name="loader" size={12} /> 重建索引 {app.rebuild.done}/{app.rebuild.total}</span>{/if}
     </div>
 
     <div class="header-actions">
+      <button class="btn icon ghost commands-mobile" aria-label="快捷操作" onclick={() => app.commandsOpen = true}><Icon name="search" size={14}/></button>
+      <LibraryRefresh />
       <button class="btn" aria-expanded={utilitiesOpen} aria-controls="library-utilities" onclick={()=>utilitiesOpen=!utilitiesOpen} hidden={tab!=='done'}><Icon name="settings" size={14}/>媒体库工具</button>
       {#if total!==0}<button class="btn primary" onclick={()=>app.navigate('import')}><Icon name="download" size={14}/>导入影片</button>{/if}
     </div>
-    <div class="tabs" role="tablist" aria-label="媒体库内容" style="--i:{tab === 'done' ? 0 : 1}">
-      <span class="thumb" aria-hidden="true"></span>
-      <button role="tab" aria-selected={tab === 'done'} class:on={tab === 'done'} onclick={() => (tab = 'done')}>已整理{#if total !== null}<span class="n"><Count value={total} /></span>{/if}</button>
-      <button role="tab" title={pendingCached ? '上次检查的数量，可在待整理页刷新' : undefined} aria-selected={tab === 'pending'} class:on={tab === 'pending'} onclick={() => (tab = 'pending')}>待整理{#if pendingCount !== null}<span class="n" class:hot={pendingCount > 0}><Count value={pendingCount} />{!pendingComplete ? "+" : ""}</span>{/if}</button>
-    </div>
+    {#if tab === 'pending'}{@render libraryTabs()}{/if}
 
     {#if countLoading}<span class="count">检查待整理数量… <button class="btn sm ghost" onclick={() => countRequest?.cancel()}>停止数量检查</button></span>{/if}
     {#if pendingError}<p role="alert" class="count">{pendingError}</p>{/if}
-    <div class="tools" hidden={tab !== 'done'}>
-      <label class="search">
-        <Icon name="search" size={15} />
-        <input bind:this={searchEl} bind:value={text} class="input" type="search" placeholder="搜索番号、标题或演员" aria-label="搜索" title="按 / 快速搜索" />
-      </label>
-      <select class="input" bind:value={contentType} aria-label="内容类型">
-        <option value="">全部类型</option>
-        {#each facets?.contentTypes ?? [] as [k, n] (k)}<option value={k}>{CONTENT_TYPE_LABEL[k] ?? k} · {n}</option>{/each}
-      </select>
-      <select class="input" bind:value={year} aria-label="年份">
-        <option value="">全部年份</option>
-        {#each facets?.years ?? [] as [y, n] (y)}<option value={y}>{y} · {n}</option>{/each}
-      </select>
-      <select class="input" bind:value={sort} aria-label="排序">
-        <option value="added">最近入库</option>
-        <option value="title">标题</option>
-        <option value="year">年份</option>
-        <option value="score">评分</option>
-      </select>
-      <button class="btn" aria-expanded={facetsOpen} aria-controls="facet-panel" onclick={() => (facetsOpen = !facetsOpen)}><Icon name="sliders" size={14} />筛选</button>
-    </div>
-    {#if tab === 'done' && (facetsOpen || filters.length)}
-      <div id="facet-panel" class="facets" role="group" aria-label="维度筛选">
-        {#if facetsOpen}
-          <label class="switch inline"><input class="checkbox" type="checkbox" checked={filters.some((f) => f.kind === 'favorite')}
-            onchange={(e) => e.currentTarget.checked ? addFilter('favorite', 'yes') : (filters = filters.filter((f) => f.kind !== 'favorite'))} /><span>只看收藏 · {facets?.favorites ?? 0}</span></label>
-          {#each FACET_GROUPS as g (g.kind)}
-            {@const values = facets?.[g.key] ?? []}
-            {#if values.length}
-              <select class="input" aria-label="按{FACET_LABEL[g.kind]}筛选" value="" onchange={(e) => { addFilter(g.kind, e.currentTarget.value); e.currentTarget.value = '' }}>
-                <option value="">{FACET_LABEL[g.kind]}…</option>
-                {#each values as [v, n] (v)}<option value={v} disabled={filters.some((f) => f.kind === g.kind && f.value === v)}>{g.kind === 'badge' ? badgeLabel(v) : v} · {n}</option>{/each}
-              </select>
-            {/if}
-          {/each}
-        {/if}
-        {#each filters as f (f.kind + '\u0000' + f.value)}
-          <span class="chip">{FACET_LABEL[f.kind]}：{valueLabel(f)}<button class="x" aria-label="移除筛选 {FACET_LABEL[f.kind]} {valueLabel(f)}" onclick={() => removeFilter(f)}><Icon name="x" size={12} /></button></span>
-        {/each}
-        {#if filters.length}<button class="btn sm ghost" onclick={() => (filters = [])}>清空筛选</button>{/if}
-      </div>
+    {#if pendingIssue}
+      <p role="alert" class="count issue">
+        <Icon name="alert" size={14} />
+        <span>待整理文件夹不可用：<span class="mono">{pendingIssue.path}</span>（{pendingIssue.message}）{#if pendingIssue.more > 0}另有 {pendingIssue.more} 处读取失败。{/if}</span>
+        {#if issueIsSource}<button class="btn sm ghost" onclick={() => removeSource(pendingIssue!.path)}>从待整理中移除</button>{/if}
+      </p>
+    {/if}
+    {#if tab === 'done'}
+      <div class="controls"><LibraryBrowserControls tabs={libraryTabs} bind:value={browser} {facets} onrandom={randomPick} {randomBusy} randomDisabled={listLoading || total === 0 || (browser.query.text ?? '').trim() !== debounced} onexport={exportCsv} exporting={!!exportTask} {exportProgress} onstop={() => void exportTask?.cancel()}/></div>
     {/if}
   </header>
 
   <div id="library-utilities" class="utility-drawer" role="region" aria-label="媒体库工具" hidden={!utilitiesOpen||tab!=='done'}>
     <div class="utility-head"><div><h2>媒体库工具</h2><p>批量更新影片信息，或检查文件是否完整。</p></div><button class="btn sm ghost" onclick={()=>utilitiesOpen=false}>收起工具</button></div>
+    {#if utilitiesOpen && tab === 'done'}<LibraryOverview {query} /><BatchEditor {query} />{/if}
     <div class="utility-grid"><div class="utility-block"><h3>语言导出</h3><LanguageBatchExport {query}/></div><div class="utility-block"><h3>文件健康</h3><LibraryHealth onopen={(code)=>open=code} /></div></div>
   </div>
   {#key tab}
@@ -211,7 +252,8 @@
   {#if tab === 'pending'}
     <PendingListView onloaded={onPending} />
   {:else}
-  <PosterWall {query} version={app.libraryVersion} onopen={(c) => (open = c)} onmenu={(card, x, y) => (menu = { card, x, y })} ontotal={(n) => (total = n)} onloading={(busy) => (listLoading = busy)}>
+  {#key app.settings?.library_root}
+  <PosterWall {query} layout={browser.layout} density={browser.density} initialScroll={browser.scroll} onscrollposition={value => browser.scroll = value} version={app.libraryVersion} onopen={openCard} onmenu={(card, x, y) => (menu = { card, x, y })} ontotal={(n) => (total = n)} onloading={(busy) => (listLoading = busy)}>
     {#snippet empty()}
       {#if filtered}
         <Empty icon="search" title="没有匹配的影片" description="换个关键词,或清除筛选条件试试。">
@@ -225,6 +267,7 @@
       {/if}
     {/snippet}
   </PosterWall>
+  {/key}
   {/if}
   </div>
   {/key}
@@ -239,20 +282,21 @@
 {/if}
 
 {#if open}
-  <DetailPanel code={open} onclose={() => (open = null)} />
+  <DetailPanel code={open} onclose={closeDetail} navigation={position === null ? undefined : { position, total: total ?? 0, busy: navigationBusy, stale: openedVersion !== app.libraryVersion, move: step => void openAt(position! + step) }} />
 {/if}
 
 <style>
   .lib { height: 100%; display: flex; flex-direction: column; }
-  header { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:12px 24px; padding:20px 24px 16px; }
+  .commands-mobile { display:none; }
+  header { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:8px 24px; padding:16px 24px 12px; }
   .title { display:flex; align-items:baseline; flex-wrap:wrap; gap:12px; }
   h1 { font-size:26px; font-weight:700; letter-spacing:-.025em; }
   .count { display:inline-flex; align-items:center; gap:5px; color:var(--text-2); font-size:var(--fs-sm); }
+  .issue { color:var(--warn); flex-wrap:wrap; overflow-wrap:anywhere; }
+  .issue > span { color:var(--text-2); }
   .header-actions { display:flex; gap:8px; align-items:center; justify-self:end; }
   .header-actions [hidden] { display:none; }
   .tabs { align-self:center; justify-self:start; }
-  .tools { display:flex; gap:8px; align-items:center; justify-content:flex-end; min-width:0; }
-  .tools[hidden] { display:none; }
   .pane { flex:1; min-height:0; display:flex; flex-direction:column; }
   .utility-drawer { flex-shrink:0; margin:0 24px 16px; border:1px solid var(--line); border-radius:var(--r-md); background:var(--surface-1); max-height:48vh; overflow:auto; }
   .utility-drawer[hidden] { display:none; }
@@ -280,33 +324,14 @@
   .tabs button.on { color: var(--text-1); }
   .n { font-size: var(--fs-xs); color: var(--text-3); }
   .n.hot { color: var(--accent); font-weight: 600; }
-  .search { position: relative; display: block; }
-  .search :global(svg) { position: absolute; left: 11px; top: 0; bottom: 0; margin: auto 0; color: var(--text-3); pointer-events: none; transition: color var(--d-base), transform var(--d-base) var(--ease-back); }
-  .search:focus-within :global(svg) { color: var(--accent); }
-  /* 聚焦时搜索框展开 */
-  .search { flex:1; min-width:160px; max-width:360px; }
-  .search .input { width:100%; padding-left:34px; }
-  .search .input:focus { width:100%; }
-  .tools select { transition: transform var(--d-base) var(--ease-back), background var(--d-fast), box-shadow var(--d-base); }
-  .tools select:active { transform: scale(0.97); }
-  @media (max-width: 1200px) {
-    .tools { grid-column:1/-1; justify-content:flex-start; flex-wrap:wrap; }
-    .tabs { grid-column:1; grid-row:2; }
-    .tools { grid-row:3; }
-  }
+  .controls { grid-column:1/-1; min-width:0; }
+  header { flex-shrink:0; max-height:55%; overflow:auto; scrollbar-gutter:stable; }
   @media (max-width: 720px) {
-    header { padding:20px 16px 12px; gap:12px; }
-    .header-actions { flex-wrap:wrap; }
-    .header-actions .btn { padding-inline:10px; }
-    .search { max-width:none; flex-basis:100%; }
-    .tools select { flex:1; min-width:0; }
+    .commands-mobile { display:inline-flex; }
+    header { padding:16px 16px 12px; gap:12px; grid-template-columns:1fr; }
+    .header-actions { grid-row:2; justify-self:start; flex-wrap:wrap; }
     .utility-drawer { margin-inline:16px; }
     .utility-grid { grid-template-columns:1fr; }
     .utility-block+ .utility-block { border-left:0; border-top:1px solid var(--line); }
   }
-  .facets { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2); margin-top: var(--s3); }
-  .facets select { max-width: 200px; }
-  .chip { display: inline-flex; align-items: center; gap: 4px; padding: 2px 4px 2px 10px; border-radius: 999px; background: var(--accent-soft); color: var(--accent); font-size: var(--fs-sm); max-width: 100%; overflow-wrap: anywhere; }
-  .chip .x { display: grid; place-items: center; width: 20px; height: 20px; border: 0; border-radius: 50%; background: transparent; color: inherit; cursor: pointer; }
-  .chip .x:hover { background: color-mix(in srgb, var(--accent) 18%, transparent); }
 </style>

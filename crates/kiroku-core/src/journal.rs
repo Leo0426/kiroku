@@ -4,7 +4,9 @@
 mod durable;
 mod storage;
 mod history;
-pub use history::{HistoryCache,HistoryPage,HistorySummary};
+mod detail;
+pub use detail::{HistoryDetail,HistoryOperation};
+pub use history::{HistoryCache,HistoryPage,HistorySummary,HistoryFilter};
 pub(crate) mod replacement;
 pub use replacement::{Replacement, ReplacementInput, ReplacementCheckpoint};
 pub use durable::Checkpoint;

@@ -3,7 +3,8 @@ import type { TransitionConfig } from 'svelte/transition'
 
 /** 用户开启「减少动态效果」时,所有位移/缩放过渡直接取消 */
 export const reduced = (): boolean =>
-  typeof matchMedia !== 'undefined' && matchMedia('(prefers-reduced-motion: reduce)').matches
+  (typeof document !== 'undefined' && document.documentElement.dataset.motion === 'reduced') ||
+  (typeof matchMedia !== 'undefined' && matchMedia('(prefers-reduced-motion: reduce)').matches)
 
 export const dur = (ms: number): number => (reduced() ? 0 : ms)
 

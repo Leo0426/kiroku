@@ -278,6 +278,7 @@ impl Settings {
     /// 校验:引用的数据源必须存在;字段名合法;间隔不得为 0;模板非空。
     pub fn validate(&self) -> Result<(), String> {
         self.name_rules.validate()?;
+        self.ai.validate()?;
         if let Some(c) = self.sources.iter().find(|c| matches!(&c.proxy, SourceProxy::Custom { url } if reqwest::Proxy::all(url.trim()).is_err() || url.trim().is_empty())) {
             return Err(format!("数据源 {} 的自定义代理地址无效", c.id));
         }

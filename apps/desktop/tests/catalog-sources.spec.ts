@@ -76,6 +76,7 @@ test('AVBase is opt-in, joins censored and amateur routes and goes through the s
   const checkbox = page.locator('label.switch').filter({ hasText: 'AVBase' }).getByRole('checkbox').first()
   await expect(checkbox).not.toBeChecked()
   await checkbox.check()
+  await page.getByRole('button', { name: 'AVBase 说明', exact: true }).hover()
   await expect(page.getByText(/直连会被 Cloudflare 挑战拦住，需要求解器/)).toBeVisible()
   await page.getByRole('button', { name: '加入支持类型路线', exact: true }).last().click()
   await page.getByLabel('求解器地址').fill('http://127.0.0.1:8191/v1')

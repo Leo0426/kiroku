@@ -15,7 +15,7 @@ test('fixed crop frame drags over the original, saves, reopens at the same place
  await crop.getByRole('button',{name:'保存海报',exact:true}).click();await expect(crop).toHaveCount(0);await expect(panel.locator('h2')).toHaveText(title)
  await panel.getByRole('button',{name:'重新裁剪海报'}).click();await expect(crop.getByText('原图 800 × 600 像素')).toBeVisible();await expect(position).toHaveText('X 11 · Y 0 · 423 × 600')
  await page.keyboard.press('Escape');await expect(crop).toHaveCount(0);await expect(panel).toBeVisible();await expect(panel.locator('.files')).toHaveText(files)
- await panel.getByRole('button',{name:'关闭详情'}).click();await page.getByRole('navigation').getByRole('button',{name:'历史',exact:true}).click();await page.getByRole('button',{name:'撤销',exact:true}).first().click();await page.getByRole('button',{name:'确认撤销',exact:true}).click();await expect(page.getByText('已撤销',{exact:true})).toBeVisible()
+ await panel.getByRole('button',{name:'关闭详情'}).click();await page.getByRole('navigation').getByRole('button',{name:'历史',exact:true}).click();await page.getByRole('button',{name:'撤销',exact:true}).first().click();await page.getByRole('button',{name:'确认撤销',exact:true}).click();await expect(page.getByRole('list', {name:'操作记录'}).getByText('已撤销',{exact:true})).toBeVisible()
 })
 test('right-click opens the same crop dialog from the poster wall',async({page})=>{
  await page.goto('/');const first=page.locator('button.pcard').first();const code=(await first.locator('.sub .mono').textContent())!.trim()

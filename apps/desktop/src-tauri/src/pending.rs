@@ -89,6 +89,10 @@ impl Value {
     }
 }
 
+/// 已保存的待整理文件夹被删除、改名或所在磁盘未连接时给出的原因。
+/// 不自动从设置中移除:外接盘只是暂时离线时,配置应保留。
+const MISSING_SOURCE: &str = "文件夹不存在，可能已被移动、改名，或所在磁盘未连接";
+
 struct Sources(Vec<(PathBuf, Result<RootGuard, String>)>);
 impl Sources {
     fn capture(roots: &[PathBuf], cancel: &CancellationToken) -> Self {
@@ -97,10 +101,13 @@ impl Sources {
                 .iter()
                 .take_while(|_| !cancel.is_cancelled())
                 .map(|root| {
-                    (
-                        root.clone(),
-                        RootGuard::capture(root, false).map_err(|error| error.to_string()),
-                    )
+                    let guard = match std::fs::symlink_metadata(root) {
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            Err(MISSING_SOURCE.to_string())
+                        }
+                        _ => RootGuard::capture(root, false).map_err(|error| error.to_string()),
+                    };
+                    (root.clone(), guard)
                 })
                 .collect(),
         )
@@ -117,6 +124,10 @@ impl Sources {
             });
             match verified {
                 Ok(guard) => guards.push(guard),
+                Err(error) if error == MISSING_SOURCE => {
+                    valid = false;
+                    value.error(&root, MISSING_SOURCE);
+                }
                 Err(error) => {
                     valid = false;
                     let reason = error
@@ -538,6 +549,7 @@ mod tests {
         });
         assert!(sources.verify(&mut value).is_none());
         assert_eq!(value.summary().errors_total, 150);
+        assert_eq!(value.summary().errors[0].message, MISSING_SOURCE);
         assert_eq!(value.summary().errors.len(), 100);
         assert!(!value.summary().complete);
     }

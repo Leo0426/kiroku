@@ -397,8 +397,8 @@ async fn only_selected_unlocked_plot_is_translated_and_raw_cache_stays_pre_ai() 
     let (address, request, handle) = ai_server("end_turn");
     let mut settings = Settings::default();
     settings.ai.enabled = true;
-    settings.ai.api_key = "fake".into();
-    settings.ai.base_url = address;
+    settings.ai.providers[0].api_key = "fake".into();
+    settings.ai.providers[0].base_url = address;
     let sc = Scraper::with_sources(settings, vec![Box::new(Japanese)]).unwrap();
     let code = parse_code("ABC-001").unwrap();
     let mut before = Metadata {
@@ -434,8 +434,8 @@ async fn translation_failure_yields_no_candidate_and_preserves_old_metadata() {
     let (address, request, handle) = ai_server("max_tokens");
     let mut settings = Settings::default();
     settings.ai.enabled = true;
-    settings.ai.api_key = "fake".into();
-    settings.ai.base_url = address;
+    settings.ai.providers[0].api_key = "fake".into();
+    settings.ai.providers[0].base_url = address;
     let sc = Scraper::with_sources(settings, vec![Box::new(Japanese)]).unwrap();
     let code = parse_code("ABC-001").unwrap();
     let before = Metadata {

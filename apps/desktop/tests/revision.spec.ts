@@ -26,7 +26,7 @@ test('manual edit previews, saves and history restores metadata with stable vide
   await page.getByRole('navigation').getByRole('button', { name: '历史', exact: true }).click()
   await page.getByRole('button', { name: '撤销', exact: true }).first().click()
   await page.getByRole('button', { name: '确认撤销', exact: true }).click()
-  await expect(page.getByText('已撤销', { exact: true })).toBeVisible()
+  await expect(page.getByRole('list', {name:'操作记录'}).getByText('已撤销', { exact: true })).toBeVisible()
   await page.getByRole('navigation').getByRole('button', { name: '媒体库', exact: true }).click()
   await page.locator('button.pcard').first().click()
   await expect(panel.locator('h2')).toHaveText(oldTitle)

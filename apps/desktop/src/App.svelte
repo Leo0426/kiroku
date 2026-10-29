@@ -5,6 +5,7 @@
   import DropZone from './components/DropZone.svelte'
   import Sidebar from './components/Sidebar.svelte'
   import Toast from './components/Toast.svelte'
+  import CommandPalette from './components/CommandPalette.svelte'
   import LoadingStatus from './components/LoadingStatus.svelte'
   import { flow } from './lib/importflow.svelte'
   import { app } from './lib/state.svelte'
@@ -95,6 +96,7 @@
 {/if}
 
 <ConfirmDialog />
+{#if initialized}<CommandPalette />{/if}
 <Toast />
 
 <style>
@@ -105,6 +107,6 @@
   .startup { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: var(--s4); padding: var(--s6); text-align: center; }
   .startup p { max-width: 640px; overflow-wrap: anywhere; }
   @media (max-width: 720px) {
-    main { padding-bottom: 64px; }
+    main { padding-bottom: calc(64px + env(safe-area-inset-bottom)); }
   }
 </style>
