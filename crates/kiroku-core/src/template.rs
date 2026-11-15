@@ -258,6 +258,9 @@ mod tests {
             ("smpl001-uc.mp4", "SMPL-001-UC"),
             ("SMPL-001-U-CD2.mp4", "SMPL-001-CD2-U"),
             ("SMPL-001-UMR.mp4", "SMPL-001-U"),
+            ("SMPL-001-LTX.mp4", "SMPL-001-U"),
+            ("SMPL-001-LTX-C.mp4", "SMPL-001-UC"),
+            ("SMPL-001-2-LTX.mp4", "SMPL-001-CD2-U"),
             ("SMPL-001 流出.mp4", "SMPL-001-LEAK"),
             ("SMPL-001-C 流出.mp4", "SMPL-001-LEAKC"),
             ("HEYZO-1234-C.mp4", "SMPL-001-C"), // 无码类型不标(meta 的番号固定为 SMPL-001)
@@ -270,7 +273,7 @@ mod tests {
     /// 整理后的文件名再解析,相位不变(重建索引、再次整理都不丢中字/破解/流出)。
     #[test]
     fn default_names_round_trip_through_the_parser() {
-        for src in ["SMPL-001-C.mp4", "SMPL-001-UC.mp4", "SMPL-001-U.mp4", "SMPL-001-leak.mp4", "SMPL-001-C-leak.mp4", "SMPL-001-UC-CD2.mp4", "SMPL-001.mp4"] {
+        for src in ["SMPL-001-LTX.mp4", "SMPL-001-C-LTX.mp4", "SMPL-001-2-LTX.mp4", "SMPL-001-C.mp4", "SMPL-001-UC.mp4", "SMPL-001-U.mp4", "SMPL-001-leak.mp4", "SMPL-001-C-leak.mp4", "SMPL-001-UC-CD2.mp4", "SMPL-001.mp4"] {
             let before = parse_file_info(src);
             let after = parse_file_info(&format!("{}.mp4", file(DEFAULT_FILE_TEMPLATE, src)));
             assert_eq!(

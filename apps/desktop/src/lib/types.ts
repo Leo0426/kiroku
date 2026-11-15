@@ -387,6 +387,7 @@ export interface Metadata {
   placements?: { path: string; mode: OrganizeMode; source: string; source_proof: string; size: number; anchor?: string | null }[]
   text_versions?: TextVersions
   nfo_language?: NfoLanguage
+  artwork_phase?: VersionPhase
   artwork?: Artwork
 
   code: string
@@ -478,7 +479,8 @@ export interface SourceCandidate { source: string; value: unknown; fetchedAt: nu
 export interface CropBox { x:number; y:number; width:number; height:number }
 export interface ArtworkOriginal { token:string; root:string; code:string; width:number; height:number; image:number[]; crop:CropBox|null; source:string|null }
 export interface ArtworkPreview { revision:RevisionPreview; image:number[] }
-export interface Artwork {original:string; digest:string; source_url:string|null; crop:CropBox|null; phase:{subtitle:boolean;uncensored:boolean;cracked:boolean;leaked:boolean;definition:string|null}}
+export interface VersionPhase {subtitle:boolean;uncensored:boolean;cracked:boolean;leaked:boolean;definition:string|null}
+export interface Artwork {original:string; digest:string; source_url:string|null; crop:CropBox|null; phase:VersionPhase}
 
 export interface AppendPreview {token:string;root:string;code:string;targetDir:string;ops:({MoveFile?:{from:string;to:string};CopyFile?:{from:string;to:string};HardlinkFile?:{from:string;to:string};SymlinkFile?:{from:string;to:string}})[];skipped:string[];conflicts:string[];newVersions?:string[]}
 export interface AppendResult {journalId:string;completed:number;skipped:string[];failed:string[];cancelled:boolean}

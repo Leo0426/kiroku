@@ -2,7 +2,7 @@
   import { onDestroy } from 'svelte'
   import { api } from '../lib/api'
   import { app } from '../lib/state.svelte'
-  import { EDITABLE_FIELDS, type Actor, type Metadata, type RevisionPreview, type RevisionResult } from '../lib/types'
+  import { EDITABLE_FIELDS, type Actor, type Metadata, type RevisionPreview, type RevisionResult, type VersionPhase } from '../lib/types'
   let { meta, onsaved, onactive }: { meta: Metadata; onsaved: () => void; onactive?: (active: boolean) => void } = $props()
   let editing = $state(false), busy = $state(false), error = $state('')
   let values = $state<Record<string, string>>({})
@@ -10,6 +10,15 @@
   const genderLabel = { female: '女', male: '男', unknown: '未知' }
   let preview = $state<RevisionPreview | null>(null)
   let result = $state<RevisionResult | null>(null)
+  const phaseOptions = [{key:'subtitle',label:'中文字幕'}, {key:'uncensored',label:'无码'}, {key:'cracked',label:'破解（含 LTX / U / UMR）'}, {key:'leaked',label:'流出'}] as const
+  const emptyPhase = (): VersionPhase => ({subtitle:false,uncensored:false,cracked:false,leaked:false,definition:null})
+  const savedPhase = () => meta.artwork_phase ?? meta.artwork?.phase ?? emptyPhase()
+  let phase = $state<VersionPhase>(emptyPhase())
+  function phaseText(value: unknown): string {
+    if (!value) return '未记录'
+    const p = value as VersionPhase
+    return [...phaseOptions.filter(o=>p[o.key]).map(o=>o.label), p.definition].filter(Boolean).join('、') || '无标记'
+  }
   let generation = 0
   onDestroy(() => { generation++ })
   $effect(() => { meta.code; app.settings?.library_root; generation++; editing = false; preview = null; error = ''; result = null; busy = false })
@@ -20,6 +29,7 @@
   }
   function start() {
     values = Object.fromEntries(EDITABLE_FIELDS.map(f => [f.key, text(meta[f.key as keyof Metadata])]))
+    phase = {...savedPhase()}
     actors = meta.actors.map(actor => ({ ...actor }))
     editing = true; error = ''; preview = null; result = null
   }
@@ -35,6 +45,7 @@
       if (actors.some(actor => !actor.name.trim())) throw '请填写演员姓名，或删除空白演员行'
       const patch: Record<string, unknown> = Object.fromEntries(EDITABLE_FIELDS.filter(f => f.key !== 'actors' && values[f.key] !== text(meta[f.key as keyof Metadata])).map(f => [f.key, value(f.key, values[f.key])]))
       if (JSON.stringify(actors) !== JSON.stringify(meta.actors)) patch.actors = actors.map(actor => ({ ...actor }))
+      if (JSON.stringify(phase) !== JSON.stringify(savedPhase())) patch.artwork_phase = {...phase}
       if (!Object.keys(patch).length) throw '没有字段变化'
       const next = await api.revisionPreview(meta.code, patch)
       if (current === generation) preview = next
@@ -58,15 +69,22 @@
 </script>
 <section class:expanded={editing} aria-label="人工编辑">
   {#if !editing}<button class="btn" onclick={start}>编辑元数据</button>{:else}
-    <h3>人工编辑</h3><p class="muted">仅修改发生变化的字段；保存后自动锁定，包括清空的值。视频文件名和位置保持不变。</p>
+    <h3>人工编辑</h3><p class="muted">仅修改发生变化的字段；普通元数据保存后自动锁定，包括清空的值。视频文件名和位置保持不变。</p>
     {#if preview}
       <div aria-label="修订差异预览">
-        {#each preview.changes as change}<div class="change"><strong>{EDITABLE_FIELDS.find(f => f.key === change.field)?.label ?? change.field} · 人工 · 保存后锁定</strong><del>{text(change.before) || '（空）'}</del><ins>{text(change.after) || '（空）'}</ins></div>{/each}
+        {#each preview.changes as change}<div class="change"><strong>{change.field === 'artwork_phase' ? '版本标记 · 人工' : `${EDITABLE_FIELDS.find(f => f.key === change.field)?.label ?? change.field} · 人工 · 保存后锁定`}</strong><del>{(change.field === 'artwork_phase' ? phaseText(change.before) : text(change.before)) || '（空）'}</del><ins>{(change.field === 'artwork_phase' ? phaseText(change.after) : text(change.after)) || '（空）'}</ins></div>{/each}
+        {#each preview.warnings ?? [] as warning}<p role="note">{warning}</p>{/each}
         <button class="btn primary" onclick={save} disabled={busy}>确认保存</button>
         <button class="btn" onclick={() => preview = null} disabled={busy}>返回修改</button>
       </div>
     {:else}
       <form onsubmit={(event) => { event.preventDefault(); inspect() }}>
+        <fieldset disabled={busy} aria-label="版本标记">
+          <legend>版本标记</legend>
+          <p class="muted">漏识别 LTX 时勾选「破解」。这些标记用于角标；下方「类别」可追加普通标签，一行一个。海报角标需在设置中启用。</p>
+          {#each phaseOptions as option}<label class="phase-option"><input class="checkbox" type="checkbox" bind:checked={phase[option.key]} />{option.label}</label>{/each}
+          <label>清晰度<select aria-label="版本清晰度" bind:value={phase.definition}><option value={null}>无标记</option>{#each ['8K','4K','1440p','1080p','720p','480p','HD','SD'] as definition}<option value={definition}>{definition}</option>{/each}</select></label>
+        </fieldset>
         {#each EDITABLE_FIELDS as field}
           {#if field.key === 'actors'}
             <fieldset disabled={busy}>
@@ -92,4 +110,4 @@
   {#if error}<p role="alert">{error}</p>{/if}
   {#if result?.error}<p>修订未完整完成，请从历史核对或撤销。日志：{result.journalId}</p>{/if}
 </section>
-<style>fieldset { border:1px solid var(--border); border-radius:var(--r-sm); padding:12px; } .actor-row { display:flex; align-items:center; gap:8px; } .actor-row label:first-child { flex:1; min-width:0; } .actor-row input { width:100%; } del { white-space:pre-wrap; } label { display:flex; flex-direction:column; gap:6px; margin:12px 0; } textarea { width:100%; resize:vertical; } small { color:var(--text-3); } .change { display:flex; flex-direction:column; gap:6px; margin:16px 0; overflow-wrap:anywhere; } del { color:var(--text-3); } ins { text-decoration:none; color:var(--accent); white-space:pre-wrap; }</style>
+<style>.phase-option { flex-direction:row; align-items:center; } fieldset { border:1px solid var(--border); border-radius:var(--r-sm); padding:16px; margin:16px 0; } .actor-row { display:flex; align-items:flex-end; gap:12px; margin:16px 0; } .actor-row label { margin:0; } .actor-row button { margin:0 !important; flex-shrink:0; } .actor-row label:first-child { flex:1; min-width:0; } .actor-row input { width:100%; } del { white-space:pre-wrap; } label { display:flex; flex-direction:column; gap:8px; margin:18px 0; } textarea { width:100%; resize:vertical; } small { color:var(--text-3); } .change { display:flex; flex-direction:column; gap:6px; margin:16px 0; overflow-wrap:anywhere; } del { color:var(--text-3); } ins { text-decoration:none; color:var(--accent); white-space:pre-wrap; }</style>

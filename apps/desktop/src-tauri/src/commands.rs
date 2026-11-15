@@ -1692,9 +1692,11 @@ pub async fn revision_preview(
         let detail = with_lib(&state, |lib| lib.get(&code))?.ok_or("影片不在媒体库中")?;
         let preview = kiroku_core::revision::preview(&root, Path::new(&detail.dir), &code, patch)
             .map_err(|e| e.to_string())?;
+        let settings = state.settings();
+        let preview = kiroku_core::artwork::revise_phase(preview, &settings).map_err(|e| e.to_string())?;
         let token = id.to_string();
         *state.revision.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some(PendingRevision{token:token.clone(),preview:preview.clone(),settings:None});
+            Some(PendingRevision{token:token.clone(),preview:preview.clone(),settings:Some(settings)});
         Ok(RevisionPreview { token, preview })
     })
     .await

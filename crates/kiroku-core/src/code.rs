@@ -429,11 +429,11 @@ fn detect_cd(b: &str) -> Option<u8> {
             return m[1].parse().ok();
         }
     }
-    if let Some(m) = caps(rx!(r"-([AB])(?:-(?:UC|C|U))?(?:\.|$)"), b) {
+    if let Some(m) = caps(rx!(r"-([AB])(?:-(?:UC|C|U|LTX))*(?:\.|$)"), b) {
         return Some(m[1].as_bytes()[0] - b'A' + 1);
     }
     // amane 只认结尾 `-N`;kiroku 补 `_N` 和分段号后跟字幕/破解尾符(`-1-C`、`_2-UC`)。
-    caps(rx!(r"[-_]([1-9])(?:-(?:UC|C|U))?$"), b).and_then(|m| m[1].parse().ok())
+    caps(rx!(r"[-_]([1-9])(?:-(?:UC|C|U|LTX))*$"), b).and_then(|m| m[1].parse().ok())
 }
 
 fn detect_cd_from_parent(parent: &str) -> Option<u8> {
@@ -454,9 +454,9 @@ fn fill_mosaic(m: Option<Mosaic>, ty: ContentType) -> Option<Mosaic> {
     })
 }
 
-/// 破解优先于流出,流出优先于无码。`-UMR`、`-LEAK` 是 kiroku 在 amane 之外补充的常见后缀。
+/// 破解优先于流出,流出优先于无码。`-UMR`、`-LTX`、`-LEAK` 是 kiroku 在 amane 之外补充的常见后缀。
 fn detect_mosaic(b: &str) -> Option<Mosaic> {
-    if is_match(rx!(r"破解|克破|CRACKED"), b) || is_match(rx!(r"-U(C|MR)?(?![A-Z0-9])"), b) {
+    if is_match(rx!(r"破解|克破|CRACKED"), b) || is_match(rx!(r"-(?:U(C|MR)?|LTX)(?![A-Z0-9])"), b) {
         return Some(Mosaic::Cracked);
     }
     if is_match(rx!(r"流出|LEAKED"), b) || is_match(rx!(r"[-_ .]LEAKC?(?![A-Z0-9])"), b) {
@@ -684,6 +684,23 @@ mod tests {
     }
 
     #[test]
+    fn ltx_parts_and_token_boundaries() {
+        for (name, part) in [
+            ("SMPL-001-1-LTX.mp4", 1),
+            ("SMPL-001-B-LTX.mp4", 2),
+            ("SMPL-001_2-LTX-C.mp4", 2),
+            ("SMPL-001-CD2-LTX.mp4", 2),
+            ("SMPL-001-LTX-CD2.mp4", 2),
+        ] {
+            let c = parse_code(name).unwrap();
+            assert_eq!((c.id.as_str(), c.part, c.mosaic), ("SMPL-001", Some(part), Some(Mosaic::Cracked)), "{name}");
+        }
+        for name in ["LTX-123.mp4", "SMPL-001-LTXA.mp4", "SMPL-001-LTX2.mp4"] {
+            assert_eq!(parse_code(name).unwrap().mosaic, Some(Mosaic::Censored), "{name}");
+        }
+    }
+
+    #[test]
     fn unmatched_names_are_not_codes() {
         // 路径模式有兜底值(与 amane 一致),但 parse_code 不把兜底值当番号
         assert!(parse_file_info("random.mp4").number.is_some());
@@ -719,6 +736,11 @@ mod tests {
             ("SMPL-001-U.mp4", false, Cracked),
             ("SMPL-001-UC.mp4", true, Cracked),
             ("SMPL-001-UMR.mp4", false, Cracked),
+            ("SMPL-001-LTX.mp4", false, Cracked),
+            ("smpl-001-ltx.mp4", false, Cracked),
+            ("SMPL-001-LTX-C.mp4", true, Cracked),
+            ("SMPL-001-C-LTX.mp4", true, Cracked),
+            ("SMPL-001-LTX-LEAK.mp4", false, Cracked),
             ("SMPL-001-UC-CD1.mp4", true, Cracked),
             ("SMPL-001-leak.mp4", false, Leaked),
             ("SMPL-001-LEAKED.mp4", false, Leaked),

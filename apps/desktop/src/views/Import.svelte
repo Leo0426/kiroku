@@ -409,15 +409,17 @@
             {#if flow.apply.running}<button class="btn sm" onclick={() => flow.cancel()}>停止</button>{/if}
           </div>
         </section>
-        <section class="card table" aria-label="整理日志">
-          {#each applyTail as e (e.itemId)}
-            <div class="trow logrow" class:bad={!e.ok}>
-              <Icon name={e.ok ? 'check' : 'alert'} size={14} />
-              <span class="mono code">{e.code}</span>
-              <span class="faint err">{e.error ?? (e.warnings.length ? `完成,但有 ${e.warnings.length} 条警告` : '完成')}</span>
-            </div>
-          {/each}
-        </section>
+        {#if applyTail.length}
+          <section class="card table" aria-label="整理日志">
+            {#each applyTail as e (e.itemId)}
+              <div class="trow logrow" class:bad={!e.ok}>
+                <Icon name={e.ok ? 'check' : 'alert'} size={14} />
+                <span class="mono code">{e.code}</span>
+                <span class="faint err">{e.error ?? (e.warnings.length ? `完成,但有 ${e.warnings.length} 条警告` : '完成')}</span>
+              </div>
+            {/each}
+          </section>
+        {/if}
         {#if app.settings?.log.app}<LogPanel lines={flow.logLines} live={flow.apply.running} />{/if}
 
         <!-- 5. 完成 -->

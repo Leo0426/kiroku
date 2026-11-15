@@ -488,7 +488,7 @@
       <ul class="rules">
         <li><span class="mark subtitle">字幕</span><span class="mono">-C</span><span class="mono">-UC</span><span class="mono">-CH</span><span>字幕 / 中文</span></li>
         <li><span class="mark uncensored">无码</span><span>无码番号(HEYZO、六位日期号等)/ 无码 / uncensored</span></li>
-        <li><span class="mark cracked">破解</span><span class="mono">-U</span><span class="mono">-UC</span><span class="mono">-UMR</span><span>破解 / cracked</span></li>
+        <li><span class="mark cracked">破解</span><span class="mono">-U</span><span class="mono">-UC</span><span class="mono">-UMR</span><span class="mono">-LTX</span><span>破解 / cracked</span></li>
         <li><span class="mark leaked">流出</span><span class="mono">-LEAK</span><span class="mono">-LEAKED</span><span>流出</span></li>
         <li><span class="mark definition">4K</span><span class="mono">4K</span><span class="mono">8K</span><span class="mono">2160p</span><span>内置 4K / 8K;其他清晰度需自备角标图</span></li>
       </ul>

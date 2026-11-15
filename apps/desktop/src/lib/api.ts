@@ -112,6 +112,7 @@ export interface Api {
   metadataUpdatePreview(code: string, update: MetadataUpdate, requestId?:string): Promise<RevisionPreview>
   artworkOpen(code:string,requestId?:string):Promise<ArtworkOriginal>
   artworkPreview(token:string,root:string,code:string,crop:CropBox,requestId?:string):Promise<ArtworkPreview>
+  /** 元数据补丁；artwork_phase 用于人工修订版本标记并更新可重建的海报。 */
   revisionPreview(code: string, patch: Record<string, unknown>): Promise<RevisionPreview>
   revisionSave(token: string, root: string, code: string): Promise<RevisionResult>
   openSourceUrl(url: string): Promise<void>

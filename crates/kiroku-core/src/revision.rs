@@ -119,12 +119,22 @@ pub fn preview(root: &Path, dir: &Path, code: &str, patch: Value) -> io::Result<
         .ok_or_else(|| io::Error::other("编辑内容必须是字段对象"))?;
     let mut value = serde_json::to_value(&before)?;
     for (field, v) in patch {
-        if !EDITABLE_FIELDS.contains(&field.as_str()) {
+        if field != "artwork_phase" && !EDITABLE_FIELDS.contains(&field.as_str()) {
             return Err(io::Error::other(format!("不可人工编辑字段: {field}")));
         }
         value[field] = v.clone();
     }
     let mut after: Metadata = serde_json::from_value(value)?;
+    if patch.contains_key("artwork_phase") {
+        let phase = after.artwork_phase.as_ref().ok_or_else(|| io::Error::other("版本标记不能为空"))?;
+        if phase.definition.as_deref().is_some_and(|d| !["8K", "4K", "1440p", "1080p", "720p", "480p", "HD", "SD"].contains(&d)) {
+            return Err(io::Error::other("无效清晰度标记"));
+        }
+        if let Some(artwork) = &mut after.artwork { artwork.phase = phase.clone(); }
+        if after.artwork_phase != before.artwork_phase {
+            after.provenance.insert("artwork_phase".into(), "manual".into());
+        }
+    }
     let old = serde_json::to_value(&before)?;
     let new = serde_json::to_value(&after)?;
     for field in EDITABLE_FIELDS {
@@ -168,6 +178,9 @@ pub fn prepare(root: &Path, dir: &Path, code: &str, after: Metadata) -> io::Resu
             after: projected_new[*f].clone(),
         })
         .collect();
+    if before.artwork_phase != after.artwork_phase {
+        changes.push(Change { field: "artwork_phase".into(), before: serde_json::to_value(&before.artwork_phase)?, after: serde_json::to_value(&after.artwork_phase)? });
+    }
     if before.favorite != after.favorite {
         changes.push(Change { field: "favorite".into(), before: before.favorite.into(), after: after.favorite.into() });
     }

@@ -44,6 +44,39 @@
   async function repair(){await repairFlow.start(code)}
   async function undoRepair(){if(!repairResult?.journalId)return;const current=generation;try{const result=await api.rollback(repairResult.journalId);if(current!==generation)return;if(result.failures.length||result.indexError)throw [...result.failures,result.indexError].filter(Boolean).join('; ');repairFlow.clearResult();attempt++;app.toast('ok','本次补图已撤销')}catch(e){if(current===generation)undoError=String(e)}}
 
+  const WIDTH_KEY = 'kiroku.detail-width'
+  function storedWidth() {
+    try { const n = Number(localStorage.getItem(WIDTH_KEY)); return Number.isFinite(n) && n >= 360 ? n : 540 } catch { return 540 }
+  }
+  let preferredWidth = $state(storedWidth())
+  let viewportWidth = $state(window.innerWidth)
+  const narrow = $derived(viewportWidth <= 720)
+  const maxWidth = $derived(Math.max(360, viewportWidth - 48))
+  const panelWidth = $derived(narrow ? viewportWidth : Math.min(maxWidth, Math.max(360, preferredWidth)))
+  let drag = $state<{ id: number; x: number; width: number } | null>(null)
+  function rememberWidth() { try { localStorage.setItem(WIDTH_KEY, String(preferredWidth)) } catch { /* Storage may be unavailable. */ } }
+  function resizeStart(e: PointerEvent) {
+    if (e.button !== 0) return
+    e.preventDefault()
+    const target = e.currentTarget as HTMLElement
+    target.focus(); target.setPointerCapture(e.pointerId)
+    drag = {id:e.pointerId,x:e.clientX,width:panelWidth}
+  }
+  function resizeMove(e: PointerEvent) {
+    if (!drag || drag.id !== e.pointerId) return
+    preferredWidth = Math.min(maxWidth, Math.max(360, drag.width + drag.x - e.clientX))
+  }
+  function resizeEnd(e: PointerEvent) {
+    if (!drag || drag.id !== e.pointerId) return
+    drag = null; rememberWidth()
+  }
+  function resetWidth() { preferredWidth = 540; rememberWidth() }
+  function resizeKey(e: KeyboardEvent) {
+    if (!['ArrowLeft','ArrowRight','Home','End'].includes(e.key)) return
+    e.preventDefault(); e.stopPropagation()
+    preferredWidth = e.key === 'Home' ? 360 : e.key === 'End' ? maxWidth : Math.min(maxWidth, Math.max(360, panelWidth + (e.key === 'ArrowLeft' ? 40 : -40)))
+    rememberWidth()
+  }
   let panel: HTMLElement | undefined = $state()
   /**
    * 面板滑入期间不响应按钮:双击海报时,第二下会落在刚滑到光标下的「播放」上,误打开视频。
@@ -140,7 +173,7 @@
   }
 </script>
 
-<svelte:window onkeydown={onkey} />
+<svelte:window onkeydown={onkey} bind:innerWidth={viewportWidth} onblur={() => { if (drag) { drag = null; rememberWidth() } }} />
 
 {#if cropping}
   <ArtworkEditor {code} onsaved={() => attempt++} onclose={() => (cropping = false)} />
@@ -148,7 +181,12 @@
 
 <div class="scrim" role="presentation" onclick={closeDetails} transition:fade={{ duration: dur(200) }}></div>
 
-<aside class="panel" class:armed bind:this={panel} tabindex="-1" aria-label="影片详情" aria-busy={loading} transition:slideIn onintroend={() => (armed = true)}>
+{#if !narrow && armed && !cropping}
+  <!-- Focusable ARIA window splitter: separator is interactive when it exposes a value and keyboard resizing. -->
+  <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
+  <div class="resize-handle" class:dragging={!!drag} role="separator" tabindex="0" aria-label="调整详情宽度" aria-controls="movie-detail-panel" aria-orientation="vertical" aria-valuemin={360} aria-valuemax={maxWidth} aria-valuenow={Math.round(panelWidth)} title="拖动调整宽度，双击恢复默认；方向键微调" style:right={`${panelWidth - 6}px`} onpointerdown={resizeStart} onpointermove={resizeMove} onpointerup={resizeEnd} onpointercancel={resizeEnd} onlostpointercapture={resizeEnd} onkeydown={resizeKey} ondblclick={resetWidth}></div>
+{/if}
+<aside id="movie-detail-panel" class="panel" style:width={`${panelWidth}px`} class:armed bind:this={panel} tabindex="-1" aria-label="影片详情" aria-busy={loading} transition:slideIn onintroend={() => (armed = true)}>
   {#if navigation}<div class="sequence" aria-label="连续浏览" title={navigation.stale ? '列表已更新，请返回列表重新选择影片' : toolActive ? '请先结束当前编辑或工具操作' : '按当前筛选顺序浏览'}><button class="btn sm" aria-label="上一部影片" disabled={navigation.stale || navigation.busy || navigation.position <= 0 || cropping || mediaBusy || toolActive || favoriteBusy} onclick={() => navigation?.move(-1)}>← 上一部</button><span aria-live="polite">{#if navigation.stale}列表已更新，请重新选择{:else}{navigation.position + 1} / {navigation.total}{/if}</span><button class="btn sm" aria-label="下一部影片" disabled={navigation.stale || navigation.busy || navigation.position >= navigation.total - 1 || cropping || mediaBusy || toolActive || favoriteBusy} onclick={() => navigation?.move(1)}>下一部 →</button></div>{/if}
   <button class="close btn icon ghost" aria-label="关闭详情" onclick={closeDetails}><Icon name="x" size={18} /></button>
 
@@ -266,10 +304,13 @@
   /* 滑入完成前按钮不接收点击(见 armed) */
   .panel:not(.armed) :global(button) { pointer-events: none; }
   .panel {
-    position: fixed; z-index: 41; top: 0; right: 0; bottom: 0; width: min(540px, 100%);
+    position: fixed; z-index: 41; top: 0; right: 0; bottom: 0; max-width: 100%; container-type: inline-size;
     background: var(--surface-1); box-shadow: var(--shadow-3);
     overflow-y: auto; outline: none;
   }
+  .resize-handle { position:fixed; z-index:42; top:0; bottom:0; width:12px; cursor:ew-resize; touch-action:none; user-select:none; outline:none; }
+  .resize-handle::after { content:''; position:absolute; top:0; bottom:0; left:5px; width:2px; background:transparent; transition:background var(--d-fast); }
+  .resize-handle:hover::after, .resize-handle:focus-visible::after, .resize-handle.dragging::after { background:var(--accent); }
   .close:hover :global(svg) { transform: rotate(90deg); }
   .close { position: absolute; z-index: 3; top: var(--s3); right: var(--s3); background: rgb(12 12 16 / 0.5); backdrop-filter: blur(10px); color: #fff; }
   .sequence { position:relative; z-index:3; display:flex; flex-wrap:wrap; align-items:center; gap:8px; padding:12px 56px 12px 16px; background:var(--surface-1); font-size:var(--fs-xs); }
@@ -279,7 +320,7 @@
   @keyframes heroIn { from { opacity: 0; transform: scale(1.14); } }
   .hero::after { content: ''; position: absolute; inset: 0; backdrop-filter: blur(22px) brightness(0.7); }
   .hero-fade { position: absolute; inset: 0; z-index: 1; background: linear-gradient(to bottom, transparent 30%, var(--surface-1)); }
-  .content { position: relative; z-index: 2; margin-top: -92px; padding: 0 var(--s5) var(--s7); display: flex; flex-direction: column; gap: var(--s4); }
+  .content { position: relative; z-index: 2; margin-top: -92px; padding: 0 clamp(20px, 4cqi, 32px) var(--s7); display: flex; flex-direction: column; gap: 24px; }
   .top { display: flex; gap: var(--s4); align-items: flex-end; }
   .poster { flex-shrink: 0; width: 132px; aspect-ratio: var(--poster-ratio); border-radius: var(--r-md); overflow: hidden; background: var(--surface-3); box-shadow: var(--shadow-3); transition: transform var(--d-slow) var(--ease-back); }
   .poster:hover { transform: translateY(-4px) rotate(-1.5deg) scale(1.03); }
@@ -291,27 +332,33 @@
   .poster:hover .crop-hint, .poster:focus-visible .crop-hint { opacity: 1; }
   .head { min-width: 0; padding-bottom: 2px; }
   .code { color: var(--accent); font-weight: 600; font-size: var(--fs-sm); }
-  h2 { font-size: var(--fs-xl); line-height: 1.3; font-weight: 700; margin: 2px 0; letter-spacing: -0.005em; }
+  h2 { overflow-wrap:anywhere; font-size: var(--fs-xl); line-height: 1.3; font-weight: 700; margin: 2px 0; letter-spacing: -0.005em; }
   .orig { color: var(--text-2); font-size: var(--fs-sm); }
   .facts { display: flex; flex-wrap: wrap; gap: var(--s1) var(--s3); margin-top: var(--s2); color: var(--text-2); font-size: var(--fs-sm); }
   .facts span + span::before { content: '·'; margin-right: var(--s3); color: var(--text-3); }
   .score { color: var(--accent); display: inline-flex; align-items: center; gap: 3px; }
-  .toolbox { padding: var(--s3); border: 1px solid var(--line); border-radius: var(--r-md); }
-  .tool-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: var(--s2); align-items: start; }
+  .toolbox { padding: 16px; border: 1px solid var(--line); border-radius: var(--r-md); }
+  .tool-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; align-items: stretch; }
   .tool-grid > :global(section) { min-width: 0; margin: 0; }
-  .tool-grid > :global(section.expanded) { grid-column: 1 / -1; padding: var(--s3); border-radius: var(--r-sm); background: var(--surface-2); }
-  .tool-grid > :global(section:not(.expanded) > button:first-child) { width: 100%; margin: 0; text-align: left; justify-content: flex-start; }
+  .tool-grid > :global(section.expanded) { grid-column: 1 / -1; padding: 16px; border-radius: var(--r-sm); background: var(--surface-2); }
+  .tool-grid > :global(section:not(.expanded) > button:first-child) { width: 100%; height: 100%; min-height: 44px; margin: 0; padding: 10px 16px; text-align: left; justify-content: flex-start; }
   .tool-grid :global(input:not([type=checkbox])), .tool-grid :global(textarea), .tool-grid :global(select) { max-width: 100%; min-width: 0; }
   .tool-grid :global(p), .tool-grid :global(ins), .tool-grid :global(del) { overflow-wrap: anywhere; }
   .tool-grid :global(button) { max-width: 100%; white-space: normal; }
-  .cta { display: flex; gap: var(--s2); flex-wrap: wrap; }
+  .cta { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:12px; }
+  .cta > .btn { min-width:0; min-height:44px; padding:10px 12px; white-space:normal; }
+  .toolbox > h3 { margin-bottom:12px; }
+  .tool-grid > :global(section.expanded > p) { margin:12px 0; line-height:1.6; }
+  .tool-grid > :global(section.expanded .btn) { min-height:40px; margin:6px 8px 6px 0; }
+  .tool-grid > :global(section.expanded > .btn.ghost:last-of-type) { margin-top:16px; }
+  @container (min-width: 700px) { .cta { grid-template-columns:repeat(4, minmax(0, 1fr)); } }
   /* 收藏:星标转一圈弹出 */
   .cta .on { color: var(--warn); }
   .cta .on :global(svg) { animation: starPop 560ms var(--ease-back); }
   @keyframes starPop { 0% { transform: scale(0.4) rotate(-90deg); } 60% { transform: scale(1.35) rotate(12deg); } 100% { transform: scale(1) rotate(0); } }
   h3 { font-size: var(--fs-xs); font-weight: 600; letter-spacing: 0.06em; color: var(--text-3); margin-bottom: var(--s2); text-transform: uppercase; }
   .plot { color: var(--text-1); font-size: var(--fs-md); line-height: 1.75; white-space: pre-wrap; }
-  .chips { display: flex; flex-wrap: wrap; gap: var(--s2); }
+  .chips { display: flex; flex-wrap: wrap; gap: 10px; }
   .chip { padding: 4px 11px; border-radius: var(--r-pill); background: var(--accent-soft); color: var(--accent); font-size: var(--fs-sm); font-weight: 500; transition: transform var(--d-base) var(--ease-back), background var(--d-fast); }
   .chip:hover { transform: translateY(-2px); }
   .chip { animation: chipIn 360ms var(--ease-back) both; animation-delay: calc(240ms + var(--n, 0) * 28ms); }
@@ -322,7 +369,7 @@
   .chip.subtle { background: var(--surface-3); color: var(--text-2); }
   dl { display: grid; grid-template-columns: auto 1fr; gap: var(--s2) var(--s5); margin: 0; font-size: var(--fs-sm); }
   dt { color: var(--text-3); }
-  dd { margin: 0; }
+  dd { margin: 0; min-width:0; overflow-wrap:anywhere; }
   .files { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--s1); }
   .files li { display: flex; align-items: center; gap: var(--s3); padding: var(--s2) var(--s3); background: var(--surface-2); border-radius: var(--r-sm); font-size: var(--fs-sm); transition: background var(--d-fast), transform var(--d-base) var(--ease-out); }
   .files li:hover { background: var(--surface-3); transform: translateX(2px); }
@@ -333,5 +380,12 @@
   .l { height: 14px; border-radius: 7px; background: var(--surface-3); animation: pulse 1.4s ease-in-out infinite; }
   .w60 { width: 60%; } .w80 { width: 80%; }
   .gone { padding: var(--s7) var(--s5); text-align: center; }
-  @media (max-width: 720px) { .panel { bottom: calc(64px + env(safe-area-inset-bottom)); } .top { flex-direction: column; align-items: flex-start; } .poster { width: 112px; } }
+  @container (max-width: 430px) {
+    .top { flex-direction:column; align-items:flex-start; }
+    .poster { width:112px; }
+    .toolbox, .tool-grid > :global(section.expanded) { padding:12px; }
+    .tool-grid { grid-template-columns:minmax(0, 1fr); }
+    .tool-grid :global(.actor-row) { flex-wrap:wrap; }
+  }
+  @media (max-width: 720px) { .panel { bottom: calc(64px + env(safe-area-inset-bottom)); } }
 </style>

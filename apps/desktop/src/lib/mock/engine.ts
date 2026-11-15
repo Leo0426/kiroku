@@ -1033,6 +1033,17 @@ export const mockApi: Api = {
       const after = clone(detail.meta), changes: RevisionPreview['changes'] = []
       for (const [field, supplied] of Object.entries(patch)) {
         const value = field === 'actors' && Array.isArray(supplied) ? supplied.map(v => v && typeof v === 'object' ? { ...v, gender: v.gender ?? 'unknown' } : v) : supplied
+        if (field === 'artwork_phase') {
+          const p = value as import('../types').VersionPhase
+          if (!p || ['subtitle','uncensored','cracked','leaked'].some(k=>typeof p[k as keyof typeof p] !== 'boolean') || (p.definition !== null && !['8K','4K','1440p','1080p','720p','480p','HD','SD'].includes(p.definition))) throw '无效版本标记'
+          if (JSON.stringify(after.artwork_phase) !== JSON.stringify(p)) {
+            changes.push({field,before:clone(after.artwork_phase ?? null),after:clone(p)})
+            after.artwork_phase=clone(p)
+            if(after.artwork)after.artwork.phase=clone(p)
+            after.provenance={...after.provenance,artwork_phase:'manual'}
+          }
+          continue
+        }
         if (!EDITABLE_FIELDS.some(f => f.key === field)) throw '不可人工编辑字段'
         if (['actors', 'tags', 'directors'].includes(field)) {
           if (!Array.isArray(value) || value.some(v => field === 'actors' ? !v || typeof v.name !== 'string' || !['female','male','unknown'].includes(v.gender ?? 'unknown') : typeof v !== 'string')) throw '列表字段格式无效'
@@ -1046,8 +1057,8 @@ export const mockApi: Api = {
         after.locked_fields = [...new Set([...(after.locked_fields ?? []), field])]
         after.provenance = { ...after.provenance, [field]: 'manual' }
       }
-      revisionSettings = null
-      revision = { token: String(id), root: settings.library_root ?? '/Library', dir: detail.dir, code, before: clone(detail.meta), after, changes }
+      revisionSettings = clone(settings)
+      revision = { token: String(id), root: settings.library_root ?? '/Library', dir: detail.dir, code, before: clone(detail.meta), after, changes, warnings: changes.some(c=>c.field==='artwork_phase') ? ['浏览器预览仅模拟版本标记保存；原生应用从保留原图更新海报。'] : [] }
       return clone(revision)
     } finally { end() }
   },

@@ -828,3 +828,63 @@ fn existing_large_original_remains_loadable_cropable_and_undoable() {
     assert_eq!(fs::read(root.join("poster.jpg")).unwrap(), b"old poster");
     assert_eq!(fs::read(root.join(&original)).unwrap(), bytes);
 }
+
+#[test]
+fn manual_version_marks_rebuild_from_original_and_undo_atomically() {
+    use kiroku_core::{badge::Phase, settings::Settings};
+    let t = tempfile::tempdir().unwrap();
+    let root = t.path().canonicalize().unwrap();
+    let m = Metadata { code: "ABC-123".into(), ..Default::default() };
+    fs::write(root.join("kiroku.json"), serde_json::to_vec(&m).unwrap()).unwrap();
+    fs::write(root.join("movie.mp4"), b"video").unwrap();
+    let original = artwork::Original::from_bytes(revision::capture(&root,&root,&m.code).unwrap(), png(800,600), None, Phase::default()).unwrap();
+    let rect = CropBox {x:100,y:20,width:300,height:500};
+    let (initial,_) = original.preview(rect,None).unwrap();
+    assert!(revision::apply(&initial).unwrap().error.is_none());
+    let side = fs::read(root.join("kiroku.json")).unwrap();
+    let poster = fs::read(root.join("poster.jpg")).unwrap();
+    let nfo = fs::read(root.join("movie.nfo")).unwrap();
+    let phase = Phase {cracked:true,subtitle:true,..Default::default()};
+    let patch = serde_json::json!({"artwork_phase":phase,"tags":["sample"]});
+    let mut settings = Settings::default();
+    settings.badges.enabled = true;
+    settings.badges.poster = true;
+    let p = artwork::revise_phase(revision::preview(&root,&root,&m.code,patch).unwrap(),&settings).unwrap();
+    assert!(p.changes.iter().any(|c|c.field=="artwork_phase"));
+    assert_eq!(fs::read(root.join("poster.jpg")).unwrap(),poster,"preview must be read-only");
+    let mut outcome = revision::apply(&p).unwrap();
+    assert!(outcome.error.is_none());
+    let saved: Metadata = serde_json::from_slice(&fs::read(root.join("kiroku.json")).unwrap()).unwrap();
+    assert_eq!(saved.artwork_phase,Some(phase.clone()));
+    assert_eq!(saved.artwork.as_ref().unwrap().phase,phase);
+    assert_eq!(saved.artwork.as_ref().unwrap().crop,Some(rect));
+    assert_eq!(saved.provenance["artwork_phase"],"manual");
+    assert!(!saved.locked_fields.contains("artwork_phase"));
+    assert_eq!(saved.fields.tags,vec!["sample"]);
+    assert_ne!(fs::read(root.join("poster.jpg")).unwrap(),poster);
+    assert_eq!(artwork::dimensions(&fs::read(root.join("poster.jpg")).unwrap()).unwrap(),(300,500));
+    assert!(outcome.journal.rollback().is_empty());
+    assert_eq!(fs::read(root.join("kiroku.json")).unwrap(),side);
+    assert_eq!(fs::read(root.join("poster.jpg")).unwrap(),poster);
+    assert_eq!(fs::read(root.join("movie.nfo")).unwrap(),nfo);
+    assert_eq!(fs::read(root.join("movie.mp4")).unwrap(),b"video");
+}
+
+#[test]
+fn version_marks_without_original_warn_and_survive_without_changing_poster() {
+    let t = tempfile::tempdir().unwrap();
+    let root = t.path();
+    let m = Metadata {code:"ABC-123".into(),..Default::default()};
+    fs::write(root.join("kiroku.json"),serde_json::to_vec(&m).unwrap()).unwrap();
+    fs::write(root.join("poster.jpg"),b"existing poster").unwrap();
+    let phase = kiroku_core::badge::Phase {cracked:true,..Default::default()};
+    let p = revision::preview(root,root,&m.code,serde_json::json!({"artwork_phase":phase})).unwrap();
+    let p = artwork::revise_phase(p,&Default::default()).unwrap();
+    assert!(p.warnings.iter().any(|w|w.contains("缺少保留原图")));
+    assert!(revision::apply(&p).unwrap().error.is_none());
+    let saved:Metadata=serde_json::from_slice(&fs::read(root.join("kiroku.json")).unwrap()).unwrap();
+    assert_eq!(saved.artwork_phase,Some(phase));
+    assert_eq!(fs::read(root.join("poster.jpg")).unwrap(),b"existing poster");
+    assert!(revision::preview(root,root,&m.code,serde_json::json!({"artwork_phase":null})).is_err());
+    assert!(revision::preview(root,root,&m.code,serde_json::json!({"artwork_phase":{"cracked":"true"}})).is_err());
+}
