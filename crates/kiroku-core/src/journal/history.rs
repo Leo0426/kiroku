@@ -20,11 +20,11 @@ impl HistorySummary {
 pub struct HistoryPage {pub items:Vec<HistorySummary>,pub total:usize,pub next:Option<String>}
 #[derive(Debug,Clone,Default,Deserialize)]
 #[serde(rename_all="camelCase", default)]
-pub struct HistoryFilter { pub text:String, pub status:Option<JournalStatus>, pub from:Option<u64>, pub until:Option<u64> }
+pub struct HistoryFilter { pub text:String, pub status:Option<JournalStatus>, pub from:Option<u64>, pub until:Option<u64>, pub excluded_ids:std::collections::HashSet<String> }
 impl HistoryFilter {
-    fn active(&self)->bool { !self.text.trim().is_empty() || self.status.is_some() || self.from.is_some() || self.until.is_some() }
+    fn active(&self)->bool { !self.excluded_ids.is_empty() || !self.text.trim().is_empty() || self.status.is_some() || self.from.is_some() || self.until.is_some() }
     fn matches(&self, summary:&HistorySummary, codes:&str)->bool {
-        self.status.is_none_or(|v|v==summary.status) && self.from.is_none_or(|v|summary.ts>=v) && self.until.is_none_or(|v|summary.ts<v)
+        !self.excluded_ids.contains(&summary.id) && self.status.is_none_or(|v|v==summary.status) && self.from.is_none_or(|v|summary.ts>=v) && self.until.is_none_or(|v|summary.ts<v)
           && self.text.split_whitespace().all(|word|codes.contains(&word.to_lowercase()) || summary.id.to_lowercase().contains(&word.to_lowercase()))
     }
 }
@@ -133,11 +133,16 @@ mod tests {
         for index in 0..3 {let mut j=Journal::new(root.path());j.ts=1000+index;j.status=if index==0{JournalStatus::RolledBack}else{JournalStatus::Applied};
           j.items=(0..9).map(|i|super::super::JournalItem{code:format!("SMPL-{i:03}"),dir:root.path().into()}).collect();j.save().unwrap();}
         let cancel=CancellationToken::new();let mut cache=HistoryCache::default();
-        let filter=HistoryFilter{text:"smpl-008".into(),status:Some(JournalStatus::Applied),from:Some(1001),until:Some(1003)};
+        let filter=HistoryFilter{text:"smpl-008".into(),status:Some(JournalStatus::Applied),from:Some(1001),until:Some(1003),..Default::default()};
         let first=cache.read_filtered_page(root.path(),None,1,&filter,&cancel).unwrap();assert_eq!(first.total,2);assert_eq!(first.items.len(),1);assert_eq!(first.items[0].codes.len(),6);
         let second=cache.read_filtered_page(root.path(),first.next.as_deref(),1,&filter,&cancel).unwrap();assert_eq!(second.total,2);assert_eq!(second.items.len(),1);assert_eq!(second.next,None);assert_ne!(first.items[0].id,second.items[0].id);
         storage::metrics::take_reads();cache.read_filtered_page(root.path(),None,1,&filter,&cancel).unwrap();assert_eq!(storage::metrics::take_reads(),0);
         assert_eq!(cache.read_page(root.path(),None,1,&cancel).unwrap().total,3);
+        let hidden=HistoryFilter{excluded_ids:[first.items[0].id.clone()].into(),..Default::default()};
+        let visible=cache.read_filtered_page(root.path(),None,10,&hidden,&cancel).unwrap();
+        assert_eq!(visible.total,2);assert!(visible.items.iter().all(|row|row.id!=first.items[0].id));
+        // Filtering the view must leave journals available to recovery and normal reads.
+        assert_eq!(cache.read_page(root.path(),None,10,&cancel).unwrap().total,3);
     }
 
     #[test]

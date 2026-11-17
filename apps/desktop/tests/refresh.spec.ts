@@ -38,7 +38,7 @@ test('locked empty title and unselected fields survive replacement, cancel and l
 test('refresh backend error is explicit and cancellation leaves library metadata unchanged',async({page})=>{
  await overrideApi(page,`api.metadataUpdatePreview=async()=>{throw new Error('cache refresh failed');}`);await page.goto('/');await page.locator('button.pcard').first().click();const panel=page.getByLabel('影片详情',{exact:true});const title=await panel.locator('h2').innerText();await panel.getByRole('button',{name:'更新与来源'}).click();await panel.getByRole('button',{name:'预览更新'}).click();await expect(panel.getByRole('alert')).toContainText('cache refresh failed');await panel.getByRole('button',{name:'取消更新',exact:true}).click();await expect(panel.locator('h2')).toHaveText(title);await expect(panel.getByLabel('更新差异预览')).toHaveCount(0);
 })
-test('source and refresh tokens expire after same-root source settings changes while manual editing survives',async({page})=>{
+test('source, refresh and manual previews expire after same-root settings changes',async({page})=>{
  await overrideApi(page,'window.testApi = api;');await page.goto('/');await page.locator('button.pcard').first().click();const code=await page.getByLabel('影片详情',{exact:true}).locator('.head .code').innerText();
  const result=await page.evaluate(async code=>{
   const api=(window as any).testApi;const original=await api.getSettings();const cache=await api.metadataUpdatePreview(code,{kind:'refresh',fields:[],replace:false,force:false});await api.revisionSave(cache.token,cache.root,code);const old=(await api.libraryGet(code)).meta;const failures=[];
@@ -47,7 +47,7 @@ test('source and refresh tokens expire after same-root source settings changes w
    if(change==='base')changed.sources[0].base='https://new.example';if(change==='cookie')changed.sources[0].cookie='changed';if(change==='proxy')changed.proxy='http://localhost:9999';if(change==='route')Object.keys(changed.routes).forEach(k=>changed.routes[k]=[]);if(change==='enabled')changed.sources[0].enabled=false;await api.saveSettings(changed);
    try{await api.revisionSave(p.token,p.root,code);failures.push(`${kind}/${change} saved`)}catch(e){if(!String(e).includes('预览'))failures.push(String(e))}
   }
-  const after=(await api.libraryGet(code)).meta;await api.saveSettings(original);const manual=await api.revisionPreview(code,{title:'manual survives'});const changed=structuredClone(original);changed.sources[0].cookie='same root edit';await api.saveSettings(changed);await api.revisionSave(manual.token,manual.root,code);return {failures,old,after,title:(await api.libraryGet(code)).meta.title}
+  const after=(await api.libraryGet(code)).meta;await api.saveSettings(original);const manual=await api.revisionPreview(code,{title:'manual survives'});const changed=structuredClone(original);changed.sources[0].cookie='same root edit';await api.saveSettings(changed);try{await api.revisionSave(manual.token,manual.root,code);failures.push('stale manual preview saved')}catch(e){if(!String(e).includes('预览'))failures.push(String(e))}const fresh=await api.revisionPreview(code,{title:'manual survives'});await api.revisionSave(fresh.token,fresh.root,code);return {failures,old,after,title:(await api.libraryGet(code)).meta.title}
  },code);expect(result.failures).toEqual([]);expect(result.after).toEqual(result.old);expect(result.title).toBe('manual survives');
 })
 test('source dropdown contains only eligible nonempty choices and refreshed source opens its new domain',async({page})=>{

@@ -52,6 +52,7 @@ export interface Settings {
   download_extrafanart: boolean
   retention: RetentionPolicy
   cleanup_source: boolean
+  actor_hosting: { enabled: boolean; directory: string; base_url: string }
   plex: PlexCfg
   media_server: MediaServerCfg
   log: LogCfg
@@ -332,7 +333,7 @@ export interface JournalSummary {
 
 /** 历史分页:next 是下一页游标(本页最后一条 id),没有更多时为 null */
 export interface HistoryPage { items: JournalSummary[]; total: number; next: string | null }
-export interface HistoryFilter { text?:string; status?:JournalStatus | null; from?:number | null; until?:number | null }
+export interface HistoryFilter { excludedIds?:string[]; text?:string; status?:JournalStatus | null; from?:number | null; until?:number | null }
 export interface HistoryPageRequest { before?: string | null; limit?: number; filter?:HistoryFilter }
 export interface HistoryDetail { id:string; status:JournalStatus; operations:{index:number; description:string; state:'undone'|'recorded'|'pending'|'trashed'}[]; total:number; next:number | null }
 
@@ -379,9 +380,13 @@ export interface MovieCard {
   favorite: boolean
 }
 
+/** Decoded avatar bytes supplied by the backend; never a remote hotlink. */
+export interface ActorImage { bytes: number[]; mime: 'image/png' }
+
 export interface Actor { name: string; gender: 'female' | 'male' | 'unknown'; /** ADR-0009 头像 URL */ thumb?: string | null }
 
 export interface Metadata {
+  hosted_actor_images?: Record<string, {file:string;url:string}>
   asset_stem?: string | null
   name_projection?: Record<string, { original: unknown; applied: unknown; fingerprint: string; warnings?:string[] }>
   placements?: { path: string; mode: OrganizeMode; source: string; source_proof: string; size: number; anchor?: string | null }[]
@@ -472,7 +477,7 @@ export interface RevisionPreview {
 export interface RevisionResult { jobId: number; root: string; code: string; journalId: string; error: string | null; indexError: string | null }
 
 export interface SourceSnapshot { code: string; content_type: string; base: string; base_identity?: string; cache_identity?: string; fetched_at: number; fields: Partial<Metadata> & { source_url?: string | null } }
-export type MetadataUpdate = {kind:'revalidateLinks'} | { kind: 'favorite'; favorite: boolean } | {kind:'textVersion';language:string;text:TextVersion;select:boolean} | { kind: 'nfoLanguage'; language:NfoLanguage } | { kind: 'lock'; field: string; locked: boolean } | { kind: 'source'; field: string; source: string } | { kind: 'refresh'; fields: string[]; replace: boolean; force: boolean; url?: string }
+export type MetadataUpdate = {kind:'translate'} | {kind:'actorImages'} | {kind:'revalidateLinks'} | { kind: 'favorite'; favorite: boolean } | {kind:'textVersion';language:string;text:TextVersion;select:boolean} | { kind: 'nfoLanguage'; language:NfoLanguage } | { kind: 'lock'; field: string; locked: boolean } | { kind: 'source'; field: string; source: string } | { kind: 'refresh'; fields: string[]; replace: boolean; force: boolean; url?: string }
 
 export interface SourceCandidate { source: string; value: unknown; fetchedAt: number }
 
@@ -518,3 +523,6 @@ export type LibraryOverview = { movies: number; files: number; bytes: number; fa
 
 export type BatchEdit = {kind:"favorite";favorite:boolean} | {kind:"tags";add:string[];remove:string[]}
 export type BatchEditResult = LanguageBatchResult & {skipped:string[]}
+
+/** Dictionary suggestions require explicit acceptance before saving. */
+export type TranslatableNameField = 'series' | 'tags'

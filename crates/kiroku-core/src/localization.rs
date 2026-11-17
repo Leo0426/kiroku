@@ -292,3 +292,24 @@ pub fn set_localized(
     }
     Ok(after)
 }
+
+/// Translate one movie from saved source text; the caller previews and journals the result.
+pub async fn translate_movie(m: &Metadata, cfg: crate::translate::AiCfg) -> Result<Metadata, String> {
+    if !cfg.enabled { return Err("请先在设置 → AI 汉化中启用并配置翻译服务".into()); }
+    let mut source = m.clone();
+    recover_original(&mut source);
+    let title = source.text_versions.original.title.as_deref().filter(|_| !m.locked_fields.contains("title"));
+    let plot = source.text_versions.original.plot.as_deref().filter(|_| !m.locked_fields.contains("plot"));
+    let translated = crate::translate::Translator::new(cfg)?.translate(title, plot).await?;
+    if translated.title.is_none() && translated.plot.is_none() {
+        return Err("没有可翻译的日文原文：请检查原文、字段锁定及 AI 汉化的标题／简介选项".into());
+    }
+    let fields: Vec<_> = [("title", &translated.title), ("plot", &translated.plot)].into_iter()
+        .filter_map(|(field, value)| value.as_ref().map(|_| field)).collect();
+    let text = TextVersion { title: translated.title.clone(), plot: translated.plot.clone(), ..Default::default() };
+    let mut after = set_localized(&source, "zh-Hans", text, true).map_err(|e| e.to_string())?;
+    for field in fields {
+        after.text_versions.localized.get_mut("zh-Hans").unwrap().provenance.insert(field.into(), "ai".into());
+    }
+    Ok(after)
+}

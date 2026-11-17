@@ -13,7 +13,7 @@ async fn named_companions_import_index_edit_and_rollback() {
     let meta = Metadata { code: code.id.clone(), ..Default::default() };
     let plan = organize::plan(&input, &code, &meta, &root, "{code}");
     assert!(plan.ops.iter().any(|op| matches!(op, Op::WriteFile { path, .. } if path.ends_with("ABC-123-C.nfo"))));
-    let scan = pipeline::scan(&[temp.path().into()], Some(&root), &Default::default(), &CancellationToken::new(), &mut |_| {});
+    let scan = pipeline::scan(&[temp.path().into()], Some(&root), &kiroku_core::video_filter::VideoFilter::none(), &CancellationToken::new(), &mut |_| {});
     let pairs = scan.items.iter().map(|i| (i, i.code.as_ref().unwrap())).collect::<Vec<_>>();
     let plans = pipeline::build_plans(&pairs, &HashMap::from([(code.id.clone(), meta)]), &root, "{code}", Default::default());
     let http = kiroku_core::net::Http::new(std::time::Duration::ZERO, None).unwrap();

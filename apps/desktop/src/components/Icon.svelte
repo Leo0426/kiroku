@@ -2,12 +2,13 @@
   /** 24px 描边图标集(线宽 1.75),颜色跟随 currentColor */
   type Name =
     | 'grid' | 'download' | 'history' | 'settings' | 'search' | 'play' | 'folder' | 'x' | 'check' | 'alert'
-    | 'undo' | 'refresh' | 'film' | 'plus' | 'pencil' | 'arrow-right' | 'arrow-left' | 'info' | 'star' | 'loader' | 'disc'
+    | 'chevron-down' | 'undo' | 'refresh' | 'film' | 'plus' | 'pencil' | 'arrow-right' | 'arrow-left' | 'info' | 'star' | 'loader' | 'disc'
     | 'globe' | 'sparkles' | 'tv' | 'sliders' | 'image' | 'trash'
 
   let { name, size = 18, class: cls = '' }: { name: Name; size?: number; class?: string } = $props()
 
   const paths: Record<Name, string> = {
+    'chevron-down': '<path d="m6 9 6 6 6-6"/>',
     grid: '<rect width="7" height="7" x="3" y="3" rx="1.5"/><rect width="7" height="7" x="14" y="3" rx="1.5"/><rect width="7" height="7" x="14" y="14" rx="1.5"/><rect width="7" height="7" x="3" y="14" rx="1.5"/>',
     download: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/>',
     history: '<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/>',

@@ -6,6 +6,7 @@ use std::{fs, io::{self, Read, Write}, path::Path};
 
 fn digest(bytes: &[u8]) -> String { format!("{:x}", Sha256::digest(bytes)) }
 fn file_digest_checked(path: &Path,cancel:&dyn Fn()->bool) -> io::Result<String> {
+    if let Some(result)=crate::nas_ops::digest(path,cancel){return result}
     let mut file = fs::File::open(path)?;
     let mut hash = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
@@ -206,13 +207,27 @@ fn link_move_stage(from:&Path,stage:&Path)->io::Result<()> {
     #[cfg(test)] if FORCE_MOVE_COPY.get() {return Err(io::Error::new(io::ErrorKind::CrossesDevices,"test cross-volume boundary"))}
     fs::hard_link(from,stage)
 }
-fn verified(path: &Path, proof: &Proof) -> io::Result<bool> { verified_checked(path,proof,&||false) }
+#[cfg(test)]
+thread_local! {static FORCE_PUBLISH_COPY: std::cell::Cell<bool> = const {std::cell::Cell::new(false)};}
+fn publish_link(from:&Path,to:&Path)->io::Result<()> {
+    #[cfg(test)] if FORCE_PUBLISH_COPY.get(){return Err(io::Error::new(io::ErrorKind::Unsupported,"test SMB link"))}
+    if crate::nas_ops::mapped_pair(from,to){return Err(io::Error::new(io::ErrorKind::Unsupported,"NAS sidecars use SMB exclusive copy publication"))}
+    fs::hard_link(from,to)
+}
+fn nas_move(op:&Op)->bool {matches!(op,Op::MoveFile{from,to} if crate::nas_ops::mapped_pair(from,to))}
+fn occupied_for(path:&Path,remote:bool)->io::Result<bool> {
+    if remote {if let Some(result)=crate::nas_ops::exists(path){return result}}
+    Ok(organize::occupied(path))
+}
+pub(super) fn verified(path: &Path, proof: &Proof) -> io::Result<bool> { verified_checked(path,proof,&||false) }
 fn verified_checked(path: &Path, proof: &Proof,cancel:&dyn Fn()->bool) -> io::Result<bool> {
     crate::append::check_stopped(cancel)?;
     if let Some(source)=&proof.link {
         return Ok(fs::symlink_metadata(path)?.file_type().is_symlink() && fs::read_link(path)?==*source);
     }
-    if !fs::symlink_metadata(path)?.file_type().is_file() { return Err(conflict(path)); }
+    if proof.published_identity.is_none() {if let Some(result)=crate::nas_ops::digest_remote(path,cancel){return result.map(|digest|digest==proof.digest)}}
+    let meta=match crate::nas_ops::metadata(path,cancel){Some(result)=>result?,None=>fs::symlink_metadata(path)?};
+    if !meta.file_type().is_file() { return Err(conflict(path)); }
     Ok(file_digest_checked(path,cancel)? == proof.digest)
 }
 fn within(root: &Path, target: &Path) -> io::Result<()> {
@@ -223,7 +238,7 @@ fn within(root: &Path, target: &Path) -> io::Result<()> {
     if !parent.canonicalize()?.starts_with(root) { return Err(conflict(target)); }
     Ok(())
 }
-fn owned(target:&Path,proof:&Proof)->bool{if proof.link.is_some(){crate::placement::same_link(target,&proof.stage).unwrap_or(false)}else{same(target,&proof.stage)}}
+pub(super) fn owned(target:&Path,proof:&Proof)->bool{if let Some(id)=&proof.published_identity{return crate::durable_fs::identity(target).is_ok_and(|current|current==*id)}if proof.link.is_some(){crate::placement::same_link(target,&proof.stage).unwrap_or(false)}else{if let Some(result)=crate::nas_ops::same_file(target,&proof.stage){return result.unwrap_or(false)}same(target,&proof.stage)}}
 fn same(a: &Path, b: &Path) -> bool { same_file::is_same_file(a,b).unwrap_or(false) }
 fn conflict(path: &Path) -> io::Error { io::Error::other(format!("恢复需要核对文件,已保留内容: {}", path.display())) }
 fn compact(op: &Op) -> Op {
@@ -349,15 +364,17 @@ impl Journal {
         };
         let target = op.target();
         let parent = target.parent().ok_or_else(|| io::Error::other("目标缺少父目录"))?;
-        let proof = Proof { stage: std::path::absolute(parent.join(format!(".kiroku-{}-{}.tmp", self.id, self.ops.len())))?, digest: expected, link: if matches!(op,Op::SymlinkFile{..}){Some(op.source().unwrap().canonicalize()?)}else{None}, source_proof };
+        let mut proof = Proof { stage: std::path::absolute(parent.join(format!(".kiroku-{}-{}.tmp", self.id, self.ops.len())))?, digest: expected, link: if matches!(op,Op::SymlinkFile{..}){Some(op.source().unwrap().canonicalize()?)}else{None}, source_proof, published_identity: None };
         if op.retained(){self.version=4;}
         self.pending = Some(Pending { op: compact(op), proof: proof.clone() });
         verify_root()?; self.persist_progress()?; *unsynced = false; checkpoint(Checkpoint::Intent)?;
         fs::create_dir_all(parent)?;
+        let remote_move=nas_move(op);
         let mut copied_proof=None;
         match op {
             Op::MoveFile { from, .. } => {
-                if link_move_stage(from, &proof.stage).is_err() {
+                if let Some(result)=crate::nas_ops::link(from,&proof.stage,cancel){result?;}
+                else if link_move_stage(from, &proof.stage).is_err() {
                     copied_proof=Some(organize::copy_proven(from,&proof.stage,cancel)?);
                 }
             }
@@ -379,24 +396,44 @@ impl Journal {
             if proof.source_proof.as_ref()!=Some(&copied) {return Err(conflict(op.source().unwrap()))}
         } else if op.retained() && !linked_stage_verified { let from=op.source().unwrap(); if proof.source_proof.as_ref()!=Some(&crate::append::fingerprint_stream(from,cancel,&|_,_|{},None)?){return Err(conflict(from))} }
         if !linked_stage_verified && !verified_checked(&proof.stage, &proof, cancel)? { return Err(conflict(&proof.stage)); }
-        #[cfg(unix)]
-        if proof.link.is_none(){fs::File::open(&proof.stage)?.sync_all()?;}
-        #[cfg(not(unix))]
-        if proof.link.is_none(){fs::OpenOptions::new().write(true).open(&proof.stage)?.sync_all()?;}
+        if proof.link.is_none() && !remote_move {crate::durable_fs::sync_file(&proof.stage)?;}
         checkpoint(Checkpoint::Staged)?;
         crate::append::check_stopped(cancel)?;
-        // 同盘独占发布,暂存硬链接留作所有权证明;不支持安全提交时保留源与暂存并报错。
-        fs::hard_link(&proof.stage, target)?;
-        #[cfg(unix)] fs::File::open(parent)?.sync_all()?;
+        // NAS anchors are never opened over SMB. Publish video by atomic no-replace
+        // rename so the SMB client observes one live video name, not hardlink aliases.
+        if remote_move {
+            let from=op.source().unwrap();
+            if proof.source_proof.as_ref()!=Some(&crate::append::fingerprint_stream(from,cancel,&|_,_|{},None)?) {return Err(conflict(from))}
+            crate::nas_ops::rename(from,target,&proof.stage,cancel).expect("mapped move")?;
+        } else {match publish_link(&proof.stage, target) {
+            Ok(()) => {},
+            Err(e) if proof.link.is_none() && crate::durable_fs::unsupported_link(&e) => {
+                // SMB has no link or exclusive rename. Claim a new file, persist its
+                // birth identity before writing, and never delete the source until verified.
+                let mut output=fs::OpenOptions::new().write(true).create_new(true).open(target)?;
+                proof.published_identity=Some(crate::durable_fs::identity_file(&output)?);
+                self.pending=Some(Pending{op:compact(op),proof:proof.clone()});
+                self.persist_progress()?;
+                let mut input=fs::File::open(&proof.stage)?;
+                let mut buf=[0;65536];
+                loop {crate::append::check_stopped(cancel)?;let n=input.read(&mut buf)?;if n==0{break}output.write_all(&buf[..n])?;}
+                output.set_permissions(input.metadata()?.permissions())?;
+                output.sync_all()?;
+                if !owned(target,&proof) || !verified_checked(target,&proof,cancel)? {return Err(conflict(target))}
+            },
+            Err(e) => return Err(e),
+        }}
+        #[cfg(unix)] crate::durable_fs::sync_directory(parent)?;
         checkpoint(Checkpoint::Published)?;
         crate::append::check_stopped(cancel)?;
-        if let Op::MoveFile { from, .. } = op {
+        if let Op::MoveFile { from, .. } = op {if !remote_move {
+            if proof.published_identity.is_some() && (!owned(target,&proof) || !verified_checked(target,&proof,cancel)?) {return Err(conflict(target))}
             // Check both inode identity and content at the deletion boundary.
             // A same-byte replacement belongs to the user and must be preserved.
             if proof.source_proof.as_ref()!=Some(&crate::append::fingerprint_stream(from,cancel,&|_,_|{},None)?) { return Err(conflict(from)); }
             fs::remove_file(from)?;
-            #[cfg(unix)] if let Some(dir) = from.parent() { fs::File::open(dir)?.sync_all()?; }
-        }
+            #[cfg(unix)] if let Some(dir) = from.parent() { crate::durable_fs::sync_directory(dir)?; }
+        }}
         checkpoint(Checkpoint::SourceRemoved)?;
         let index = self.ops.len();
         self.push_ops([op.clone()]); self.proofs.insert(index, proof); self.pending = None;
@@ -410,11 +447,12 @@ impl Journal {
         self.check_storage()?;
         let Some(p) = self.pending.clone() else { return Ok(()) };
         let target = p.op.target();
+        let remote=p.proof.published_identity.is_none() && crate::nas_ops::mapped_pair(&p.proof.stage,target);
         within(&self.root, target)?;
         within(&self.root, &p.proof.stage)?;
-        if organize::occupied(&p.proof.stage) {
+        if occupied_for(&p.proof.stage,remote)? {
             if !verified(&p.proof.stage, &p.proof)? { return Err(conflict(&p.proof.stage)); }
-            if organize::occupied(target) {
+            if occupied_for(target,remote)? {
                 if !owned(target, &p.proof) || !verified(target, &p.proof)? { return Err(conflict(target)); }
                 let i = self.ops.len(); self.push_ops([p.op]); self.proofs.insert(i, p.proof); self.pending = None; self.persist_progress()?;
                 return Ok(());
@@ -422,9 +460,9 @@ impl Journal {
             if let Op::MoveFile { from, .. } = &p.op {
                 if !verified(from, &p.proof)? { return Err(conflict(from)); }
             }
-            fs::remove_file(&p.proof.stage)?;
+            if remote {crate::nas_ops::remove_owned(&p.proof.stage,p.op.source().unwrap_or(&p.proof.stage)).expect("mapped anchor")?;}else{fs::remove_file(&p.proof.stage)?;}
         } else {
-            if organize::occupied(target) { return Err(conflict(target)); }
+            if occupied_for(target,remote)? { return Err(conflict(target)); }
             if let Op::MoveFile { from, .. } = &p.op { if !verified(from, &p.proof)? { return Err(conflict(from)); } }
         }
         self.pending = None; self.persist_progress()?; Ok(())
@@ -438,18 +476,19 @@ impl Journal {
             }
             return organize::rollback(&self.ops[i..=i], Some(&self.root))
         };
+        let remote=proof.published_identity.is_none() && crate::nas_ops::mapped_pair(&proof.stage,op.target());
         let undo = (|| -> io::Result<()> {
             within(&self.root, op.target())?;
             within(&self.root, &proof.stage)?;
             if !verified(&proof.stage, proof)? { return Err(conflict(&proof.stage)); }
             let target = op.target();
-            if organize::occupied(target) {
+            if occupied_for(target,remote)? {
                 if !owned(target, proof) || !verified(target, proof)? { return Err(conflict(target)); }
                 if let Op::MoveFile { from, .. } = op {
-                    if organize::occupied(from) {
+                    if occupied_for(from,remote)? {
                         // 发布完成但尚未删源时中断:保留内容一致的原文件。
                         if !verified(from, proof)? { return Err(conflict(from)); }
-                        fs::remove_file(target)?;
+                        if remote {crate::nas_ops::remove_owned(target,&proof.stage).expect("mapped move")?;}else{fs::remove_file(target)?;}
                         return Ok(());
                     }
                 }
@@ -463,16 +502,79 @@ impl Journal {
                             return Err(io::Error::other("较新或未恢复的 sidecar 仍引用本次媒体，已保留目标"));
                         }
                     }
-                    fs::remove_file(target)?;return Ok(())
+                    if remote {crate::nas_ops::remove_owned(target,&proof.stage).expect("mapped anchor")?;}else{fs::remove_file(target)?;}return Ok(())
                 }
+                if remote && matches!(op,Op::MoveFile{..}) {
+                    let from=op.source().unwrap();
+                    if let Some(parent)=from.parent(){fs::create_dir_all(parent)?;}
+                    crate::nas_ops::rename(target,from,&proof.stage,&||false).expect("mapped move")?;
+                    return Ok(());
+                }
+                if remote {crate::nas_ops::remove_owned(target,&proof.stage).expect("mapped anchor")?;return Ok(());}
                 let errors = organize::rollback(&self.ops[i..=i], Some(&self.root));
                 if !errors.is_empty() { return Err(io::Error::other(errors.join("; "))); }
             } else if let Op::MoveFile { from, .. } = op {
-                if !same(from, &proof.stage) || !verified(from, proof)? { return Err(conflict(from)); }
+                let same_source=if remote {crate::nas_ops::same_file(from,&proof.stage).expect("mapped move")?}else{same(from,&proof.stage)};
+                if !same_source || !verified(from, proof)? { return Err(conflict(from)); }
             }
             // 暂存文件在成功进度持久化之前保留,保证撤销自身也可重试。
             Ok(())
         })();
         undo.err().map(|e| vec![e.to_string()]).unwrap_or_default()
     }
+}
+
+#[cfg(test)]
+mod smb_publication_tests {
+ use super::*;
+ struct CopyMode;
+ impl CopyMode {fn new()->Self{FORCE_PUBLISH_COPY.set(true);Self}}
+ impl Drop for CopyMode {fn drop(&mut self){FORCE_PUBLISH_COPY.set(false)}}
+ #[test]
+ fn copied_sidecar_preserves_original_reference_undo_guards(){
+  let _mode=CopyMode::new();let d=tempfile::tempdir().unwrap();let root=d.path().canonicalize().unwrap();
+  let side=root.join(crate::organize::SIDECAR);let original=root.join(".kiroku-original-fixture.png");
+  let content=serde_json::json!({"artwork":{"original":".kiroku-original-fixture.png"}}).to_string();
+  let mut bytes=std::io::Cursor::new(vec![]);image::DynamicImage::new_rgb8(4,6).write_to(&mut bytes,image::ImageFormat::Png).unwrap();let bytes=bytes.into_inner();
+  let mut j=Journal::new(&root);let out=j.execute(&Plan{ops:vec![Op::WriteFile{path:side.clone(),content},Op::Download{path:original.clone(),url:"fixture".into(),crop:None,stamp:None}]},&mut |_|Ok(bytes.clone()),&||false);
+  assert!(out.error.is_none());assert!(j.proofs[&0].published_identity.is_some());
+  let mut loaded=Journal::load(&j.path()).unwrap();let errors=loaded.rollback();assert!(errors.is_empty(),"{errors:?}");assert!(!side.exists());assert!(!original.exists());
+ }
+ #[test]
+ fn exclusive_copy_survives_reload_and_undo(){
+  let _mode=CopyMode::new();let d=tempfile::tempdir().unwrap();let from=d.path().join("source");let root=d.path().join("lib");let to=root.join("target");fs::write(&from,b"video").unwrap();
+  let mut j=Journal::new(&root);
+  assert!(j.execute(&Plan{ops:vec![Op::MoveFile{from:from.clone(),to:to.clone()}]},&mut |_|unreachable!(),&||false).error.is_none());
+  assert!(j.proofs[&0].published_identity.is_some());
+  let mut saved=Journal::load(&j.path()).unwrap();assert!(saved.rollback().is_empty());assert_eq!(fs::read(from).unwrap(),b"video");assert!(!to.exists());
+ }
+ #[test]
+ fn cancelled_publication_keeps_source_and_reports_partial_target(){
+  let _mode=CopyMode::new();let d=tempfile::tempdir().unwrap();let from=d.path().join("source");let root=d.path().join("lib");let to=root.join("target");let bytes=vec![7;131072];fs::write(&from,&bytes).unwrap();
+  let mut j=Journal::new(&root);
+  let cancel=||fs::metadata(&to).is_ok_and(|m|m.len()>=65536);
+  let out=j.execute(&Plan{ops:vec![Op::MoveFile{from:from.clone(),to:to.clone()}]},&mut |_|unreachable!(),&cancel);
+  assert_eq!(out.error.unwrap().kind(),io::ErrorKind::Interrupted);
+  assert_eq!(fs::read(&from).unwrap(),bytes);
+  let mut saved=Journal::load(&j.path()).unwrap();assert!(saved.recover_pending().is_err());
+  assert!(from.exists());assert!(to.exists()); // Never silently delete a partial or externally changed target.
+ }
+ #[test]
+ fn target_race_is_never_overwritten(){
+  let _mode=CopyMode::new();let d=tempfile::tempdir().unwrap();let from=d.path().join("source");let root=d.path().join("lib");let to=root.join("target");fs::write(&from,b"video").unwrap();
+  let mut j=Journal::new(&root);
+  let out=j.execute_observed(&Plan{ops:vec![Op::MoveFile{from:from.clone(),to:to.clone()}]},&mut |_|unreachable!(),&||false,&mut |p|{if p==Checkpoint::Staged{fs::write(&to,b"external")?}Ok(())});
+  assert!(out.error.is_some());assert_eq!(fs::read(from).unwrap(),b"video");assert_eq!(fs::read(to).unwrap(),b"external");
+ }
+ #[test]
+ fn published_copy_recovers_but_replaced_target_is_preserved(){
+  for replace in [false,true]{
+   let _mode=CopyMode::new();let d=tempfile::tempdir().unwrap();let from=d.path().join("source");let root=d.path().join("lib");let to=root.join("target");fs::write(&from,b"video").unwrap();let mut j=Journal::new(&root);
+   let out=j.execute_observed(&Plan{ops:vec![Op::MoveFile{from:from.clone(),to:to.clone()}]},&mut |_|unreachable!(),&||false,&mut |p|{if p==Checkpoint::Published{return Err(io::Error::other("test interruption"))}Ok(())});assert!(out.error.is_some());
+   if replace{fs::rename(&to,root.join("old-target")).unwrap();fs::write(&to,b"video").unwrap();}
+   let mut saved=Journal::load(&j.path()).unwrap();
+   if replace{assert!(saved.recover_pending().is_err());assert!(to.exists());}else{saved.recover_pending().unwrap();assert!(saved.rollback().is_empty());assert!(!to.exists());}
+   assert_eq!(fs::read(from).unwrap(),b"video");
+  }
+ }
 }

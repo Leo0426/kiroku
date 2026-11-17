@@ -87,7 +87,7 @@
     badges: ['badges'],
     sources: ['sources', 'routes', 'min_interval_secs', 'proxy', 'solver'],
     ai: ['ai'],
-    plex: ['plex', 'media_server'],
+    plex: ['plex', 'media_server', 'actor_hosting'],
     advanced: ['routes', 'field_priority', 'field_blacklist', 'log'],
   }
   const part = (v: Settings, t: SettingsTab) => JSON.stringify(KEYS[t].map((k) => v[k]))
@@ -135,6 +135,11 @@
     else src.proxy = mode === 'custom' ? { mode, url: src.proxy?.mode === 'custom' ? src.proxy.url : '' } : { mode }
   }
 
+  async function clearImportCache() {
+    if (!await app.confirm({title:'清空抓取缓存',body:'将清除本机已缓存的来源信息和下载图片，下次抓取会重新联网。媒体文件、整理日志和 AI 译文缓存不受影响。',confirmLabel:'清空缓存'})) return
+    try { await api.clearImportCache(); app.toast('ok', '抓取缓存已清空') }
+    catch (e) { app.toast('error', String(e), 5000) }
+  }
   async function clearTranslationCache() {
     try { await api.clearTranslationCache(); app.toast('ok', '译文缓存已清空') }
     catch (e) { app.toast('error', String(e), 5000) }
@@ -352,7 +357,7 @@
         <div class="pane-head">
           <div class="tipped"><h2 class="pane-title">{current.label}</h2><InfoTip label="{current.label}说明"><p>{current.desc}</p></InfoTip></div>
         </div>
-    {#if tab === 'data'}<LibraryMaintenance {dirty} onpolicySaved={() => { if (s && app.settings) { s.retention = { ...app.settings.retention }; saved = JSON.stringify(s) } }} />{/if}
+    {#if tab === 'data'}<section class="card" id="import-cache" aria-label="抓取缓存"><h2>抓取缓存</h2><p class="hint">成功获取的来源信息和图片自动保存在本机。意外退出后，重新扫描并开始抓取即可复用；失败的部分会重试。缓存会占用本机磁盘空间，可按需清空。</p><button class="btn sm" type="button" onclick={clearImportCache}>清空抓取缓存</button></section><LibraryMaintenance {dirty} onpolicySaved={() => { if (s && app.settings) { s.retention = { ...app.settings.retention }; saved = JSON.stringify(s) } }} />{/if}
     {#if tab === 'names'}<NameRules bind:rules={s.name_rules} {dirty}/>{/if}
     {#if tab === 'general'}
     <section class="card">
@@ -390,7 +395,7 @@
       <div class="tipped extra"><label class="switch extra">
         <input class="checkbox" type="checkbox" disabled={s.organize_mode !== 'move'} bind:checked={s.cleanup_source} />
         <span>整理后清理原文件夹</span>
-      </label><InfoTip label="整理后清理原文件夹说明"><p>仅将已整理完的源子文件夹移到废纸篓，可找回。</p></InfoTip></div>
+      </label><InfoTip label="整理后清理原文件夹说明"><p>仅将已整理完的源子文件夹移到废纸篓，可找回。仍有小于扫描体积阈值的视频时保留文件夹及其上级目录。</p></InfoTip></div>
       <div class="tipped extra"><label class="switch extra">
         <input class="checkbox" type="checkbox" bind:checked={s.download_extrafanart} />
         <span>下载剧照</span>
@@ -437,7 +442,7 @@
         <textarea id="scan-black" class="input grow mono" rows="3" spellcheck="false" placeholder={'例:最新地址\n(?i)^ads?[-_. ]'} value={s.scan.blacklist.join('\n')} oninput={(e) => (s!.scan.blacklist = e.currentTarget.value.split('\n').map((l) => l.trim()).filter(Boolean))}></textarea>
       </div>
       <div class="row">
-        <span class="label with-tip"><label for="scan-min">最小体积</label><InfoTip label="最小体积说明"><p>0 为不限制，短片建议保持 0。</p></InfoTip></span>
+        <span class="label with-tip"><label for="scan-min">最小体积</label><InfoTip label="最小体积说明"><p>默认 100 MB，小于阈值的视频跳过扫描并保留原处；包含这些视频的文件夹不会被清理。0 为不限制。</p></InfoTip></span>
         <input id="scan-min" class="input num" type="number" min="0" step="10" value={s.scan.min_video_mb} oninput={(e) => (s!.scan.min_video_mb = Math.max(0, Math.floor(Number(e.currentTarget.value) || 0)))} />
         <span class="faint hint2">MB</span>
       </div>
@@ -609,8 +614,9 @@
     </section>
 
     {:else if tab === 'advanced'}
-    <section class="card">
+    <section class="card log-card">
       <div class="tipped"><h2>日志</h2><InfoTip label="日志说明"><p>记录运行过程，方便排查问题。</p></InfoTip><span class="tip-links"><span class="with-tip">设置文件位置<InfoTip label="设置文件位置"><p class="mono file-path">{path}</p></InfoTip></span></span></div>
+      <div class="log-options">
       <div class="tipped extra"><label class="switch extra">
         <input class="checkbox" type="checkbox" bind:checked={s.log.app} />
         <span>在 App 内显示</span>
@@ -619,7 +625,6 @@
         <input class="checkbox" type="checkbox" bind:checked={s.log.file} />
         <span>写入日志文件</span>
       </label><InfoTip label="写入日志文件说明"><p>按天保存为 <span class="mono">kiroku-日期.log</span>{#if logDir},位于 <span class="mono">{logDir}</span>{/if}。</p></InfoTip></div>
-      <div class="row"><button class="btn sm" type="button" onclick={() => api.openLogDir().catch((e) => (error = String(e)))}><Icon name="folder" size={14} />打开日志文件夹</button></div>
       <div class="tipped extra"><label class="switch extra">
         <input class="checkbox" type="checkbox" bind:checked={s.log.console} />
         <span>输出到终端</span>
@@ -628,6 +633,8 @@
         <input class="checkbox" type="checkbox" bind:checked={s.log.verbose} />
         <span>详细模式</span>
       </label><InfoTip label="详细模式说明"><p>记录请求详情，日志会更多。</p></InfoTip></div>
+          </div>
+      <div class="log-footer"><button class="btn sm" type="button" onclick={() => api.openLogDir().catch((e) => (error = String(e)))}><Icon name="folder" size={14} />打开日志文件夹</button></div>
     </section>
 
     <LibraryMaintenance {dirty} onpolicySaved={() => { if (s && app.settings) { s.retention = { ...app.settings.retention }; saved = JSON.stringify(s) } }} />
@@ -663,8 +670,20 @@
     </section>
 
     {:else if tab === 'plex'}
+    <section class="card" aria-label="演员头像托管">
+      <h2>演员头像托管</h2>
+      <p class="hint">下载头像到共享目录，NFO 使用稳定的 NAS 主机名地址。静态文件服务需由 NAS 或其他设备提供，kiroku 不启动服务器。</p>
+      <label class="switch extra"><input type="checkbox" class="checkbox" bind:checked={s.actor_hosting.enabled}/>启用演员头像托管</label>
+      {#if s.actor_hosting.enabled}
+      <div class="row"><label class="label" for="actor-directory">头像保存目录</label><input id="actor-directory" class="input grow mono" bind:value={s.actor_hosting.directory} placeholder="/Volumes/NAS/avatars"/><button class="btn sm" onclick={async()=>{const dir=await api.pickDirectory('选择已有头像共享目录');if(dir&&s)s.actor_hosting.directory=dir}}>选择头像目录</button></div>
+      <div class="row"><label class="label" for="actor-base-url">头像 URL 前缀</label><input id="actor-base-url" class="input grow mono" bind:value={s.actor_hosting.base_url} placeholder="http://nas.home.arpa:8088/actors/"/></div>
+      <p class="hint">保存目录应为这台电脑可访问、只存头像的专用文件夹，URL 前缀应映射到同一个文件夹。建议在路由器配置固定主机名和 DHCP 地址保留；无需把服务开放到公网。</p>
+      <ol><li>在 NAS 配置只读静态图片服务，并把主机名解析到 NAS。</li><li>保存此页设置。</li><li>打开影片详情 → 影片工具 → 演员头像，预览后确认保存。</li><li>打开生成的头像链接检查，再到 Plex 刷新本片元数据。</li></ol>
+      <p class="hint">更换 URL 前缀后，对影片重新预览并保存即可重写 NFO；已有头像缓存会复用。启用本项不会自动改写现有影片或导入任务。</p>
+      {/if}
+    </section>
     <section class="card">
-      <div class="tipped"><h2>Plex</h2><InfoTip label="Plex 媒体库配置方法"><p>Plex 不读 NFO:它按文件名识别片名,用目录里的 poster.jpg / fanart.jpg 作封面和背景。建议在 Plex 里把媒体库文件夹建成影片库,代理选「Personal Media / 个人媒体」并勾选「使用本地资源」。</p></InfoTip></div>
+      <div class="tipped"><h2>Plex</h2><InfoTip label="Plex 媒体库配置方法"><p>Plex Media Server 1.43.1 起可使用 Plex NFO 代理读取影片资料及演员头像 URL。请在 Plex 影片库中选择 NFO 元数据代理；头像地址须能由 Plex 服务器直接访问。旧版个人媒体代理主要依赖文件名和本地封面。</p></InfoTip></div>
       <div class="tipped extra"><label class="switch extra">
         <input class="checkbox" type="checkbox" bind:checked={s.plex.naming} />
         <span>Plex 友好命名</span>
@@ -822,6 +841,10 @@
   .tipped > .switch { min-width: 0; }
   .tipped > h2 { margin-bottom: 0; }
   .with-tip { display: inline-flex; align-items: center; gap: var(--s1); }
+  .log-options { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,240px),1fr)); gap:12px 24px; margin-top:16px; }
+  .log-options .tipped.extra { margin-top:0; min-height:32px; }
+  .log-footer { border-top:1px solid var(--line); margin-top:16px; padding-top:12px; }
+  .log-card > .tipped { flex-wrap:wrap; }
   .tip-links { display: flex; flex-wrap: wrap; gap: var(--s1) var(--s4); margin-left: auto; color: var(--text-2); font-size: var(--fs-sm); }
   .card > .tip-links { margin-top: var(--s3); }
   .row { display: flex; align-items: center; gap: var(--s3); margin: var(--s2) 0; }
@@ -833,6 +856,8 @@
   .num { width: 96px; }
   .switch { display: flex; align-items: center; gap: var(--s2); min-width: 150px; font-weight: 600; }
   .switch.extra { font-weight: 500; margin-top: var(--s3); }
+  /* 带说明图标的整行已设置间距，标签不再单独下移。 */
+  .tipped > .switch.extra { margin-top: 0; }
   .field { display: flex; align-items: center; gap: var(--s4); padding: var(--s3) 0; border-top: 1px solid var(--line); }
   .field-name { width: 110px; flex-shrink: 0; font-weight: 600; }
   .sub { display: block; font-weight: 400; font-size: var(--fs-xs); color: var(--text-3); }

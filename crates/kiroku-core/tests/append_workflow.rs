@@ -119,7 +119,7 @@ fn pipeline_existing_movie_plans_only_new_video() {
     let scan = pipeline::scan(
         &[t.path().to_path_buf()],
         Some(&root),
-        &Default::default(),
+        &kiroku_core::video_filter::VideoFilter::none(),
         &CancellationToken::new(),
         &mut |_| {},
     );

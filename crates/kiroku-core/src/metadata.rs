@@ -184,6 +184,9 @@ pub fn usable_partial(fields: &PartialMetadata) -> bool {
 /// `extrafanart`/`score`/`external_id`/`source_url` 不在 `fields` 内聚合,见下方专用字段。
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Metadata {
+    /// Source URL stays in Actor.thumb; only NFO export uses these hosted URLs.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub hosted_actor_images: BTreeMap<String, crate::actor_hosting::HostedImage>,
     /// Import-time concrete video stem for NFO/poster/fanart. None is legacy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asset_stem: Option<String>,

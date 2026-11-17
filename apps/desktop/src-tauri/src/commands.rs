@@ -438,7 +438,15 @@ pub async fn scrape_start(app: AppHandle, state: State<'_, AppState>, item_ids: 
 
 /// 刮削器;AI 汉化使用设置目录下的译文缓存。
 fn scraper(settings: Settings) -> CmdResult<Scraper> {
-    Ok(Scraper::new(settings)?.with_translation_cache(kiroku_core::translate::cache_path(&Settings::default_path())))
+    Ok(Scraper::new(settings)?.with_translation_cache(kiroku_core::translate::cache_path(&Settings::default_path())).with_import_cache(kiroku_core::import_cache::cache_path(&Settings::default_path())))
+}
+
+/// Clear only disposable download/source caches; serialize with all import tasks.
+#[tauri::command]
+pub async fn import_cache_clear(app:AppHandle,state:State<'_,AppState>)->CmdResult<()> {
+    let (id,_)=state.begin_job("cache-clear")?;
+    let _guard=JobGuard{app:app.clone(),id};
+    tauri::async_runtime::spawn_blocking(||kiroku_core::import_cache::ImportCache::new(kiroku_core::import_cache::cache_path(&Settings::default_path())).clear()).await.map_err(|e|e.to_string())?.map_err(|e|e.to_string())
 }
 
 /// 清空 AI 汉化译文缓存。
@@ -453,6 +461,17 @@ pub async fn translation_cache_clear() -> CmdResult<()> {
 #[tauri::command]
 pub fn tag_preset_merge(rules: kiroku_core::names::NameRules) -> kiroku_core::names::PresetMerge {
     rules.merge_tags(&kiroku_core::names::tag_preset())
+}
+
+/// Generate a dictionary candidate without writing settings or library files.
+#[tauri::command]
+pub async fn name_translation(
+    app: AppHandle, state: State<'_, AppState>, rules: kiroku_core::names::NameRules,
+    field: kiroku_core::translate::NameKind, source: String,
+) -> CmdResult<kiroku_core::names::NameRule> {
+    let (id, _) = state.begin_job("name-translation")?;
+    let _guard = JobGuard { app, id };
+    kiroku_core::translate::suggest_name(state.settings().ai, &rules, field, &source).await
 }
 
 /// 长任务结束时发系统通知:设置关闭或主窗口在前台时不发。返回是否发出。
@@ -574,7 +593,7 @@ pub async fn apply_start(app: AppHandle, state: State<'_, AppState>, item_ids: V
         return Err("没有可执行的项目,请重新生成整理计划".into());
     }
     let settings = state.settings();
-    let http = settings.build_http().map_err(|e| e.to_string())?;
+    let http = settings.build_http().map_err(|e| e.to_string())?.with_image_cache(kiroku_core::import_cache::cache_path(&Settings::default_path()),kiroku_core::import_cache::image_scope(&settings));
     let roots = if settings.cleanup_source { state.session().roots.clone() } else { vec![] };
     let filter = settings.video_filter();
     tauri::async_runtime::spawn(async move {
@@ -899,6 +918,35 @@ pub async fn library_get(app: AppHandle, code: String) -> CmdResult<Option<Movie
     query_lib(app, move |l| l.get(&code)).await
 }
 
+/// Only fetch avatar URLs already attached to this library item; no disk mutation.
+#[tauri::command]
+pub async fn actor_image(app: AppHandle, code: String, url: String) -> CmdResult<serde_json::Value> {
+    let state = app.state::<AppState>();
+    let snapshot = state.read_snapshot()?;
+    let read_snapshot = snapshot.clone();
+    let app_read = app.clone();
+    let expected = url.clone();
+    let allowed = tauri::async_runtime::spawn_blocking(move || {
+        with_read_snapshot(&app_read.state::<AppState>(), &read_snapshot, |reader| {
+            Ok(reader.get(&code)?.is_some_and(|d| d.meta.fields.actors.iter().any(|a| a.thumb.as_deref() == Some(expected.as_str()))))
+        })
+    }).await.map_err(|e| e.to_string())??;
+    if !allowed { return Err("影片中没有此头像地址".into()); }
+    static REQUESTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+    let _permit = REQUESTS.acquire().await.map_err(|_| "头像加载已停止")?;
+    state.validate_read(&snapshot)?;
+    let settings = state.settings();
+    let mut http = settings.build_http().map_err(|_| "无法创建图片请求")?.for_images();
+    if let Ok(source) = settings.source_for_url(&url) {
+        http = http.with_proxy(settings.proxy_for(source)).map_err(|_| "无法创建图片请求")?;
+        http.seed_cookies(&source.base, &source.cookie);
+    }
+    let bytes = tokio::time::timeout(std::time::Duration::from_secs(20), kiroku_core::actor_image::fetch(&http, &url))
+        .await.map_err(|_| "头像加载超时")?.map_err(|e| e.to_string())?;
+    state.validate_read(&snapshot)?;
+    Ok(serde_json::json!({"bytes": bytes, "mime": "image/png"}))
+}
+
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct RepairDone {
@@ -913,7 +961,7 @@ pub async fn repair_images_start(app: AppHandle, state: State<'_, AppState>, cod
     let guard = JobGuard { app: app.clone(), id };
     let root = state.library_root().ok_or("请先设置媒体库目录")?;
     let settings = state.settings();
-    let http = settings.build_http().map_err(|e| e.to_string())?;
+    let http = settings.build_http().map_err(|e| e.to_string())?.with_image_cache(kiroku_core::import_cache::cache_path(&Settings::default_path()),kiroku_core::import_cache::image_scope(&settings));
     tauri::async_runtime::spawn(async move {
         let (app_read, root_read, code_read) = (app.clone(), root.clone(), code.clone());
         let prepared = tauri::async_runtime::spawn_blocking(move || -> CmdResult<PlanItem> {
@@ -1795,6 +1843,8 @@ pub fn open_source_url(app: AppHandle, url: String) -> CmdResult<()> {
 #[derive(serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum MetadataUpdate {
+    Translate,
+    ActorImages,
     RevalidateLinks,
     TextVersion {language:String,text:kiroku_core::localization::TextVersion,select:bool},
     NfoLanguage { language: kiroku_core::localization::NfoLanguage },
@@ -1849,7 +1899,18 @@ pub async fn metadata_update_preview(
     .map_err(|e| e.to_string())??;
     let before = captured.before.clone();
     let is_language_export=matches!(&update,MetadataUpdate::NfoLanguage{..});
+    let mut actor_cache = None;
     let after = match update {
+        MetadataUpdate::Translate => {
+            tokio::select! {
+                _ = cancel.cancelled() => return Err("翻译已取消".into()),
+                translated = kiroku_core::localization::translate_movie(&before, settings.ai.clone()) => translated?,
+            }
+        }
+        MetadataUpdate::ActorImages => {
+            let (after, cache, warnings) = kiroku_core::actor_hosting::prepare(&before, &settings, &cancel).await.map_err(|e| e.to_string())?;
+            actor_cache = Some((cache, warnings)); after
+        }
         MetadataUpdate::RevalidateLinks => {let root=root.clone();let dir=captured.dir.clone();let meta=before.clone();tauri::async_runtime::spawn_blocking(move||kiroku_core::placement::revalidate(&root,&dir,&meta)).await.map_err(|e|e.to_string())?.map_err(|e|e.to_string())?},
         MetadataUpdate::TextVersion{language,text,select} => kiroku_core::localization::set_localized(&before,&language,text,select).map_err(|e|e.to_string())?,
         MetadataUpdate::NfoLanguage{language} => {let mut after=before.clone();kiroku_core::localization::recover_original(&mut after);after.nfo_language=language;after},
@@ -1894,6 +1955,7 @@ pub async fn metadata_update_preview(
             return Err("媒体库或设置已变化，请重新预览".into());
         }
         let preview = captured.prepare_after(after).map_err(|e| e.to_string())?;
+        let preview = if let Some((cache, warnings)) = actor_cache { preview.with_actor_cache(cache, warnings).map_err(|e| e.to_string())? } else { preview };
         let preview=if is_language_export {preview.for_language_export().map_err(|e|e.to_string())?}else{preview};
         if cancel.is_cancelled() {
             return Err("已取消".into());

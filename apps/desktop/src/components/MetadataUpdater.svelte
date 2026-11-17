@@ -1,4 +1,6 @@
 <script lang="ts">
+  import Icon from './Icon.svelte'
+ let collapsed = $state(false)
  import { onDestroy, untrack } from 'svelte'
  import {cancellableJob,type CancellableJob} from '../lib/cancellable-job'
  import { api } from '../lib/api'
@@ -32,10 +34,12 @@
    else{opened=false;app.toast('ok','更新已保存，可从历史撤销');onsaved()}
   }catch(e){if(current===generation){error=String(e);preview=null}}finally{if(current===generation)busy=false}
  }
-  $effect(() => onactive?.(opened))
+  $effect(() => onactive?.(opened && !collapsed))
 </script>
-<section class:expanded={opened} aria-label="元数据更新">
- {#if !opened}<button class="btn" onclick={start}>更新与来源</button>{:else}
+<section class:expanded={opened && !collapsed} aria-label="元数据更新">
+ <button class="btn" type="button" aria-expanded={opened && !collapsed} disabled={busy} title={opened && !collapsed ? '收起（保留当前填写内容）' : '展开'} onclick={() => { if (opened) collapsed = !collapsed; else { collapsed = false; start() } } }><Icon name="refresh" size={15}/>更新与来源<Icon name="chevron-down" size={16}/></button>
+ <div class="tool-content" hidden={!(!collapsed && (opened || error))}>
+ {#if opened && !collapsed}
  <h3>更新与来源</h3>
  {#if preview}
  <div aria-label="更新差异预览">
@@ -71,7 +75,8 @@
  {/if}
  <button class="btn ghost" disabled={busy} onclick={()=>{opened=false;preview=null}}>取消更新</button>
  {/if}
- {#if error}<p role="alert">{error}</p>{/if}
+ {#if error && !collapsed}<p role="alert">{error}</p>{/if}
+</div>
 </section>
 <style>.inline{display:inline-flex;gap:6px;align-items:center;margin:6px}.field{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:12px 0}.field strong{min-width:70px}select{max-width:100%}.change{display:flex;flex-direction:column;gap:6px;margin:16px 0}del{color:var(--text-3);white-space:pre-wrap}ins{text-decoration:none;color:var(--accent);white-space:pre-wrap} .urlrow { display:flex; flex-direction:column; gap:4px; }
 </style>

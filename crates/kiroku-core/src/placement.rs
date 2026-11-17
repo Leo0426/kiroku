@@ -548,6 +548,15 @@ fn registration_anchor(root: &Path, file: &Path, p: &Placement) -> io::Result<Pa
     {
         return Err(failure());
     }
+    if p.mode == OrganizeMode::Copy {
+        if let Some(id)=&proof.published_identity {
+            if crate::durable_fs::identity(file)? != *id {return Err(failure())}
+            for path in [file,anchor.as_path()] {
+                let fingerprint=crate::append::fingerprint_stream(path,&||false,&|_,_|{},None)?;
+                if fingerprint.rsplit(':').next()!=Some(proof.digest.as_str()){return Err(failure())}
+            }
+        } else if !same_file::is_same_file(file,anchor)? {return Err(failure())}
+    }
     normalize(anchor)
 }
 
@@ -579,7 +588,7 @@ pub(crate) fn is_owned_anchor(
                     if fs::read_link(path)? != p.source || !same_link(path, &media)? {
                         return Err(io::Error::other("媒体证明被替换"));
                     }
-                } else if !same_file::is_same_file(path, &media)? {
+                } else if p.mode != OrganizeMode::Copy && !same_file::is_same_file(path, &media)? {
                     return Err(io::Error::other("媒体证明被替换"));
                 }
                 return Ok(true);

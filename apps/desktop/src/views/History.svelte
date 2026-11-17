@@ -16,6 +16,15 @@
   import { app } from '../lib/state.svelte'
   import type { JournalStatus, JournalSummary } from '../lib/types'
 
+  let removedIds = $state<string[]>([])
+  const removedKey = (root: string) => `kiroku-history-removed:${root}`
+  function readRemoved(root: string): string[] {
+    try { const value=JSON.parse(localStorage.getItem(removedKey(root))??'[]'); return Array.isArray(value)?value.filter((id):id is string=>typeof id==='string'):[] } catch { return [] }
+  }
+  function storeRemoved(ids:string[]):boolean {
+    try { localStorage.setItem(removedKey(shownRoot??''),JSON.stringify(ids));removedIds=ids;return true }
+    catch { app.toast('error','无法保存历史显示偏好，记录尚未移除');return false }
+  }
   let search = $state('')
   let status = $state<JournalStatus | ''>('')
   let from = $state('')
@@ -52,7 +61,7 @@
     loadError = ''
     try {
       // 刷新时保留已加载的条数,撤销或删除后不跳回第一页;不让调用它的 $effect 依赖 list
-      const result = await api.historyList(id, { filter: $state.snapshot(filter), limit: Math.min(Math.max(PAGE, untrack(() => list?.length ?? 0)), 1000) })
+      const result = await api.historyList(id, { filter: { ...$state.snapshot(filter), excludedIds: [...removedIds] }, limit: Math.min(Math.max(PAGE, untrack(() => list?.length ?? 0)), 1000) })
       if (current === generation) ({ items: list, total, next } = result)
     } catch (e) {
       if (current === generation) loadError = String(e)
@@ -67,7 +76,7 @@
     const current = generation
     loadingMore = true
     try {
-      const result = await api.historyList(id, { before: next, limit: PAGE, filter: $state.snapshot(filter) })
+      const result = await api.historyList(id, { before: next, limit: PAGE, filter: { ...$state.snapshot(filter), excludedIds: [...removedIds] } })
       if (current !== generation) return
       const seen = new Set(list.map((j) => j.id))
       list = [...list, ...result.items.filter((j) => !seen.has(j.id))]
@@ -81,10 +90,14 @@
   }
 
   function stopRead(){if(requestId)void api.historyCancel(requestId).catch(()=>{});requestId=null;generation++;loading=false;loadingMore=false;loadError='读取已停止，可重新加载。';}
-  $effect(() => {
+  $effect.pre(() => {
     const root=app.settings?.library_root??null;
-    if(root!==shownRoot){shownRoot=root;list=null;next=null;total=0;confirming=null;}
+    if(root!==shownRoot){shownRoot=root;removedIds=readRemoved(root??'');list=null;next=null;total=0;confirming=null;}
+  })
+  $effect(() => {
+    app.settings?.library_root
     app.libraryVersion
+    removedIds
     filter
     untrack(() => void load())
     return () => { generation++;if(requestId){void api.historyCancel(requestId).catch(()=>{});requestId=null;} }
@@ -131,26 +144,14 @@
   }
 
   async function deleteRecord(j: JournalSummary) {
-    if (busyId || j.status !== 'rolledBack' || j.error) return
-    const current = generation
-    const root = app.settings?.library_root
-    busyId = j.id
-    try {
-      const preview = await api.maintenancePreview(true)
-      if (current !== generation || root !== app.settings?.library_root) return
-      const candidate = preview.candidates.find(c => c.id === `history:${j.id}`)
-      if (!candidate) { app.toast('info', '记录仍有依赖或无法确认安全，已保留。'); return }
-      const ok = await app.confirm({title:'删除已撤销记录', body:`将 ${fmtDateTime(j.ts)} 的记录及其 ${candidate.paths.length} 个日志、暂存或备份文件移到废纸篓。已整理影片和有效撤销记录继续保留，执行前会重新核对依赖。`, confirmLabel:'移到废纸篓'})
-      if (!ok || current !== generation || root !== app.settings?.library_root) return
-      const result = await api.maintenanceApply(preview.token, [candidate.id])
-      if (root !== app.settings?.library_root) return
-      app.toast(result.failed.length || result.skipped.length ? 'error' : 'ok', result.failed[0] ?? result.skipped[0] ?? (result.cancelled ? '删除已停止' : '已移到废纸篓'))
-      await load()
-      await app.recovery.refresh()
-    } catch (e) {
-      if (root === app.settings?.library_root) app.toast('error', String(e), 5000)
-    } finally { busyId = null }
+    const root=shownRoot
+    const ok=await app.confirm({title:'从历史列表删除记录？',body:`移除 ${fmtDateTime(j.ts)} 的显示记录。
+
+不会删除影片，也不会修改操作日志或恢复数据。可通过“恢复已移除记录”重新显示。此设置仅保存在当前设备。`,confirmLabel:'删除记录'})
+    if(!ok||root!==shownRoot)return
+    if(storeRemoved([...new Set([...removedIds,j.id])])){if(detail===j.id)detail=null;confirming=null;app.toast('ok','已从历史列表移除')}
   }
+
 </script>
 
 <div class="page" in:rise>
@@ -167,6 +168,7 @@
     <label>结束日期<input class="input" type="date" aria-label="历史结束日期" bind:value={until} /></label>
     {#if filtering}<button class="btn ghost" onclick={() => { search='';status='';from='';until='' }}>清除历史筛选</button>{/if}
   </div>
+  {#if removedIds.length}<div class="removed-notice"><span>已移除 {removedIds.length} 条记录</span><button class="btn sm ghost" onclick={()=>storeRemoved([])}>恢复已移除记录</button></div>{/if}
   {#if invalidDates}<p role="alert">结束日期不能早于开始日期。</p>{/if}
   {#if !loading && list}<p class="muted" role="status">{total} 条{filtering ? '匹配记录' : '记录'}</p>{/if}
   {#if loading}<button class="btn" onclick={stopRead}>停止读取</button>{/if}
@@ -204,9 +206,7 @@
           <div class="act">
           <button class="btn sm" aria-expanded={detail === j.id} onclick={() => detail = detail === j.id ? null : j.id}>{detail === j.id ? '收起详情' : '操作详情'}</button>
           <button class="btn sm" onclick={() => revealLog(j.id)}>查看日志</button>
-          {#if j.status === 'rolledBack' && !j.error}
-            <button class="btn danger sm" disabled={busyId !== null} onclick={() => deleteRecord(j)}>{busyId === j.id ? '检查中…' : '删除记录'}</button>
-          {/if}
+          <button class="btn ghost sm" disabled={busyId !== null} onclick={() => deleteRecord(j)}><Icon name="trash" size={13}/>删除记录</button>
           {#if j.status !== 'rolledBack' && !j.error}
               {#if confirming === j.id}
                 <button class="btn danger sm" disabled={busyId === j.id} onclick={() => undo(j)}>{busyId === j.id ? '撤销中…' : '确认撤销'}</button>
@@ -231,6 +231,7 @@
 </div>
 
 <style>
+  .removed-notice { display:flex; align-items:center; flex-wrap:wrap; gap:8px; margin:8px 0; color:var(--text-2); font-size:var(--fs-sm); }
   .history-filters { display:flex; align-items:end; gap:var(--s2); flex-wrap:wrap; margin-bottom:var(--s4); }
   .history-filters > input { flex:1; min-width:200px; }
   .history-filters label { display:grid; gap:4px; font-size:var(--fs-xs); }

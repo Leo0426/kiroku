@@ -11,9 +11,13 @@ pub fn build_request(cfg: &AiProvider, title: Option<&str>, plot: Option<&str>) 
     let schema = json!({"type":"object","properties":{
         "title":{"type":"string"},"plot":{"type":"string"}
     },"required":["title","plot"],"additionalProperties":false});
+    build_payload(cfg, SYSTEM, &content, schema)
+}
+
+pub(super) fn build_payload(cfg: &AiProvider, system: &str, content: &str, schema: Value) -> Value {
     match cfg.protocol {
         AiProtocol::Anthropic => {
-            let mut r = json!({"model":cfg.model.trim(),"max_tokens":16000,"system":SYSTEM,
+            let mut r = json!({"model":cfg.model.trim(),"max_tokens":16000,"system":system,
                 "messages":[{"role":"user","content":content}]});
             if cfg.anthropic_fallback { r["fallbacks"] = json!("default"); }
             if !cfg.effort.is_empty() { r["output_config"]["effort"] = json!(cfg.effort); }
@@ -24,7 +28,7 @@ pub fn build_request(cfg: &AiProvider, title: Option<&str>, plot: Option<&str>) 
         }
         AiProtocol::Openai => {
             let mut r = json!({"model":cfg.model.trim(),"messages":[
-                {"role":"system","content":SYSTEM},{"role":"user","content":content}]});
+                {"role":"system","content":system},{"role":"user","content":content}]});
             // Leave the output limit at the provider default for compatibility with models
             // that accept either max_tokens or max_completion_tokens, but not both.
             if !cfg.effort.is_empty() { r["reasoning_effort"] = json!(cfg.effort); }
@@ -38,6 +42,16 @@ pub fn build_request(cfg: &AiProvider, title: Option<&str>, plot: Option<&str>) 
 }
 
 pub fn parse_response(protocol: AiProtocol, v: &Value) -> Result<Translated, String> {
+    let value = response_json(protocol, v)?;
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Output { title: String, plot: String }
+    let out: Output = serde_json::from_value(value).map_err(|_| "译文必须为包含 title、plot 字符串的 JSON 对象")?;
+    let pick = |s: String| { let s = s.trim(); if s.is_empty() { None } else { Some(s.to_string()) } };
+    Ok(Translated { title: pick(out.title), plot: pick(out.plot) })
+}
+
+pub(super) fn response_json(protocol: AiProtocol, v: &Value) -> Result<Value, String> {
     let text = match protocol {
         AiProtocol::Anthropic => {
             match v["stop_reason"].as_str() {
@@ -69,10 +83,5 @@ pub fn parse_response(protocol: AiProtocol, v: &Value) -> Result<Translated, Str
     // Prompt-only compatible services sometimes wrap their valid JSON in a fence.
     let text = text.strip_prefix("```json").or_else(|| text.strip_prefix("```"))
         .and_then(|t| t.trim_end().strip_suffix("```" )).unwrap_or(text).trim();
-    #[derive(serde::Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct Output { title: String, plot: String }
-    let out: Output = serde_json::from_str(text).map_err(|_| "译文必须为包含 title、plot 字符串的 JSON 对象")?;
-    let pick = |s: String| { let s = s.trim(); if s.is_empty() { None } else { Some(s.to_string()) } };
-    Ok(Translated { title: pick(out.title), plot: pick(out.plot) })
+    serde_json::from_str(text).map_err(|_| "译文必须为 JSON 对象".into())
 }

@@ -9,6 +9,7 @@
     value: BrowserState; facets: Facets | null; tabs: Snippet; onrandom: () => void; randomBusy: boolean; randomDisabled: boolean
     onexport: () => void; exporting: boolean; exportProgress: { done: number; total: number }; onstop: () => void
   } = $props()
+  let layoutOpen = $state(false)
   let expanded = $state(false)
   let savedOpen = $state(false)
   let recentOpen = $state(false)
@@ -101,12 +102,27 @@
     {@render tabs()}
     <button class="btn sm ghost" aria-expanded={savedOpen} onclick={() => savedOpen = !savedOpen}><Icon name="star" size={13}/>筛选视图{#if value.saved.length} · {value.saved.length}{/if}</button>
     <div class="display" role="group" aria-label="显示方式"><button aria-label="海报视图" aria-pressed={value.layout === 'posters'} onclick={() => { value.layout = 'posters'; value.scroll = 0 }}><Icon name="grid" size={14}/></button><button aria-label="列表视图" aria-pressed={value.layout === 'list'} onclick={() => { value.layout = 'list'; value.scroll = 0 }}>☰</button></div>
-    {#if value.layout === 'posters'}<select class="input density" aria-label="海报大小" bind:value={value.density}><option value="compact">紧凑海报</option><option value="comfortable">标准海报</option><option value="large">大海报</option></select>{/if}
+    {#if value.layout === 'posters'}
+      <label class="zoom">缩小 <input type="range" min="60" max="180" step="5" aria-label="海报缩放" bind:value={value.posterScale} oninput={() => value.gridMode=false}/> 放大 <output>{value.posterScale}%</output></label>
+      <button class="btn sm ghost" aria-expanded={layoutOpen} onclick={() => layoutOpen = !layoutOpen}><Icon name="sliders" size={14}/>海报布局</button>
+    {/if}
     <div class="spacer"></div>
     <button class="btn sm ghost" onclick={onrandom} disabled={randomBusy || randomDisabled} title={randomDisabled ? '等待查询完成且有匹配影片后可挑选' : '从当前筛选的全部影片中随机打开一部'}>{randomBusy ? '正在挑选…' : '随机挑选'}</button>
     {#if exporting}<span class="muted" role="status">导出 {exportProgress.done} / {exportProgress.total || '…'}</span>{/if}
     <button class="btn sm ghost" onclick={exporting ? onstop : onexport}>{exporting ? '停止导出' : '导出 CSV'}</button>
   </div>
+  {#if value.layout === 'posters' && layoutOpen}
+    <div class="tray poster-layout" role="group" aria-label="海报布局设置">
+      <label>排列方式 <select class="input" aria-label="海报排列方式" value={value.gridMode ? 'grid' : 'scale'} onchange={e => { value.gridMode = e.currentTarget.value === 'grid'; value.scroll = 0 }}><option value="scale">按大小缩放</option><option value="grid">按行列排列</option></select></label>
+      {#if value.gridMode}
+        <label>列数 <select class="input" aria-label="海报列数" bind:value={value.columns}>{#each Array.from({length:12},(_,i)=>i+1) as n}<option value={n}>{n} 列</option>{/each}</select></label>
+        <label>每屏行数 <select class="input" aria-label="海报每屏行数" bind:value={value.visibleRows}>{#each [1,2,3,4,5,6] as n}<option value={n}>{n} 行</option>{/each}</select></label>
+        <span class="muted">保持海报比例；窗口过小时自动减少行列，更多影片向下滚动。</span>
+
+      {/if}
+      <button class="btn sm ghost" onclick={() => { value.posterScale=100; value.gridMode=false; value.columns=4; value.visibleRows=2; value.scroll=0 }}>重置布局</button>
+    </div>
+  {/if}
   {#if savedOpen}
     <div class="tray saved" aria-label="筛选视图管理">
       <select class="input" aria-label="已保存视图" value={savedId} onchange={e => selectSaved(e.currentTarget.value)}><option value="">选择已保存视图…</option>{#each value.saved as s}<option value={s.id}>{s.name}</option>{/each}</select>
@@ -130,7 +146,12 @@
   .chip button { border:0; background:none; color:inherit; min-width:24px; min-height:24px; }
   .active-dot { width:5px; height:5px; background:var(--accent); border-radius:50%; }
   .display { display:flex; padding:2px; background:var(--surface-2); border-radius:8px; }.display button { display:grid; place-items:center; min-width:32px; height:28px; border:0; border-radius:6px; background:none; color:var(--text-2); }.display button[aria-pressed="true"] { color:var(--accent); background:var(--accent-soft); }
-  .density { min-height:30px; height:30px; font-size:var(--fs-xs); }.spacer { flex:1; }
+  .spacer { flex:1; }
+  .poster-layout label, .zoom { display:flex; flex-wrap:wrap; align-items:center; gap:8px; font-size:var(--fs-sm); }
+  .zoom { flex:0 1 260px; min-width:200px; }
+  .zoom input { flex:1; min-width:80px; max-width:240px; accent-color:var(--accent); }
+  .zoom output { min-width:4ch; }
+  .poster-layout .muted { flex:1 1 240px; font-size:var(--fs-xs); }
   form { display:flex; flex-wrap:wrap; gap:8px; flex:1; }form .input { flex:1; min-width:180px !important; max-width:none !important; }
   @media(max-width:1000px) { .direction span { display:none; } }
   @media(max-width:560px) { .search { flex-basis:100%; }.search-row>select { flex:1 1 110px; min-width:110px; }.tray .input { flex:1 1 120px; min-width:120px; max-width:100%; }.browse-row { gap:5px; }.spacer { display:none; }.recent-toggle { font-size:var(--fs-sm); } }

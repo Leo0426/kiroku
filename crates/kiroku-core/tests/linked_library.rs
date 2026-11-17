@@ -182,7 +182,7 @@ async fn retained_existing_multi_part_batch_records_every_append_and_undo() {
     let scan = pipeline::scan(
         &[input],
         Some(&root),
-        &Default::default(),
+        &kiroku_core::video_filter::VideoFilter::none(),
         &cancel,
         &mut |_| {},
     );

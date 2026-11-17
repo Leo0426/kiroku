@@ -10,6 +10,8 @@
  let {rules=$bindable(),dirty=false}:{rules:NameRules;dirty?:boolean}=$props()
  const labels:Record<NameField,string>={actors:'演员',tags:'标签',studio:'制作商',publisher:'发行商',series:'系列'}
  let field=$state<NameField>('actors'),canonical=$state(''),aliases=$state(''),error=$state(''),busy=$state(false),inventory=$state<CatalogInventory|null>(null),selected=$state<string[]>([]),preview=$state<CatalogPreview|null>(null),result=$state<CatalogResult|null>(null),message=$state(''),progress=$state(''),editIndex=$state<number|null>(null)
+ let translationSource=$state('')
+ const unknownNames=$derived(Object.keys(inventory?.names[field]??{}).filter(name=>!rules[field].some(r=>[r.canonical,...r.aliases].some(s=>s.trim().normalize('NFC')===name.trim().normalize('NFC')))))
  let task=$state<CancellableJob<unknown>|null>(null)
  let generation=0,libraryRoot:string|null=null
  onDestroy(()=>{generation++;void task?.cancel()})
@@ -34,6 +36,19 @@
   try{const next=await request.promise;if(g===generation)accept(next,request.cancelled)}
   catch(e){if(g===generation)error=String(e)}finally{unlisten?.();if(g===generation){busy=false;task=null}}
  }
+ async function translateName(){
+  if(busy||(field!=='series'&&field!=='tags'))return
+  const g=generation,kind=field;busy=true;error='';message=''
+  try{
+   const rule=await api.nameTranslation($state.snapshot(rules),kind,translationSource)
+   if(g!==generation)return
+   const index=rules[kind].findIndex(r=>r.canonical.trim().normalize('NFC')===rule.canonical)
+   canonical=rule.canonical
+   aliases=[...new Set([...(index>=0?rules[kind][index].aliases:[]),...rule.aliases])].join('\n')
+   editIndex=index>=0?index:null
+   message='候选译名已填入下方，可编辑；确认添加规则并保存设置后生效'
+  }catch(e){if(g===generation)error=String(e)}finally{if(g===generation)busy=false}
+ }
  async function preset(){error='';message='';try{const r=await api.tagPresetMerge($state.snapshot(rules));rules=r.rules;field='tags';editIndex=null;preview=null;message=r.added_rules||r.added_aliases?`已加入 ${r.added_rules} 条标签规则、${r.added_aliases} 个别名，保存设置后生效`:'内置标签译名已全部在规则里'}catch(e){error=String(e)}}
  async function load(){if(busy)return;inventory=null;selected=[];preview=null;result=null;await run(id=>api.catalogInventory(id),next=>{inventory=next})}
  async function build(){preview=null;result=null;await run(id=>api.catalogPreview(selected,id),(next,cancelled)=>{if(!cancelled)preview=next})}
@@ -53,6 +68,15 @@
  <div class="preset"><button class="btn" onclick={preset} disabled={busy||editIndex!==null}>导入内置标签译名</button><InfoTip label="内置标签译名说明"><p>把常见的繁体、日文标签统一成简体，不改动已有规则。</p></InfoTip></div>
  <label class="toggle"><input type="checkbox" checked={!!rules.strip_actor_names_from_title} disabled={busy} onchange={e=>{rules={...rules,strip_actor_names_from_title:e.currentTarget.checked};preview=null}} /><span>标题剔除演员名<small>在 AI 汉化之前，从标题里删掉本片演员的规范名和别名；原题保留来源原文。只有一个字的名字不处理，删完为空时保留原题。</small></span></label>
  <label>名称类别 <select class="input" bind:value={field} disabled={busy||editIndex!==null}>{#each NAME_FIELDS as key}<option value={key}>{labels[key]}</option>{/each}</select></label>
+ {#if field==='series'||field==='tags'}
+ <div class="translation">
+  <p>系列名与未知标签先生成候选，再保存为统一规则。标签优先使用内置译名，其他名称使用已保存的 AI 服务设置。</p>
+  <label>待汉化原名 <input class="input" bind:value={translationSource} list="unmapped-names" disabled={busy||editIndex!==null} maxlength="300" /></label>
+  <datalist id="unmapped-names">{#each unknownNames as name}<option value={name}></option>{/each}</datalist>
+  {#if inventory}<label>库中未建规则的名称 <select class="input" value="" disabled={busy||editIndex!==null} onchange={e=>{translationSource=e.currentTarget.value}}><option value="">选择原名（{unknownNames.length} 个）</option>{#each unknownNames as name}<option value={name}>{name}</option>{/each}</select></label>{:else}<p class="muted">可输入原名，或点击「读取库名称」后选择。</p>{/if}
+  <button class="btn" onclick={translateName} disabled={busy||editIndex!==null||!translationSource.trim()}>生成中文候选</button>
+ </div>
+ {/if}
  <label>规范名 <input class="input" bind:value={canonical} disabled={busy} list="catalog-names" /></label>
  <datalist id="catalog-names">{#each Object.keys(inventory?.names[field]??{}) as name}<option value={name}></option>{/each}</datalist>
  <label>别名（每行一个） <textarea class="input" bind:value={aliases} disabled={busy}></textarea></label>
@@ -71,4 +95,4 @@
  {#if result}<p role="status">已完成 {result.items.filter(i=>!i.error).length} 项{result.cancelled?' · 已取消':''}</p>{#each result.items.filter(i=>i.error) as item}<p role="alert">{item.code}：{item.error}</p>{/each}{#if result.indexError}<p role="alert">索引更新失败：{result.indexError}</p>{/if}{#if result.items.some(i=>i.journalId)}<button class="btn" onclick={undo} disabled={busy}>撤销本次修改</button>{/if}{/if}
  {#if message}<p role="status">{message}</p>{/if}{#if error}<p role="alert">{error}</p>{/if}
 </section>
-<style>section{display:grid;gap:12px;padding:var(--s4)}label{display:grid;gap:6px}.toggle{display:flex;align-items:flex-start;gap:10px}textarea{min-height:80px}.preset{display:flex;align-items:center;gap:12px;flex-wrap:wrap}.rule{display:flex;align-items:center;gap:12px;flex-wrap:wrap}.movies{max-height:300px;overflow:auto}.movies label{display:flex;align-items:center;padding:8px;gap:10px}small{display:block;color:var(--text-3);overflow-wrap:anywhere}[data-name-diff]{padding:12px;background:var(--surface-2);border-radius:8px}p{overflow-wrap:anywhere}</style>
+<style>.translation{display:grid;gap:12px;padding:12px;background:var(--surface-2);border-radius:8px}section{display:grid;gap:12px;padding:var(--s4)}label{display:grid;gap:6px}.toggle{display:flex;align-items:flex-start;gap:10px}textarea{min-height:80px}.preset{display:flex;align-items:center;gap:12px;flex-wrap:wrap}.rule{display:flex;align-items:center;gap:12px;flex-wrap:wrap}.movies{max-height:300px;overflow:auto}.movies label{display:flex;align-items:center;padding:8px;gap:10px}small{display:block;color:var(--text-3);overflow-wrap:anywhere}[data-name-diff]{padding:12px;background:var(--surface-2);border-radius:8px}p{overflow-wrap:anywhere}</style>

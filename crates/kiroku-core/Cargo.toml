@@ -28,5 +28,5 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 tempfile = "3"
 futures-util = "0.3"
 
-[dev-dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"

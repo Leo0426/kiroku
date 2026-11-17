@@ -474,7 +474,7 @@ mod tests {
         assert!(cache
             .get(Kind::Summary, &cache_key, at + CACHE_TTL)
             .is_none());
-        settings.scan.min_video_mb = 100;
+        settings.scan.min_video_mb += 1;
         assert!(cache.get(Kind::Summary, &key(&settings), at).is_none());
         let cancel = CancellationToken::new();
         cache.active = Some(Active {

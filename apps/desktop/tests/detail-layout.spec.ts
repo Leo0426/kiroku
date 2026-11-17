@@ -10,7 +10,7 @@ test('detail tools are compact and language export opens without losing its draf
   await expect(tools).toBeVisible()
   await expect(panel.getByLabel('NFO 导出语言')).not.toBeVisible()
   const buttons = tools.getByRole('button')
-  await expect(buttons).toHaveCount(5)
+  await expect(buttons).toHaveCount(6)
   const edit = await tools.getByRole('button', { name: '编辑元数据', exact: true }).boundingBox()
   const update = await tools.getByRole('button', { name: '更新与来源', exact: true }).boundingBox()
   expect(Math.abs(edit!.y - update!.y)).toBeLessThan(3)
@@ -64,11 +64,88 @@ test('detail width can be dragged, remembered, reset and clamped to the window',
   await expect.poll(async () => (await panel.boundingBox())!.width).toBe(540)
   await handle.focus()
   await page.keyboard.press('End')
-  await expect.poll(async () => (await panel.boundingBox())!.width).toBe(1232)
+  await expect.poll(async () => (await panel.boundingBox())!.width).toBe(1096)
   await page.setViewportSize({width:800,height:720})
-  await expect.poll(async () => (await panel.boundingBox())!.width).toBe(752)
+  await expect.poll(async () => (await panel.boundingBox())!.width).toBe(736)
   await page.setViewportSize({width:390,height:720})
   await expect(handle).toHaveCount(0)
   await expect.poll(async () => (await panel.boundingBox())!.width).toBe(390)
   expect(await panel.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true)
+})
+
+test('movie tool triggers remain available to collapse and reopen drafts', async ({ page }) => {
+  await seedLibrary(page)
+  await page.goto('/')
+  await page.locator('button.pcard').first().click()
+  const panel = page.getByLabel('影片详情', {exact:true})
+  const tools = panel.getByRole('region', {name:'影片工具',exact:true})
+  for (const [name, field] of [['编辑元数据','编辑标题'], ['更新与来源','详情页地址（可选）'], ['追加视频或字幕','追加目标目录'], ['语言与 NFO','NFO 导出语言']]) {
+    const trigger = tools.getByRole('button', {name,exact:true})
+    await trigger.click()
+    await expect(trigger).toHaveAttribute('aria-expanded', 'true')
+    const input = panel.getByLabel(field,{exact:true})
+    await expect(input).toBeVisible()
+    if(name==='编辑元数据') await input.fill('暂存标题')
+    if(name==='更新与来源') await input.fill('https://example.invalid/draft')
+    await expect(trigger).toBeEnabled()
+    await trigger.click()
+    await expect(trigger).toHaveAttribute('aria-expanded', 'false')
+    await expect(input).not.toBeVisible()
+    await trigger.click()
+    await expect(input).toBeVisible()
+    if(name==='编辑元数据') await expect(input).toHaveValue('暂存标题')
+    if(name==='更新与来源') await expect(input).toHaveValue('https://example.invalid/draft')
+    await trigger.click()
+  }
+  await expect(panel.getByRole('button', {name:'下一部影片',exact:true})).toBeEnabled()
+  await panel.getByRole('button', {name:'下一部影片',exact:true}).click()
+  for (const name of ['编辑元数据','更新与来源','追加视频或字幕','语言与 NFO']) {
+    await expect(tools.getByRole('button', {name,exact:true})).toHaveAttribute('aria-expanded','false')
+  }
+  await tools.getByRole('button', {name:'编辑元数据',exact:true}).click()
+  await expect(panel.getByLabel('编辑标题',{exact:true})).not.toHaveValue('暂存标题')
+})
+
+
+test('remembered large detail width never hides its poster behind navigation',async({page})=>{
+ await seedLibrary(page)
+ await page.addInitScript(()=>localStorage.setItem('kiroku.detail-width','1800'))
+ await page.emulateMedia({reducedMotion:'no-preference'})
+ await page.setViewportSize({width:960,height:720})
+ await page.goto('/')
+ await page.locator('button.pcard').first().click()
+ const panel=page.getByLabel('影片详情',{exact:true})
+ await expect(page.getByRole('separator',{name:'调整详情宽度'})).toBeVisible()
+ for(const width of [960,800,1440,720,390]){
+  await page.setViewportSize({width,height:720})
+  await expect.poll(()=>panel.evaluate(el=>{
+   const r=el.getBoundingClientRect(), nav=document.querySelector('[aria-label="主导航"]')!.getBoundingClientRect()
+   return r.left >= (innerWidth>720?nav.right:0)-1 && r.right<=innerWidth+1 && el.scrollWidth<=el.clientWidth+1
+  })).toBe(true)
+  const poster=panel.getByRole('button',{name:'重新裁剪海报'})
+  await poster.scrollIntoViewIfNeeded()
+  await expect.poll(()=>poster.evaluate(el=>{
+   const r=el.getBoundingClientRect();return el.contains(document.elementFromPoint(r.x+r.width/2,r.y+r.height/2))
+  })).toBe(true)
+ }
+})
+
+test('tool labels stay in place and every disclosure opens below all labels',async({page})=>{
+ await seedLibrary(page);await page.goto('/');await page.locator('button.pcard').first().click()
+ const panel=page.getByLabel('影片详情',{exact:true})
+ const tools=panel.getByRole('region',{name:'影片工具',exact:true})
+ const triggers=tools.locator('.tool-grid > section > button:first-child')
+ const positions=()=>triggers.evaluateAll(els=>els.map(el=>{const r=el.getBoundingClientRect(),p=el.closest('.toolbox')!.getBoundingClientRect();return {x:r.x-p.x,y:r.y-p.y}}))
+ const before=await positions()
+ for(const name of ['编辑元数据','更新与来源','追加视频或字幕','演员头像','语言与 NFO']){
+  const button=tools.getByRole('button',{name,exact:true})
+  await button.click();await expect(button).toHaveAttribute('aria-expanded','true')
+  expect(await positions()).toEqual(before)
+  const content=tools.locator('.tool-content:visible')
+  await expect(content).toHaveCount(1)
+  const lowest=await triggers.evaluateAll(els=>Math.max(...els.map(el=>el.getBoundingClientRect().bottom)))
+  expect((await content.boundingBox())!.y).toBeGreaterThanOrEqual(lowest)
+  await button.click();await expect(button).toHaveAttribute('aria-expanded','false')
+  await expect(content).toHaveCount(0)
+ }
 })

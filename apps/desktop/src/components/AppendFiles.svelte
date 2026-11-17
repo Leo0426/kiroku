@@ -1,4 +1,6 @@
 <script lang="ts">
+  import Icon from './Icon.svelte'
+ let collapsed = $state(false)
  import {onDestroy,untrack} from 'svelte'
  import {api} from '../lib/api'
  import {cancellableJob,type CancellableJob} from '../lib/cancellable-job'
@@ -43,10 +45,12 @@
   catch(e){if(g===generation){error=String(e);preview=null}}finally{if(g===generation){task=null;busy=false}}
  }
  async function undo(){if(!result)return;const g=generation;busy=true;try{const r=await api.rollback(result.journalId);if(g!==generation)return;if(r.failures.length||r.indexError)throw r.failures.join('; ')+String(r.indexError??'');result=null;notice='本次追加已撤销';onsaved()}catch(e){if(g===generation)error=String(e)}finally{if(g===generation)busy=false}}
-  $effect(() => onactive?.(opened))
+  $effect(() => onactive?.(opened && !collapsed))
 </script>
-<section class:expanded={opened} aria-label="追加影片文件">
- {#if !opened}<button class="btn" onclick={start}>追加视频或字幕</button>{:else}
+<section class:expanded={opened && !collapsed} aria-label="追加影片文件">
+ <button class="btn" type="button" aria-expanded={opened && !collapsed} disabled={busy} title={opened && !collapsed ? '收起（保留当前填写内容）' : '展开'} onclick={() => { if (opened) collapsed = !collapsed; else { collapsed = false; start() } } }><Icon name="plus" size={15}/>追加视频或字幕<Icon name="chevron-down" size={16}/></button>
+ <div class="tool-content" hidden={!(!collapsed && (opened || notice || error))}>
+ {#if opened && !collapsed}
  <h3>追加视频或字幕</h3><p>保留现有元数据和海报</p>
  <select class="input" aria-label="追加目标目录" value={target} onchange={e=>chooseTarget(e.currentTarget.value)} disabled={busy}><option value="">选择已有影片目录</option>{#each targets as dir}<option value={dir}>{dir}</option>{/each}</select>
  <select class="input" aria-label="字幕目标视频" value={video} onchange={e=>chooseVideo(e.currentTarget.value)} disabled={busy}><option value="">按字幕番号和分片自动匹配</option>{#each videos as v}<option value={v}>{v}</option>{/each}</select>
@@ -58,6 +62,7 @@
  {#if busy&&task}<button class="btn" onclick={()=>task?.cancel()}>取消追加任务</button>{/if}
  <button class="btn ghost" onclick={()=>{opened=false;preview=null}} disabled={busy}>关闭追加</button>
  {/if}
- {#if notice}<p role="status">{notice}</p>{/if}{#if error}<p role="alert">{error}</p>{/if}
+ {#if notice && !collapsed}<p role="status">{notice}</p>{/if}{#if error && !collapsed}<p role="alert">{error}</p>{/if}
+</div>
 </section>
 <style>section{margin:0}p{overflow-wrap:anywhere}button{margin:4px 4px 4px 0}select{max-width:100%}</style>

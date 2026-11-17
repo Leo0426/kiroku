@@ -16,7 +16,7 @@ test('settings separates daily options and keeps syntax help collapsed', async (
   await page.getByRole('tab', { name: '扫描', exact: true }).click()
   await page.getByLabel('最小体积', { exact: true }).fill('50')
   await page.getByRole('button', { name: '恢复本页默认', exact: true }).click()
-  await expect(page.getByLabel('最小体积', { exact: true })).toHaveValue('0')
+  await expect(page.getByLabel('最小体积', { exact: true })).toHaveValue('100')
   await page.getByRole('tab', { name: '命名与 NFO', exact: true }).click()
   await expect(page.getByLabel('目录模板')).toHaveValue('{code}/{title}')
   await page.getByRole('button', { name: /^保存更改/ }).click()

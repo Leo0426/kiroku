@@ -288,14 +288,14 @@ mod tests {
         std::fs::create_dir_all(&downloads).unwrap();
         for name in ["ABC-123.mp4", "ABC-124.mp4", "ABC-123.chs.srt", "notes.txt"] { std::fs::write(downloads.join(name), b"v").unwrap(); }
         let file = downloads.join("ABC-123.mp4");
-        let r = scan(&[file.clone()], None, &VideoFilter::default(), &CancellationToken::new(), &mut |_| {});
+        let r = scan(&[file.clone()], None, &VideoFilter::new(&crate::video_filter::ScanCfg { min_video_mb: 0, ..Default::default() }), &CancellationToken::new(), &mut |_| {});
         assert!(r.summary.complete, "{:?}", r.summary.errors);
         assert_eq!(r.items.iter().map(|i| i.path.clone()).collect::<Vec<_>>(), vec![file.clone()], "siblings in the folder are not scanned");
         assert_eq!(r.items[0].code.as_ref().map(|c| c.id.as_str()), Some("ABC-123"));
         // A non-video file root yields nothing and is not an error; a file inside the library is excluded.
-        let text = scan(&[downloads.join("notes.txt")], None, &VideoFilter::default(), &CancellationToken::new(), &mut |_| {});
+        let text = scan(&[downloads.join("notes.txt")], None, &VideoFilter::new(&crate::video_filter::ScanCfg { min_video_mb: 0, ..Default::default() }), &CancellationToken::new(), &mut |_| {});
         assert!(text.items.is_empty() && text.summary.complete);
-        let excluded = scan(&[file.clone()], Some(&downloads), &VideoFilter::default(), &CancellationToken::new(), &mut |_| {});
+        let excluded = scan(&[file.clone()], Some(&downloads), &VideoFilter::new(&crate::video_filter::ScanCfg { min_video_mb: 0, ..Default::default() }), &CancellationToken::new(), &mut |_| {});
         assert!(excluded.items.is_empty());
     }
 
@@ -312,7 +312,7 @@ mod tests {
         let summary = scan_summary(
             &[root.path().into()],
             Some(&library),
-            &VideoFilter::default(),
+            &VideoFilter::new(&crate::video_filter::ScanCfg { min_video_mb: 0, ..Default::default() }),
             &CancellationToken::new(),
         );
         assert_eq!(summary.total, 1);
@@ -333,7 +333,7 @@ mod tests {
             std::fs::write(root.path().join(format!("ABC-{i:05}.mp4")), b"v").unwrap();
         }
         let token = CancellationToken::new();
-        let filter = VideoFilter::default();
+        let filter = VideoFilter::new(&crate::video_filter::ScanCfg { min_video_mb: 0, ..Default::default() });
         let roots = [root.path().into()];
         let summary = scan_summary(&roots, None, &filter, &token);
         assert_eq!(summary.visited, SUMMARY_ENTRY_LIMIT);
@@ -364,14 +364,14 @@ mod tests {
         let result = scan(
             &[root.path().into()],
             None,
-            &VideoFilter::default(),
+            &VideoFilter::new(&crate::video_filter::ScanCfg { min_video_mb: 0, ..Default::default() }),
             &token,
             &mut |_| token.cancel(),
         );
         assert_eq!(result.items.len(), 1);
         assert_eq!(result.summary.visited, 2);
         assert!(result.summary.cancelled && !result.summary.complete);
-        let empty = scan_summary(&[root.path().into()], None, &VideoFilter::default(), &token);
+        let empty = scan_summary(&[root.path().into()], None, &VideoFilter::new(&crate::video_filter::ScanCfg { min_video_mb: 0, ..Default::default() }), &token);
         assert_eq!(empty.visited, 0);
         assert!(empty.cancelled && !empty.complete);
     }
@@ -389,7 +389,7 @@ mod tests {
         let result = scan(
             &[alias.clone(), source.clone()],
             Some(&library),
-            &VideoFilter::default(),
+            &VideoFilter::new(&crate::video_filter::ScanCfg { min_video_mb: 0, ..Default::default() }),
             &CancellationToken::new(),
             &mut |_| {},
         );
@@ -400,7 +400,7 @@ mod tests {
         let excluded = scan_summary(
             &[library.clone()],
             Some(&alias.join("library")),
-            &VideoFilter::default(),
+            &VideoFilter::new(&crate::video_filter::ScanCfg { min_video_mb: 0, ..Default::default() }),
             &CancellationToken::new(),
         );
         assert_eq!(excluded.visited, 0);
@@ -413,7 +413,7 @@ mod tests {
         let result = scan_summary(
             &[root.path().into(), root.path().join("missing")],
             None,
-            &VideoFilter::default(),
+            &VideoFilter::new(&crate::video_filter::ScanCfg { min_video_mb: 0, ..Default::default() }),
             &CancellationToken::new(),
         );
         assert_eq!(result.total, 1);

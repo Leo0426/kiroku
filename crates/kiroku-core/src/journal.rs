@@ -61,7 +61,7 @@ pub struct Journal {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Proof { pub stage: PathBuf, pub digest: String, #[serde(default)] pub link: Option<PathBuf>, #[serde(default)] pub source_proof: Option<String> }
+pub struct Proof { pub stage: PathBuf, pub digest: String, #[serde(default)] pub link: Option<PathBuf>, #[serde(default)] pub source_proof: Option<String>, #[serde(default, skip_serializing_if="Option::is_none")] pub published_identity: Option<String> }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Pending { pub op: Op, pub proof: Proof }
@@ -181,8 +181,8 @@ impl Journal {
                     // v2 deliberately strips WriteFile content; its proof is the byte authority.
                     let stage = recorded_path(&self.root, &self.root, &proof.stage)?;
                     if digest(&bytes) != proof.digest
-                        || current(&stage)?.as_ref() != Some(&proof.digest)
-                        || !same_file::is_same_file(&side, &stage).unwrap_or(false)
+                        || !durable::verified(&stage,proof)?
+                        || !durable::owned(&side,proof)
                     {
                         return Err(conflict());
                     }
@@ -257,7 +257,7 @@ impl Journal {
         storage::verify_temporary(self,&root,&owner)?;
         fs::rename(&tmp, &p)?;
         #[cfg(unix)]
-        fs::File::open(p.parent().expect("journal dir"))?.sync_all()?;
+        crate::durable_fs::sync_directory(p.parent().expect("journal dir"))?;
         self.mark_snapshot()?;
         Ok(p)
     }
@@ -328,7 +328,12 @@ impl Journal {
                 }
                 if let Some(proof) = self.proofs.get(&i) {
                     // 成功进度持久化后再清暂存链接,也清理其空目录。
-                    let _ = crate::organize::rollback(&[Op::Download { path: proof.stage.clone(), url: String::new(), crop: None, stamp: None }], Some(&self.root));
+                    if proof.published_identity.is_none() && crate::nas_ops::mapped_pair(&proof.stage,self.ops[i].target()) {
+                        let anchor=self.ops[i].source().unwrap_or(&proof.stage);
+                        let _=crate::nas_ops::remove_owned(&proof.stage,anchor);
+                        let mut parent=proof.stage.parent();
+                        while let Some(dir)=parent {if dir==self.root || !dir.starts_with(&self.root) || fs::remove_dir(dir).is_err(){break}parent=dir.parent();}
+                    } else {let _ = crate::organize::rollback(&[Op::Download { path: proof.stage.clone(), url: String::new(), crop: None, stamp: None }], Some(&self.root));}
                 }
             } else {
                 failures.extend(errors);

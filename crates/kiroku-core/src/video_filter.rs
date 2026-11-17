@@ -3,7 +3,7 @@
 //! 对齐 amane `library/rules.py`:规则只匹配文件名(含扩展名),不看目录段;
 //! 每条正则单独编译(用户写的 `(?i)` 之类全局旗标拼进 `|` 中间会失效);体积阈值 0 为关闭。
 //! 与 amane 的差异:预告片默认规则更宽(amane 只有 `(?i)trailer`),把样片、预览也算进来。
-//! 扫描时跳过命中的文件;整理后清理原文件夹时,它们也不算「还有正片」。
+//! 扫描时跳过命中的文件;体积不足的视频保留在原处,并阻止原文件夹清理。
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -24,7 +24,7 @@ pub struct ScanCfg {
 
 impl Default for ScanCfg {
     fn default() -> Self {
-        Self { extra_pattern: DEFAULT_EXTRA_PATTERN.into(), blacklist: vec![], min_video_mb: 0 }
+        Self { extra_pattern: DEFAULT_EXTRA_PATTERN.into(), blacklist: vec![], min_video_mb: 100 }
     }
 }
 
@@ -81,6 +81,11 @@ impl VideoFilter {
         Self { extra: None, blacklist: vec![], min_bytes: 0 }
     }
 
+    /// 清理保护独立于文件名规则:小视频即使命中样片/黑名单也必须保留。
+    pub fn preserves_small_video(&self, size: u64) -> bool {
+        self.min_bytes > 0 && size < self.min_bytes
+    }
+
     /// `name` 为文件名(含扩展名);`size` 取不到时传 None,此时不按体积过滤(读不到的正片不能当广告丢)。
     pub fn skip(&self, name: &str, size: Option<u64>) -> Option<SkipReason> {
         if self.blacklist.iter().any(|r| r.is_match(name)) {
@@ -101,13 +106,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_skips_samples_and_trailers_only() {
+    fn default_skips_samples_trailers_and_small_videos() {
         let f = VideoFilter::default();
         for n in ["SMPL-001-trailer.mp4", "SMPL-001 sample.mp4", "smpl001_Preview.mkv", "预告.mp4", "SMPL-001 樣本.mp4"] {
             assert_eq!(f.skip(n, Some(1)), Some(SkipReason::Extra), "{n}");
         }
         for n in ["SMPL-001.mp4", "SMPL-001-C.mp4", "最新地址.mp4"] {
-            assert_eq!(f.skip(n, Some(1)), None, "{n}");
+            assert_eq!(f.skip(n, Some(100 * 1024 * 1024)), None, "{n}");
+            assert_eq!(f.skip(n, Some(1)), Some(SkipReason::TooSmall), "{n}");
         }
     }
 
@@ -121,7 +127,7 @@ mod tests {
         assert_eq!(f.skip("SMPL-001.mp4", Some(200 * 1024 * 1024)), None);
         assert_eq!(f.skip("SMPL-001.mp4", None), None, "取不到大小不按体积过滤");
         assert!(cfg.validate().unwrap_err().contains("「[」"));
-        let off = VideoFilter::new(&ScanCfg { extra_pattern: String::new(), ..Default::default() });
+        let off = VideoFilter::new(&ScanCfg { extra_pattern: String::new(), min_video_mb: 0, ..Default::default() });
         assert_eq!(off.skip("trailer.mp4", Some(1)), None);
         assert_eq!(VideoFilter::none().skip("sample.mp4", Some(0)), None);
     }

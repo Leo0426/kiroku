@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { Snippet } from 'svelte'
+  import { onDestroy, type Snippet } from 'svelte'
   import Icon from './Icon.svelte'
 
   /**
@@ -10,6 +10,9 @@
 
   const id = `tip-${Math.random().toString(36).slice(2, 9)}`
   let open = $state(false)
+  let pinned = false
+  let frame = 0
+  let closeTimer: ReturnType<typeof setTimeout> | undefined
   let right = $state(false)
   let up = $state(false)
   let x = $state(0)
@@ -22,31 +25,61 @@
     const r = host.getBoundingClientRect()
     const w = bubble.offsetWidth, h = bubble.offsetHeight
     right = r.left - 8 + w > innerWidth - 12
-    x = right ? Math.max(12, r.right + 8 - w) : r.left - 8
+    x = Math.max(12, Math.min(innerWidth - 12 - w, right ? r.right + 8 - w : r.left - 8))
     up = r.bottom + 8 + h > innerHeight - 12 && r.top - 8 - h >= 12
-    y = up ? r.top - 8 - h : r.bottom + 8
+    y = Math.max(12, Math.min(innerHeight - 12 - h, up ? r.top - 8 - h : r.bottom + 8))
+  }
+  // A transformed/animated ancestor establishes a containing block even for fixed
+  // descendants. Mount at body so getBoundingClientRect and CSS use the same viewport.
+  function portal(node: HTMLElement) {
+    document.body.appendChild(node)
+    return { destroy: () => node.remove() }
+  }
+  function follow() {
+    place()
+    frame = requestAnimationFrame(follow)
+  }
+  function show() {
+    clearTimeout(closeTimer)
+    open = true
+    place()
+    if (!frame) frame = requestAnimationFrame(follow)
+  }
+  function hide() {
+    clearTimeout(closeTimer)
+    cancelAnimationFrame(frame)
+    frame = 0
+    open = false
+    pinned = false
+  }
+  function leave() {
+    clearTimeout(closeTimer)
+    closeTimer = setTimeout(() => {
+      if (!pinned && !host?.matches(':hover') && !bubble?.matches(':hover') && !host?.contains(document.activeElement)) hide()
+    }, 100)
   }
   function toggle(e: MouseEvent) {
-    // 放在 <summary> 里时不要顺带展开/收起 details
     e.preventDefault()
-    place()
-    open = !open
+    pinned = !pinned
+    if (pinned) show()
+    else hide()
   }
   function outside(e: PointerEvent) {
-    if (open && host && !host.contains(e.target as Node)) open = false
+    if (open && !host?.contains(e.target as Node) && !bubble?.contains(e.target as Node)) hide()
   }
   function onkey(e: KeyboardEvent) {
-    if (e.key === 'Escape') open = false
+    if (e.key === 'Escape') hide()
   }
+  onDestroy(hide)
 </script>
 
 <svelte:window onpointerdown={outside} onkeydown={onkey} onscrollcapture={() => open && place()} onresize={() => open && place()} />
 
 <span class="tip" class:open class:right class:up bind:this={host}>
-  <button type="button" class="ico" aria-label={label} aria-describedby={id} aria-expanded={open} onpointerenter={place} onfocus={place} onclick={toggle}>
+  <button type="button" class="ico" aria-label={label} aria-describedby={id} aria-expanded={open} onpointerenter={show} onpointerleave={leave} onfocus={show} onblur={leave} onclick={toggle}>
     <Icon name="info" size={15} />
   </button>
-  <span class="bubble" role="tooltip" {id} bind:this={bubble} style:left="{x}px" style:top="{y}px">{@render children()}</span>
+  <span class="bubble" class:open class:right class:up use:portal onpointerenter={show} onpointerleave={leave} role="tooltip" {id} bind:this={bubble} style:left="{x}px" style:top="{y}px">{@render children()}</span>
 </span>
 
 <style>
@@ -68,10 +101,10 @@
     opacity: 0; visibility: hidden; transform: translateY(-4px) scale(0.97); transform-origin: 14px 0;
     transition: opacity var(--d-base) var(--ease-out), transform var(--d-base) var(--ease-back), visibility 0s linear var(--d-base);
   }
-  .right .bubble { transform-origin: calc(100% - 14px) 0; }
-  .up .bubble { transform: translateY(4px) scale(0.97); transform-origin: 14px 100%; }
-  .right.up .bubble { transform-origin: calc(100% - 14px) 100%; }
-  .tip:hover .bubble, .tip:focus-within .bubble, .open .bubble {
+  .bubble.right { transform-origin: calc(100% - 14px) 0; }
+  .bubble.up { transform: translateY(4px) scale(0.97); transform-origin: 14px 100%; }
+  .right.bubble.up { transform-origin: calc(100% - 14px) 100%; }
+  .bubble.open {
     opacity: 1; visibility: visible; transform: none; transition-delay: 0s;
   }
   .bubble :global(p + p), .bubble :global(* + ul), .bubble :global(* + dl) { margin-top: var(--s2); }

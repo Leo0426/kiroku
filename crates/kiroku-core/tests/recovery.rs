@@ -84,7 +84,7 @@ fn applied_with_pending_intent_is_reported() {
             stage: t.path().join(".kiroku-200-0.tmp"),
             digest: "unused".into(),
             link: None,
-            source_proof: None,
+            source_proof: None, published_identity: None,
         },
     });
     j.save().unwrap();

@@ -67,9 +67,9 @@ test('list mode virtualizes the entire library and restores position across navi
   const last = await page.evaluate(async () => { const api = (await import('/src/lib/api.ts')).api; const all = await api.libraryList({ limit: 1 }); return (await api.libraryList({ offset: all.total - 1, limit: 1 })).items[0].code })
   await expect(page.locator('button.pcard').last()).toContainText(last)
   await page.getByLabel('海报视图', { exact: true }).click()
-  await page.getByLabel('海报大小').selectOption('compact')
+  await page.getByRole('slider', {name:'海报缩放'}).fill('75')
   await nav(page, '历史').click(); await nav(page, '媒体库').click()
-  await expect(page.getByLabel('海报大小')).toHaveValue('compact')
+  await expect(page.getByRole('slider', {name:'海报缩放'})).toHaveValue('75')
 })
 
 test('filters and reverse ordering apply before pagination; random can choose an unloaded result', async ({ page }) => {

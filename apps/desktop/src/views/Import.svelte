@@ -193,6 +193,7 @@
             <h2 id="source-dirs-title">待整理的文件夹</h2>
             <InfoTip label="待整理的文件夹说明">
               <p>选择存放视频的文件夹，也会查找其中的子文件夹；也可以把文件夹或单个视频拖进窗口。单个视频只导入它自己，不清理它所在的文件夹。</p>
+              <p>成功抓取的信息和图片会自动缓存。重启后重新扫描并开始查找信息，已缓存的请求会跳过，失败部分会重试。</p>
               <p><b>支持的视频格式</b><br /><span class="mono">mp4 / mkv / avi / wmv / mov / ts / m2ts / flv / rmvb</span></p>
             </InfoTip>
           </div>

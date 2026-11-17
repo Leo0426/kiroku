@@ -9,7 +9,7 @@ import type {
   MetadataUpdate, TemplatePreview, NfoLanguage, LanguageBatchPreview, LanguageBatchResult,
   SourceCandidate,
   RevisionResult,
-  AiCfg, NameRules, PresetMerge,
+  AiCfg, NameRules, NameRule, TranslatableNameField, PresetMerge,
   DirInfo,
   DroppedPath,
   Facets,
@@ -62,9 +62,12 @@ export interface Api {
   inspectDirectory(path: string): Promise<DirInfo>
   /** 清空 AI 汉化译文缓存 */
   clearTranslationCache(): Promise<void>
+  /** 清空可重建的抓取信息和图片缓存，不改动媒体文件 */
+  clearImportCache(): Promise<void>
   /** 长任务结束的系统通知;设置关闭或窗口在前台时不发,返回是否发出 */
   notifyFinish(title: string, body: string): Promise<boolean>
   /** 把内置标签译名并入(尚未保存的)名称规则,不改动已有规则 */
+  nameTranslation(rules: NameRules, field: TranslatableNameField, source: string): Promise<NameRule>
   tagPresetMerge(rules: NameRules): Promise<PresetMerge>
   /** 只读归类拖入的路径;不是扫描授权 */
   classifyPaths(paths: string[]): Promise<DroppedPath[]>
@@ -99,6 +102,7 @@ export interface Api {
   libraryExportCsv(query: Query, requestId?: string): Promise<number | null>
   libraryPruneMissing(root: string, automatic: boolean, requestId?: string): Promise<LibraryPruned>
   libraryGet(code: string): Promise<MovieDetail | null>
+  actorImage(code: string, url: string): Promise<import('./types').ActorImage>
   /** 移到系统废纸篓并移出索引。keepMedia:只移走资料(NFO/图片等),视频和字幕留下;否则整个影片目录 */
   libraryTrash(code: string, keepMedia: boolean): Promise<TrashResult>
   repairImagesStart(code: string): Promise<number>
@@ -109,6 +113,7 @@ export interface Api {
   nfoExportPreview(codes:string[],language:NfoLanguage,requestId?:string):Promise<LanguageBatchPreview>
   nfoExportApply(token:string,root:string,requestId?:string):Promise<LanguageBatchResult>
   templatePreview(directory:string,file:string): Promise<TemplatePreview>
+  /** actorImages downloads a preview; revisionSave publishes cache before the reversible NFO change. */
   metadataUpdatePreview(code: string, update: MetadataUpdate, requestId?:string): Promise<RevisionPreview>
   artworkOpen(code:string,requestId?:string):Promise<ArtworkOriginal>
   artworkPreview(token:string,root:string,code:string,crop:CropBox,requestId?:string):Promise<ArtworkPreview>
@@ -157,7 +162,9 @@ async function tauriApi(): Promise<Api> {
     aiTest: (cfg) => invoke('ai_test', { cfg }),
     inspectDirectory: (path) => invoke('inspect_directory', { path }),
     clearTranslationCache: () => invoke('translation_cache_clear'),
+    clearImportCache: () => invoke('import_cache_clear'),
     notifyFinish: (title, body) => invoke('notify_finish', { title, body }),
+    nameTranslation: (rules, field, source) => invoke('name_translation', { rules, field, source }),
     tagPresetMerge: (rules) => invoke('tag_preset_merge', { rules }),
     classifyPaths: (paths) => invoke('classify_paths', { paths }),
     pendingList: (requestId = crypto.randomUUID(), force = false) => invoke('pending_list', { requestId, force }),
@@ -182,6 +189,7 @@ async function tauriApi(): Promise<Api> {
     libraryExportCsv: (query, requestId) => invoke('library_export_csv', { query, requestId }),
     libraryPruneMissing: (root, automatic, requestId) => invoke('library_prune_missing', { root, automatic, requestId }),
     libraryGet: (code) => invoke('library_get', { code }),
+    actorImage: (code, url) => invoke('actor_image', { code, url }),
     libraryTrash: (code, keepMedia) => invoke('library_trash', { code, keepMedia }),
     repairImagesStart: (code) => invoke('repair_images_start', { code }),
     metadataSourceCandidates: (code) => invoke('metadata_source_candidates', { code }),

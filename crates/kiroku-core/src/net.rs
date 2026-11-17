@@ -177,6 +177,7 @@ pub fn parse_solution(solver_status: u16, body: &[u8]) -> Result<Solved, String>
 
 #[derive(Clone)]
 pub struct Http {
+    image_cache: Option<(crate::import_cache::ImportCache,String)>,
     client: reqwest::Client,
     jar: Arc<reqwest::cookie::Jar>,
     min_interval: Duration,
@@ -190,7 +191,11 @@ pub struct Http {
 impl Http {
     pub fn new(min_interval: Duration, proxy: Option<&str>) -> reqwest::Result<Self> {
         let jar = Arc::new(reqwest::cookie::Jar::default());
-        Ok(Self { client: client(&jar, proxy)?, jar, min_interval, retry: Retry::default(), solver: None, last: Default::default() })
+        Ok(Self { image_cache:None, client: client(&jar, proxy)?, jar, min_interval, retry: Retry::default(), solver: None, last: Default::default() })
+    }
+
+    pub fn with_image_cache(mut self,path:std::path::PathBuf,scope:String)->Self {
+        self.image_cache=Some((crate::import_cache::ImportCache::new(path),scope));self
     }
 
     /// 换一个代理(None 为直连),其余共享:Cookie、重试策略和同 host 请求间隔都不因换 client 而重置。
@@ -212,7 +217,7 @@ impl Http {
     /// Artwork keeps the same transport, cookies and retry policy, but never
     /// consumes the scraping host budget. Callers bound image request concurrency.
     pub fn for_images(&self) -> Self {
-        Self { client: self.client.clone(), jar: self.jar.clone(), min_interval: Duration::ZERO,
+        Self { image_cache:self.image_cache.clone(), client: self.client.clone(), jar: self.jar.clone(), min_interval: Duration::ZERO,
             retry: self.retry, solver: None, last: Default::default() }
     }
 
@@ -364,8 +369,24 @@ impl Http {
     }
 
     pub(crate) async fn get_image_bytes(&self, url: &str, limit: usize) -> std::io::Result<(u16, Vec<u8>)> {
+        let cache=self.image_cache.clone().map(|(cache,scope)|(cache,format!("{scope}:{url}")));
+        if let Some((cache,key))=cache.clone(){
+            if let Ok(Some(bytes))=tokio::task::spawn_blocking(move||cache.read("images",&key,limit)).await {
+                log::debug!(target:"kiroku::images","复用已下载图片缓存");return Ok((200,bytes));
+            }
+        }
         let raw = self.fetch_limited(url, || self.get_request(url, &[]), Some(limit)).await
             .map_err(std::io::Error::other)?;
+        if raw.status==200 {if let Some((cache,key))=cache {
+            let bytes=raw.body;
+            return tokio::task::spawn_blocking(move||{
+                // Never retain HTML challenges, invalid images, or incomplete responses.
+                if crate::artwork::PreparedImage::normalize(&bytes).is_ok(){
+                    if cache.write("images",&key,&bytes).is_err(){log::warn!(target:"kiroku::images","图片缓存保存失败，本次图片仍可使用");}
+                }
+                (200,bytes)
+            }).await.map_err(std::io::Error::other);
+        }}
         Ok((raw.status, raw.body))
     }
 

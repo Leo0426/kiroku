@@ -4,7 +4,7 @@ use crate::metadata::Metadata;
 
 #[path = "nfo_edit.rs"]
 mod edit;
-pub use edit::{merge_revision,merge_language_export};
+pub use edit::{merge_revision,merge_language_export,merge_actor_export};
 
 /// 先剥非法 XML 字符(存量脏数据兜底),再转义;换行原样保留。
 fn esc(s: &str) -> String {
@@ -57,7 +57,7 @@ pub fn to_nfo(m: &Metadata) -> String {
     }
     line("<mpaa>JP-18+</mpaa>".into());
     for (order, a) in f.actors.iter().enumerate() {
-        let thumb = a.thumb.as_deref().map(|t| format!("\n    <thumb>{}</thumb>", esc(t))).unwrap_or_default();
+        let thumb = a.thumb.as_deref().map(|source| m.hosted_actor_images.get(source).map(|h| h.url.as_str()).unwrap_or(source)).map(|t| format!("\n    <thumb>{}</thumb>", esc(t))).unwrap_or_default();
         line(format!("<actor>\n    <name>{}</name>\n    <type>Actor</type>\n    <order>{order}</order>{thumb}\n  </actor>", esc(&a.name)));
     }
     if let Some(score) = m.mean_score() {

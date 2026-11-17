@@ -160,7 +160,7 @@ fn historical_root_alias_is_normalized_without_following_descendant_links() {
     j.proofs = BTreeMap::from([(
         0,
         Proof {
-            link: None, source_proof: None,
+            link: None, source_proof: None, published_identity: None,
             stage: stage.clone(),
             digest: "unused-after-rollback".into(),
         },

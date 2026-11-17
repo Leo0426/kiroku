@@ -5,6 +5,7 @@ export type Density = 'compact' | 'comfortable' | 'large'
 export interface SavedView { id: string; name: string; query: Query }
 export interface BrowserState {
   query: Query; layout: Layout; density: Density; scroll: number
+  posterScale: number; gridMode: boolean; columns: number; visibleRows: number
   saved: SavedView[]; recent: string[]
 }
 const KEY = 'kiroku-library-browser-v1'
@@ -22,7 +23,7 @@ export function cleanQuery(raw: unknown): Query {
     filters: Array.isArray(q.filters) ? q.filters.filter(f => f && kinds.includes(f.kind) && typeof f.value === 'string' && f.value.length > 0 && f.value.length <= 300).slice(0, 30).filter((f, i, a) => a.findIndex(x => x.kind === f.kind && x.value === f.value) === i).map(f => ({ kind: f.kind, value: f.value })) : [],
   }
 }
-export const defaultBrowser = (): BrowserState => ({ query: cleanQuery({}), layout: 'posters', density: 'comfortable', scroll: 0, saved: [], recent: [] })
+export const defaultBrowser = (): BrowserState => ({ query: cleanQuery({}), layout: 'posters', density: 'comfortable', posterScale: 100, gridMode: false, columns: 4, visibleRows: 2, scroll: 0, saved: [], recent: [] })
 function records(): Record<string, unknown> {
   try { const raw = JSON.parse(localStorage.getItem(KEY) ?? '{}'); return raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {} } catch { return {} }
 }
@@ -32,6 +33,10 @@ export function readBrowser(root: string): BrowserState {
   return {
     query: cleanQuery(raw.query), layout: raw.layout === 'list' ? 'list' : 'posters',
     density: raw.density === 'compact' || raw.density === 'large' ? raw.density : 'comfortable',
+    posterScale: typeof raw.posterScale === 'number' && Number.isFinite(raw.posterScale) ? Math.max(60, Math.min(180, raw.posterScale)) : raw.density === 'compact' ? 75 : raw.density === 'large' ? 140 : 100,
+    gridMode: raw.gridMode === true,
+    columns: Number.isInteger(raw.columns) ? Math.max(1, Math.min(12, raw.columns!)) : 4,
+    visibleRows: Number.isInteger(raw.visibleRows) ? Math.max(1, Math.min(6, raw.visibleRows!)) : 2,
     scroll: Number.isFinite(raw.scroll) ? Math.max(0, Math.min(raw.scroll!, 100_000_000)) : 0,
     saved: Array.isArray(raw.saved) ? raw.saved.filter(s => s && typeof s.id === 'string' && typeof s.name === 'string' && s.name.trim()).slice(0, 20).filter((s, i, a) => a.findIndex(x => x.id === s.id) === i).map(s => ({ id: s.id.slice(0, 100), name: s.name.trim().slice(0, 40), query: cleanQuery(s.query) })) : [],
     recent: Array.isArray(raw.recent) ? [...new Set(raw.recent.filter(s => typeof s === 'string' && s.trim()).map(s => s.trim().slice(0, 300)))].slice(0, 8) : [],

@@ -204,6 +204,10 @@ pub fn plan_with_phase(src: &Path, code: &Code, meta: &Metadata, root: &Path, di
 pub(crate) fn plan_with_subtitles(src: &Path, code: &Code, meta: &Metadata, root: &Path, dir_tpl: &str, with_meta: bool, opts: &PlanOpts, phase: &Phase, companions: &[subtitle::Sibling]) -> Plan {
     let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("mp4");
     let Ok((directory,new_stem,_))=preview_paths_with_subtitles(src,code,meta,dir_tpl,opts,companions) else {return Plan{ops:vec![]};};
+    let directory=crate::nas_ops::local_name(root,directory);
+    let new_stem=crate::nas_ops::local_name(root,new_stem);
+    let suffix_bytes=companions.iter().map(|s|s.suffix.len()).max().unwrap_or(0).max(ext.len()+1).max("-fanart.jpeg".len());
+    if new_stem.len()+suffix_bytes>240 || directory.split('/').any(|part|part.len()>240) {return Plan{ops:vec![]};}
     let dir=root.join(directory);
     let target = dir.join(format!("{new_stem}.{ext}"));
     let mut ops = vec![opts.mode.operation(src.to_path_buf(), target)];
@@ -357,7 +361,10 @@ pub(crate) fn copy_proven(from: &Path, to: &Path, cancel: &dyn Fn()->bool) -> io
 /// 撤销时原路径可能已被用户占用;原子创建目标,绝不替换已有文件或符号链接。
 fn restore_file(from: &Path, to: &Path) -> io::Result<()> {
     let conflict = || io::Error::new(io::ErrorKind::AlreadyExists, format!("original path already exists: {}", to.display()));
-    match fs::hard_link(from, to) {
+    if crate::nas_ops::mapped_pair(from,to) {
+        return crate::nas_ops::rename(from,to,from,&||false).expect("mapped move").map_err(|e|if e.kind()==io::ErrorKind::AlreadyExists{conflict()}else{e});
+    }
+    match fs::hard_link(from,to) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(conflict()),
         Err(_) => {

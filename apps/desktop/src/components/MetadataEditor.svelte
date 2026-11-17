@@ -1,4 +1,6 @@
 <script lang="ts">
+  import Icon from './Icon.svelte'
+ let collapsed = $state(false)
   import { onDestroy } from 'svelte'
   import { api } from '../lib/api'
   import { app } from '../lib/state.svelte'
@@ -65,10 +67,12 @@
     } catch (e) { if (current === generation) { error = String(e); preview = null } }
     finally { if (current === generation) busy = false }
   }
-  $effect(() => onactive?.(editing))
+  $effect(() => onactive?.(editing && !collapsed))
 </script>
-<section class:expanded={editing} aria-label="人工编辑">
-  {#if !editing}<button class="btn" onclick={start}>编辑元数据</button>{:else}
+<section class:expanded={editing && !collapsed} aria-label="人工编辑">
+  <button class="btn" type="button" aria-expanded={editing && !collapsed} disabled={busy} title={editing && !collapsed ? '收起（保留当前填写内容）' : '展开'} onclick={() => { if (editing) collapsed = !collapsed; else { collapsed = false; start() } } }><Icon name="pencil" size={15}/>编辑元数据<Icon name="chevron-down" size={16}/></button>
+ <div class="tool-content" hidden={!(!collapsed && (editing || error || result?.error))}>
+ {#if editing && !collapsed}
     <h3>人工编辑</h3><p class="muted">仅修改发生变化的字段；普通元数据保存后自动锁定，包括清空的值。视频文件名和位置保持不变。</p>
     {#if preview}
       <div aria-label="修订差异预览">
@@ -107,7 +111,8 @@
     {/if}
     <button class="btn ghost" disabled={busy} onclick={() => { editing = false; preview = null }}>取消编辑</button>
   {/if}
-  {#if error}<p role="alert">{error}</p>{/if}
-  {#if result?.error}<p>修订未完整完成，请从历史核对或撤销。日志：{result.journalId}</p>{/if}
+  {#if error && !collapsed}<p role="alert">{error}</p>{/if}
+  {#if result?.error && !collapsed}<p>修订未完整完成，请从历史核对或撤销。日志：{result.journalId}</p>{/if}
+</div>
 </section>
 <style>.phase-option { flex-direction:row; align-items:center; } fieldset { border:1px solid var(--border); border-radius:var(--r-sm); padding:16px; margin:16px 0; } .actor-row { display:flex; align-items:flex-end; gap:12px; margin:16px 0; } .actor-row label { margin:0; } .actor-row button { margin:0 !important; flex-shrink:0; } .actor-row label:first-child { flex:1; min-width:0; } .actor-row input { width:100%; } del { white-space:pre-wrap; } label { display:flex; flex-direction:column; gap:8px; margin:18px 0; } textarea { width:100%; resize:vertical; } small { color:var(--text-3); } .change { display:flex; flex-direction:column; gap:6px; margin:16px 0; overflow-wrap:anywhere; } del { color:var(--text-3); } ins { text-decoration:none; color:var(--accent); white-space:pre-wrap; }</style>

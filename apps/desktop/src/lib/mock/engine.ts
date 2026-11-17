@@ -67,10 +67,11 @@ const DEFAULTS: Settings = {
   retention: {historyDays:90,logDays:90},
   organize_mode: 'move',
   cleanup_source: true,
+  actor_hosting: {enabled:false,directory:'',base_url:''},
   plex: { enabled: false, url: 'http://127.0.0.1:32400', token: '', naming: false },
   media_server: { enabled: false, kind: 'jellyfin', url: 'http://127.0.0.1:8096', api_key: '', local_prefix: '', server_prefix: '' },
   log: { console: true, app: true, file: false, verbose: false },
-  scan: { extra_pattern: '(?i)sample|trailer|preview|预告|預告|样片|樣本|样本', blacklist: [], min_video_mb: 0 },
+  scan: { extra_pattern: '(?i)sample|trailer|preview|预告|預告|样片|樣本|样本', blacklist: [], min_video_mb: 100 },
   badges: {
     enabled: false, scale: 0.08, poster: true, fanart: false, external_subtitle: true,
     corners: { subtitle: 'top_left', uncensored: 'top_left', cracked: 'top_left', leaked: 'top_left', definition: 'top_left' },
@@ -451,6 +452,11 @@ export const mockApi: Api = {
     return '(浏览器预览:localStorage)'
   },
   async saveSettings(s) {
+    if(s.actor_hosting.enabled){
+      if(!/^(?:\/|[A-Za-z]:[\\/])/.test(s.actor_hosting.directory))throw '头像保存目录须为本机可访问的绝对路径'
+      let url:URL;try{url=new URL(s.actor_hosting.base_url.trim())}catch{throw '头像 URL 前缀无效'}
+      if(!['http:','https:'].includes(url.protocol)||url.username||url.password||url.search||url.hash)throw '头像 URL 前缀须为不含凭据、查询参数或片段的 HTTP(S) 地址'
+    }
     validateNames(s.name_rules)
     validateAi(s.ai)
     if (s.min_interval_secs < 1) throw '请求间隔不能为 0'
@@ -524,6 +530,23 @@ export const mockApi: Api = {
   },
 
   async clearTranslationCache() {},
+  async clearImportCache() {},
+  async nameTranslation(rules, field, source) {
+    const id=begin()
+    try {
+      validateNames(rules);source=source.trim().normalize('NFC')
+      if(!source || [...source].length>300)throw '请输入 1–300 字的系列名或标签'
+      const matches=(r:{canonical:string;aliases:string[]})=>[r.canonical,...r.aliases].some(s=>s.trim().normalize('NFC')===source)
+      if(rules[field].some(matches))throw '此名称已有规则，请编辑已有规则'
+      const preset=field==='tags'?tagPreset.find(matches):undefined
+      if(preset)return {canonical:preset.canonical,aliases:preset.canonical===source?[]:[source]}
+      if(!settings.ai.enabled)throw '请先保存并启用 AI 汉化服务设置'
+      const provider=settings.ai.providers.find(p=>p.id===settings.ai.selected_provider)
+      if(!provider?.api_key.trim()||!provider.model.trim())throw '请填写 AI Provider 的 API Key 和模型'
+      await new Promise(resolve=>setTimeout(resolve,300))
+      return {canonical:field==='series'?'示例系列译名':'示例标签译名',aliases:[source]}
+    } finally {end()}
+  },
   async tagPresetMerge(rules) { return mergeTags(rules, tagPreset) },
   async notifyFinish(title, body) {
     if (!settings.notify_on_finish || document.hasFocus()) return false
@@ -603,14 +626,15 @@ export const mockApi: Api = {
     if (!it) throw '找不到该文件'
     const t = text.trim()
     const fc2 = /^fc2[-_ ]?(?:ppv)?[-_ ]?(\d{5,})$/i.exec(t)
+    const short = /^FZ[-_ ]?(\d{2,})$/i.exec(t)
     const std = /^([A-Za-z]{2,6})[-_ ]?(\d{2,5})$/.exec(t)
-    if (!fc2 && !std) throw `无法识别「${t}」这种番号格式,试试 ABC-123 或 FC2-PPV-1234567`
-    const id = fc2 ? `FC2-${fc2[1]}` : `${std![1].toUpperCase()}-${std![2].padStart(3, '0')}`
-    const ct = fc2 ? 'fc2' : 'censored'
+    if (!fc2 && !short && !std) throw `无法识别「${t}」这种番号格式,试试 ABC-123 或 FC2-PPV-1234567`
+    const id = fc2 ? `FC2-${fc2[1]}` : short ? `FZ${short[1]}` : `${std![1].toUpperCase()}-${std![2].padStart(3, '0')}`
+    const ct = fc2 ? 'fc2' : short ? 'uncensored' : 'censored'
     scan[itemId] = {
       ...it,
-      info: { ...it.info, number: id, content_type: ct, matched: true, prefix: id.split('-')[0] },
-      code: { kind: fc2 ? 'Fc2' : 'Standard', id, content_type: ct, part: it.info.cd, subtitled: it.info.has_subtitle, mosaic: it.info.mosaic === 'cracked' || it.info.mosaic === 'leaked' ? it.info.mosaic : fc2 ? null : 'censored', definition: it.info.definition },
+      info: { ...it.info, number: id, content_type: ct, matched: true, prefix: short ? 'FZ' : id.split('-')[0] },
+      code: { kind: fc2 ? 'Fc2' : 'Standard', id, content_type: ct, part: it.info.cd, subtitled: it.info.has_subtitle, mosaic: it.info.mosaic === 'cracked' || it.info.mosaic === 'leaked' ? it.info.mosaic : fc2 ? null : short ? 'uncensored' : 'censored', definition: it.info.definition },
     }
     found.clear()
     plans = []
@@ -839,8 +863,13 @@ export const mockApi: Api = {
           itemCount: done, opCount: done * 4, trashed: 0, pendingOperations: 0, error: null, codes: [...new Set(chosen.slice(0, done).map((c) => c.code))].slice(0, 6), added,
         })
       }
-      // 模拟:整理掉的文件所在子文件夹视为已清理
-      const cleaned = settings.cleanup_source && settings.organize_mode === 'move' && done > 0 ? [`${settings.source_dirs[0] ?? '/Volumes/Downloads/新片'}/QRS-912`] : []
+      // 只清理真正整理过的子目录；根目录、剩余正片及因体积跳过的视频均保留。
+      const sourceRoots=settings.source_dirs.length?settings.source_dirs:['/Volumes/Downloads/新片']
+      const moved=new Set(chosen.slice(0,done).map(p=>p.from))
+      const candidates=[...new Set([...moved].map(path=>path.slice(0,path.lastIndexOf('/'))))]
+      const retained=[...scan.filter(item=>!moved.has(item.path)),...sourceRoots.flatMap(root=>splitScan(root).skipped).filter(item=>settings.scan.min_video_mb>0&&item.size<settings.scan.min_video_mb*1024*1024)]
+      const cleaned = settings.cleanup_source && settings.organize_mode === 'move' && !cancelled
+        ? candidates.filter(dir=>sourceRoots.some(root=>dir.startsWith(root+'/'))&&!retained.some(item=>item.path.startsWith(dir+'/'))) : []
       if (history[0]?.id === journalId) history[0].trashed = cleaned.length
       for (const d of cleaned) log('info', `原文件夹已移到废纸篓: ${d}`)
       log('info', `整理结束:成功 ${done} 项,失败 0 项${cancelled ? ',已取消' : ''}`)
@@ -867,7 +896,7 @@ export const mockApi: Api = {
       if(root!==settings.library_root||generation!==historyGeneration)throw '媒体库已变化，请重新读取'
       const f=page.filter??{},words=(f.text??'').trim().toLowerCase().split(/\s+/).filter(Boolean)
       if((f.text?.length??0)>512 || (f.from!=null && f.until!=null && f.from>=f.until))throw '历史筛选范围无效'
-      const rows=history.filter(h=>(!f.status||h.status===f.status)&&(f.from==null||h.ts>=f.from)&&(f.until==null||h.ts<f.until)&&words.every(w=>h.id.includes(w)||h.codes.join(' ').toLowerCase().includes(w))).sort((a,b)=>b.ts-a.ts||b.id.localeCompare(a.id))
+      const rows=history.filter(h=>!(f.excludedIds??[]).includes(h.id)&&(!f.status||h.status===f.status)&&(f.from==null||h.ts>=f.from)&&(f.until==null||h.ts<f.until)&&words.every(w=>h.id.includes(w)||h.codes.join(' ').toLowerCase().includes(w))).sort((a,b)=>b.ts-a.ts||b.id.localeCompare(a.id))
       const cursor=page.before?history.find(h=>h.id===page.before):null
       const limit=Math.min(Math.max(page.limit??50,1),1000),after=page.before?rows.filter(h=>cursor?(h.ts<cursor.ts||h.ts===cursor.ts&&h.id<cursor.id):false):rows,items=after.slice(0,limit).map(h=>({id:h.id,ts:h.ts,status:h.status,itemCount:h.itemCount,opCount:h.opCount,codes:h.codes.slice(0,6),trashed:h.trashed,pendingOperations:h.pendingOperations,error:h.error}))
       return {items,total:rows.length,next:after.length>items.length&&items.length?items[items.length-1].id:null}
@@ -977,6 +1006,12 @@ export const mockApi: Api = {
     } finally { end() }
   },
 
+  async actorImage(code, url) {
+    const detail = await mockApi.libraryGet(code)
+    if (!detail?.meta.actors.some(a => a.thumb === url)) throw '影片中没有此头像地址'
+    // Browser preview stays offline and simulates the native PNG response.
+    return {bytes: Array.from(Uint8Array.from(atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII='), c => c.charCodeAt(0))), mime: 'image/png'}
+  },
   async libraryGet(code): Promise<MovieDetail | null> {
     const m = movies.find((x) => x.code === code)
     if (!m) return null
@@ -1184,7 +1219,30 @@ export const mockApi: Api = {
       const route=sourceRoute(code,contentType)
       if (update.kind==='refresh' && update.url?.trim()) urlSource(update.url.trim(), route)
       const nonempty=(v: unknown) => v!=null && (Array.isArray(v) ? v.length>0 : typeof v==='string' ? v.trim().length>0 : true)
-      if(update.kind==='textVersion'){
+      if(update.kind==='translate'){
+        if(!settings.ai.enabled)throw '请先在设置 → AI 汉化中启用并配置翻译服务'
+        await sleep(900)
+        if(job?.cancelled)throw '翻译已取消'
+        recoverText(after)
+        const text: import('../types').TextVersion = {provenance:{}}
+        for(const field of ['title','plot'] as const){
+          if(settings.ai[field]&&!after.locked_fields?.includes(field)&&after.text_versions?.original[field]){
+            text[field]=field==='title'?'海边的旅行':'朋友们一起探索海边小镇。'
+            text.provenance![field]='ai';after[field]=text[field];after.provenance={...after.provenance,[field]:'localized:zh-Hans'}
+          }
+        }
+        if(!text.title&&!text.plot)throw '没有可翻译的日文原文'
+        after.text_versions!.localized['zh-Hans']={...after.text_versions!.localized['zh-Hans'],...text}
+      }else if(update.kind==='actorImages'){
+        const cfg=settings.actor_hosting
+        if(!cfg.enabled)throw '请先在设置 → 媒体服务器中启用演员头像托管'
+        if(!cfg.directory||!/^https?:\/\//.test(cfg.base_url))throw '请填写头像保存目录和 HTTP(S) URL 前缀'
+        const images:NonNullable<Metadata['hosted_actor_images']>={}
+        for(const actor of after.actors){if(!actor.thumb)continue;const file='a'.repeat(64)+'.png';images[actor.thumb]={file,url:cfg.base_url.replace(/\/+$/,'')+'/'+file}}
+        if(!Object.keys(images).length)throw '没有可发布的演员头像，请先更新演员来源'
+        after.hosted_actor_images=images
+        changes.push({field:'hosted_actor_images',before:detail.meta.hosted_actor_images??{},after:images})
+      }else if(update.kind==='textVersion'){
         if(!/^[a-zA-Z]{2,8}(?:-[a-zA-Z0-9]{1,8})*$/.test(update.language))throw '语言标签须为 BCP 47，如 zh-Hans、en 或 ja'
         recoverText(after);const canonical=update.language.split('-').map((p,i)=>i===0?p.toLowerCase():p.length===4?p[0].toUpperCase()+p.slice(1).toLowerCase():p.length===2?p.toUpperCase():p.toLowerCase()).join('-');const version=after.text_versions!.localized[canonical]??={}
         for(const field of ['title','plot'] as const){const value=update.text[field];if(value!=null){version[field]=value;version.provenance={...version.provenance,[field]:'manual'};if(update.select&&!after.locked_fields?.includes(field)){after[field]=value;after.provenance={...after.provenance,[field]:`localized:${canonical}`}}}}

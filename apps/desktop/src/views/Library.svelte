@@ -204,6 +204,8 @@
   function clearFilters() { browser.query = cleanQuery({}); browser.scroll = 0; debounced = '' }
 </script>
 
+<svelte:window onpagehide={persistBrowser} />
+
 {#snippet libraryTabs()}
 <div class="tabs" role="tablist" aria-label="媒体库内容" style="--i:{tab === 'done' ? 0 : 1}">
       <span class="thumb" aria-hidden="true"></span>
@@ -253,7 +255,7 @@
     <PendingListView onloaded={onPending} />
   {:else}
   {#key app.settings?.library_root}
-  <PosterWall {query} layout={browser.layout} density={browser.density} initialScroll={browser.scroll} onscrollposition={value => browser.scroll = value} version={app.libraryVersion} onopen={openCard} onmenu={(card, x, y) => (menu = { card, x, y })} ontotal={(n) => (total = n)} onloading={(busy) => (listLoading = busy)}>
+  <PosterWall {query} layout={browser.layout} posterScale={browser.posterScale} gridMode={browser.gridMode} columns={browser.columns} visibleRows={browser.visibleRows} initialScroll={browser.scroll} onscrollposition={value => browser.scroll = value} version={app.libraryVersion} onopen={openCard} onmenu={(card, x, y) => (menu = { card, x, y })} ontotal={(n) => (total = n)} onloading={(busy) => (listLoading = busy)}>
     {#snippet empty()}
       {#if filtered}
         <Empty icon="search" title="没有匹配的影片" description="换个关键词,或清除筛选条件试试。">
@@ -286,7 +288,7 @@
 {/if}
 
 <style>
-  .lib { height: 100%; display: flex; flex-direction: column; }
+  .lib { height: 100%; min-height:360px; display: flex; flex-direction: column; }
   .commands-mobile { display:none; }
   header { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:8px 24px; padding:16px 24px 12px; }
   .title { display:flex; align-items:baseline; flex-wrap:wrap; gap:12px; }

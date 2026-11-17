@@ -77,7 +77,7 @@ fn write_frame(writer:&mut impl Write,value:&impl Serialize)->io::Result<u64>{
     #[cfg(test)] metrics::record(bytes);
     Ok(bytes)
 }
-fn sync_parent(p:&Path)->io::Result<()> {#[cfg(unix)] fs::File::open(p.parent().ok_or_else(changed)?)?.sync_all()?;Ok(())}
+fn sync_parent(p:&Path)->io::Result<()> {#[cfg(unix)] crate::durable_fs::sync_directory(p.parent().ok_or_else(changed)?)?;Ok(())}
 fn handle(path:&Path)->io::Result<same_file::Handle>{crate::append::regular(path)?;same_file::Handle::from_path(path)}
 /// Open without truncation first: stale ordinary atomic-write files are reusable,
 /// while a link, substituted path, or shared inode must never clobber old history.
@@ -317,7 +317,7 @@ mod growth_tests {
                 j.status=JournalStatus::Partial;j.persist_progress().unwrap();
                 for i in 0..n {
                     let op=Op::WriteFile{path:root.path().join(format!("{i}.nfo")),content:String::new()};
-                    let proof=Proof{stage:root.path().join(format!(".kiroku-{}-{i}.tmp",j.id)),digest:"00".repeat(32),link:None,source_proof:None};
+                    let proof=Proof{stage:root.path().join(format!(".kiroku-{}-{i}.tmp",j.id)),digest:"00".repeat(32),link:None,source_proof:None,published_identity:None};
                     j.items.push(JournalItem{code:format!("ABC-{i:05}"),dir:root.path().to_path_buf()});
                     j.pending=Some(Pending{op:op.clone(),proof:proof.clone()});j.persist_progress().unwrap();
                     j.push_ops([op]);j.proofs.insert(i,proof);j.pending=None;j.persist_progress().unwrap();

@@ -81,7 +81,7 @@ async fn split_same_code_retained_parts_are_rejected_without_disk_effects() {
             let scan = pipeline::scan(
                 &[input.clone()],
                 Some(&root),
-                &Default::default(),
+                &kiroku_core::video_filter::VideoFilter::none(),
                 &cancel,
                 &mut |_| {},
             );
@@ -359,7 +359,7 @@ async fn retained_multipart_import_rebuilds_all_parts_with_confined_proofs() {
         let scan = pipeline::scan(
             &[input.clone()],
             Some(&root),
-            &Default::default(),
+            &kiroku_core::video_filter::VideoFilter::none(),
             &cancel,
             &mut |_| {},
         );

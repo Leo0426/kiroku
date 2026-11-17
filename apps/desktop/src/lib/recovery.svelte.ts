@@ -1,9 +1,13 @@
 import {api} from './api'
 import type {RecoveryEntry} from './types'
+const acknowledgedKey=(root:string)=>`kiroku-recovery-acknowledged-v1:${root}`
+const fingerprint=(e:RecoveryEntry)=>JSON.stringify([e.id,e.kind,e.codes,e.pendingOperations,e.message,e.canUndo])
 const cacheKey=(root:string)=>`kiroku-recovery-v1:${root}`
 export class RecoveryStore {
  root=$state<string|null>(null)
  entries=$state<RecoveryEntry[]>([])
+ private acknowledged=$state<string[]>([])
+ visibleEntries=$derived(this.entries.filter(e=>!this.acknowledged.includes(fingerprint(e))))
  loading=$state(false)
  stale=$state(true)
  error=$state('')
@@ -16,9 +20,20 @@ export class RecoveryStore {
    return value.filter((e:RecoveryEntry)=>e&&typeof e.id==='string'&&['partial','pending','corrupt'].includes(e.kind)&&Array.isArray(e.codes)&&e.codes.every(c=>typeof c==='string')&&typeof e.message==='string'&&typeof e.canUndo==='boolean'&&Number.isInteger(e.pendingOperations)&&e.pendingOperations>=0).filter((e:RecoveryEntry)=>{if(ids.has(e.id))return false;ids.add(e.id);return true}).slice(0,1000)
   }catch{return []}
  }
+ private readAcknowledged(root:string):string[]{
+  try{const value=JSON.parse(localStorage.getItem(acknowledgedKey(root))??'[]');return Array.isArray(value)?value.filter((v:unknown):v is string=>typeof v==='string'):[]}catch{return []}
+ }
+ acknowledge(){
+  const root=this.root
+  if(!root||root!==this.currentRoot()||this.loading||this.busyId)return
+  const next=[...new Set([...this.acknowledged,...this.visibleEntries.map(fingerprint)])]
+  // Persist before hiding: storage failure must not claim a durable acknowledgement.
+  localStorage.setItem(acknowledgedKey(root),JSON.stringify(next))
+  this.acknowledged=next
+ }
  async refresh(){
   const root=this.currentRoot(),g=++this.generation
-  if(this.root!==root){this.root=root;this.entries=root?this.cached(root):[];this.error='';this.stale=true}
+  if(this.root!==root){this.root=root;this.acknowledged=root?this.readAcknowledged(root):[];this.entries=root?this.cached(root):[];this.error='';this.stale=true}
   if(!root){this.loading=false;return}
   this.loading=true;this.stale=true;this.error=''
   try{const result=await api.recoveryInspect();if(g!==this.generation||root!==this.currentRoot())return;if(result.root!==root)throw '媒体库已变化，请重新检查';this.entries=result.entries;this.stale=false;try{localStorage.setItem(cacheKey(root),JSON.stringify(this.entries))}catch{ /* Display still works when browser storage is unavailable. */ }}

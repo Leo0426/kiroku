@@ -33,6 +33,8 @@ pub struct Change {
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct Preview {
+    #[serde(skip)]
+    actor_cache: Option<crate::actor_hosting::CachePlan>,
     pub root: PathBuf,
     pub dir: PathBuf,
     pub code: String,
@@ -181,6 +183,9 @@ pub fn prepare(root: &Path, dir: &Path, code: &str, after: Metadata) -> io::Resu
     if before.artwork_phase != after.artwork_phase {
         changes.push(Change { field: "artwork_phase".into(), before: serde_json::to_value(&before.artwork_phase)?, after: serde_json::to_value(&after.artwork_phase)? });
     }
+    if before.hosted_actor_images != after.hosted_actor_images {
+        changes.push(Change { field: "hosted_actor_images".into(), before: serde_json::to_value(&before.hosted_actor_images)?, after: serde_json::to_value(&after.hosted_actor_images)? });
+    }
     if before.favorite != after.favorite {
         changes.push(Change { field: "favorite".into(), before: before.favorite.into(), after: after.favorite.into() });
     }
@@ -210,6 +215,7 @@ pub fn prepare(root: &Path, dir: &Path, code: &str, after: Metadata) -> io::Resu
     ];
     root_guard.verify()?;dir_guard.verify()?;
     Ok(Preview {
+        actor_cache: None,
         root_guard,dir_guard,
         root,
         dir,
@@ -223,6 +229,15 @@ pub fn prepare(root: &Path, dir: &Path, code: &str, after: Metadata) -> io::Resu
     })
 }
 impl Preview {
+    pub fn with_actor_cache(mut self, cache: crate::actor_hosting::CachePlan, warnings: Vec<String>) -> io::Result<Self> {
+        let input = self.inputs.first_mut().ok_or_else(|| io::Error::other("缺少 NFO 输入"))?;
+        let bytes = read(&input.path)?;
+        if bytes.as_ref().map(|b| digest(b)) != input.expected { return Err(io::Error::other("预览期间 NFO 已变化")); }
+        input.bytes = crate::nfo::merge_actor_export(
+            std::str::from_utf8(&input.bytes).map_err(io::Error::other)?, &self.after,
+        )?.into_bytes();
+        self.actor_cache = Some(cache); self.warnings.extend(warnings); Ok(self)
+    }
     /// Explicit export rewrites only language-owned nodes, even if the selected language is unchanged.
     pub fn for_language_export(mut self)->io::Result<Self>{
         let input=self.inputs.first_mut().ok_or_else(||io::Error::other("缺少 NFO 输入"))?;
@@ -312,6 +327,7 @@ pub fn apply(preview: &Preview) -> io::Result<Outcome> {
             return Err(io::Error::other("预览后磁盘内容已变化，请重新预览"));
         }
     }
+    if let Some(cache) = &preview.actor_cache { cache.publish()?; }
     let mut journal = Journal::new(&preview.root);
     journal.items.push(JournalItem {
         code: preview.code.clone(),
@@ -323,7 +339,7 @@ pub fn apply(preview: &Preview) -> io::Result<Outcome> {
         .filter(|input| input.expected.as_deref() != Some(digest(&input.bytes).as_str()))
         .cloned()
         .collect::<Vec<_>>();
-    if changed.is_empty() {
+    if changed.is_empty() && preview.actor_cache.is_none() {
         return Err(io::Error::other("没有需要保存的内容变化"));
     }
     let error = journal.replace_files_observed(&changed,&mut |_| {

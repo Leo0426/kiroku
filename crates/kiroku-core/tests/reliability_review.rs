@@ -30,7 +30,7 @@ fn plans(root: &Path, incoming: &Path) -> Vec<pipeline::PlanItem> {
     let scan = pipeline::scan(
         &[incoming.to_path_buf()],
         Some(root),
-        &Default::default(),
+        &kiroku_core::video_filter::VideoFilter::none(),
         &CancellationToken::new(),
         &mut |_| {},
     );
@@ -137,7 +137,7 @@ fn maintenance_keeps_completed_counts_when_a_later_path_disappears() {
     j.proofs.insert(
         0,
         kiroku_core::journal::Proof {
-            link: None, source_proof: None,
+            link: None, source_proof: None, published_identity: None,
             stage: stage.clone(),
             digest: "previous".into(),
         },
@@ -210,7 +210,7 @@ fn missing_new_library_requires_explicit_creation_intent() {
     let scan = pipeline::scan(
         &[t.path().to_path_buf()],
         Some(&root),
-        &Default::default(),
+        &kiroku_core::video_filter::VideoFilter::none(),
         &CancellationToken::new(),
         &mut |_| {},
     );
@@ -262,7 +262,7 @@ async fn root_lost_during_image_preparation_is_not_recreated_by_final_save() {
     let scan = pipeline::scan(
         &[incoming],
         Some(&root),
-        &Default::default(),
+        &kiroku_core::video_filter::VideoFilter::none(),
         &CancellationToken::new(),
         &mut |_| {},
     );

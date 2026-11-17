@@ -233,6 +233,8 @@ pub struct Scraper {
     breaker: std::sync::Mutex<Breaker>,
     sources: Vec<Box<dyn Source>>,
     translator: Option<crate::translate::Translator>,
+    import_cache: Option<crate::import_cache::ImportCache>,
+    cached_sources_only: bool,
 }
 
 /// 页面里是否出现了番号的常见写法(`midv-018`、`midv018`、DMM cid `midv00018`),不区分大小写。
@@ -300,6 +302,16 @@ impl Scraper {
         self
     }
 
+    /// Persist each successful source independently; configuration checks still apply on reuse.
+    pub fn with_import_cache(mut self,path:PathBuf)->Self {
+        self.import_cache=Some(crate::import_cache::ImportCache::new(path.clone()));
+        self.http=self.http.with_image_cache(path,crate::import_cache::image_scope(&self.settings));
+        self
+    }
+
+    /// Resume a prepared batch without re-requesting missing source sites. Missing cache stays missing.
+    pub fn with_cached_sources_only(mut self)->Self {self.cached_sources_only=true;self}
+
     /// Dependency injection for callers using custom source implementations.
     pub fn with_sources(settings: Settings, sources: Vec<Box<dyn Source>>) -> Result<Self, String> {
         let http = settings.build_http().map_err(|e| e.to_string())?;
@@ -316,6 +328,8 @@ impl Scraper {
             breaker: Default::default(),
             sources,
             translator,
+            import_cache: None,
+            cached_sources_only: false,
         })
     }
 
@@ -326,7 +340,7 @@ impl Scraper {
         cancel: &CancellationToken,
         on_site: &(dyn Fn(&str) + Send + Sync),
     ) -> Result<Metadata, ScrapeError> {
-        self.scrape_cached(code, &Default::default(), true, cancel, on_site)
+        self.scrape_cached(code, &Default::default(), false, cancel, on_site)
             .await
     }
 
@@ -340,7 +354,13 @@ impl Scraper {
         cancel: &CancellationToken,
         on_site: &(dyn Fn(&str) + Send + Sync),
     ) -> Result<Metadata, ScrapeError> {
-        self.scrape_with(code, cached, force, None, cancel, on_site).await
+        let mut combined=std::collections::BTreeMap::new();
+        if !force {if let Some(cache)=self.import_cache.clone(){
+            let code=code.clone();let sites=self.settings.sources.iter().map(|s|s.id.clone()).collect::<Vec<_>>();
+            combined=tokio::task::spawn_blocking(move||sites.into_iter().filter_map(|site|cache.source(&code,&site).map(|s|(site,s))).collect()).await.unwrap_or_default();
+        }}
+        combined.extend(cached.clone());
+        self.scrape_with(code, &combined, force, None, cancel, on_site).await
     }
 
     /// 用户指定某站详情页:该站使用这一页的结果(不搜索),路线上的其他站照常查询;
@@ -427,17 +447,31 @@ impl Scraper {
                     continue;
                 }
             }
+            if self.cached_sources_only {not_found+=1;continue;}
             if let Some(reason) = self.breaker.lock().unwrap_or_else(|e| e.into_inner()).paused.get(site.as_str()) {
                 paused.push(format!("{site}: 来源暂停(本批连续 {PAUSE_AFTER} 次失败:{reason}),可稍后重试未完成项"));
                 continue;
             }
             slots.push(Slot::Fetch(s.as_ref(), cfg));
         }
-        let fetching: Vec<_> = slots.iter().filter_map(|slot| match slot { Slot::Fetch(s, _) => Some(*s), Slot::Ready(..) => None }).collect();
+        let fetching: Vec<_> = slots.iter().filter_map(|slot| match slot { Slot::Fetch(s, cfg) => Some((*s,*cfg)), Slot::Ready(..) => None }).collect();
+        let reused=slots.iter().filter(|s|matches!(s,Slot::Ready(..))).count();
+        if reused>0 {log::info!(target:"kiroku::scrape","{} 复用 {reused} 个来源缓存",code.id);}
         if !fetching.is_empty() {
-            on_site(&fetching.iter().map(|s| s.id()).collect::<Vec<_>>().join(","));
+            on_site(&fetching.iter().map(|(s,_)| s.id()).collect::<Vec<_>>().join(","));
         }
-        let requests = fetching.iter().map(|s| s.fetch(code, self.source_http.get(s.id()).unwrap_or(&self.http)));
+        let requests = fetching.iter().map(|(s,cfg)| async move {
+            let result=s.fetch(code,self.source_http.get(s.id()).unwrap_or(&self.http)).await;
+            if pinned_id.is_none() {if let (Some(cache),Ok(part))=(self.import_cache.clone(),&result){
+                if crate::metadata::usable_partial(part){
+                    let snapshot=crate::metadata::SourceSnapshot::configured(code,cfg,self.settings.proxy_for(cfg),part);
+                    let code=code.clone();let site=s.id();
+                    let saved=tokio::task::spawn_blocking(move||cache.save_source(&code,site,&snapshot)).await;
+                    if !matches!(saved,Ok(Ok(()))){log::warn!(target:"kiroku::scrape","来源缓存保存失败，本次结果仍可使用");}
+                }
+            }}
+            result
+        });
         let mut fetched = tokio::select! {
             biased; // on_site 也可能同步取消；取消与来源结果同时就绪时优先取消。
             _ = cancel.cancelled() => return Err(ScrapeError::Cancelled),
@@ -1093,18 +1127,23 @@ pub struct ApplyOutcome {
 // 整理后清理原文件夹
 // ---------------------------------------------------------------------------
 
-/// 目录(含子目录)里是否还有正片视频;样片/预告、黑名单、过小的视频不算(与扫描同一套规则),不阻止清理。
-fn has_main_video(dir: &Path, filter: &VideoFilter) -> bool {
-    WalkDir::new(dir).into_iter().filter_map(Result::ok).filter(|e| e.file_type().is_file()).any(|e| {
-        let name = e.file_name().to_string_lossy();
+/// 剩余正片或因体积跳过的视频都阻止清理;无法确认的目录、链接与文件也保留。
+fn has_retained_video(dir: &Path, filter: &VideoFilter) -> bool {
+    WalkDir::new(dir).into_iter().any(|entry| {
+        let Ok(entry) = entry else { return true };
+        if entry.file_type().is_symlink() { return true; }
+        if !entry.file_type().is_file() { return false; }
+        let name = entry.file_name().to_string_lossy();
         let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-        VIDEO_EXT.contains(&ext.as_str()) && filter.skip(&name, std::fs::metadata(e.path()).ok().map(|m| m.len())).is_none()
+        if !VIDEO_EXT.contains(&ext.as_str()) { return false; }
+        let Ok(metadata) = entry.metadata() else { return true };
+        filter.preserves_small_video(metadata.len()) || filter.skip(&name, Some(metadata.len())).is_none()
     })
 }
 
 /// 把整理后空出来的原文件夹交给 `trash`(通常是移到系统废纸篓)。
 /// 只处理位于某个待整理根目录**之内**的文件夹(根目录本身永远保留);
-/// 里面还剩正片视频的不动;清掉子目录后若上级也空了,继续向上直到根目录。
+/// 里面还剩正片或小视频的不动;清掉子目录后若上级也空了,继续向上直到根目录。
 pub fn cleanup_sources(moved_from: &[PathBuf], roots: &[PathBuf], filter: &VideoFilter, trash: &dyn Fn(&Path) -> io::Result<()>) -> Vec<PathBuf> {
     let inside_root = |d: &Path| roots.iter().any(|r| d != r.as_path() && d.starts_with(r));
     let mut dirs: Vec<PathBuf> = moved_from.iter().filter_map(|f| f.parent().map(Path::to_path_buf)).collect();
@@ -1115,7 +1154,7 @@ pub fn cleanup_sources(moved_from: &[PathBuf], roots: &[PathBuf], filter: &Video
     for d in dirs {
         let mut cur = Some(d);
         while let Some(dir) = cur {
-            if !seen.insert(dir.clone()) || !inside_root(&dir) || !dir.is_dir() || has_main_video(&dir, filter) {
+            if !seen.insert(dir.clone()) || !inside_root(&dir) || !dir.is_dir() || has_retained_video(&dir, filter) {
                 break;
             }
             if trash(&dir).is_err() {
@@ -1461,7 +1500,7 @@ mod tests {
     }
 
     fn scanned(roots: &[PathBuf], exclude: Option<&Path>) -> ScanResult {
-        scan(roots, exclude, &VideoFilter::default(), &CancellationToken::new(), &mut |_| {})
+        scan(roots, exclude, &VideoFilter::new(&crate::video_filter::ScanCfg { min_video_mb: 0, ..Default::default() }), &CancellationToken::new(), &mut |_| {})
     }
 
     #[test]
@@ -1493,13 +1532,13 @@ mod tests {
         write("tiny.mp4", 10);
         let root = [d.path().join("in")];
         let names = |r: &ScanResult| { let mut v: Vec<_> = r.items.iter().map(|i| i.path.file_name().unwrap().to_string_lossy().into_owned()).collect(); v.sort(); v };
-        // 默认:只跳过样片/预告片
+        // 关闭大小限制时:只跳过样片/预告片
         let r = scanned(&root, None);
         assert_eq!(names(&r), ["SMPL-001-C.mp4", "tiny.mp4", "最新地址.mp4"]);
         assert_eq!(r.skipped.len(), 2);
         assert!(r.skipped.iter().all(|s| s.reason == SkipReason::Extra && s.size == 4096));
         // 黑名单(广告)
-        let cfg = crate::video_filter::ScanCfg { blacklist: vec!["最新地址".into(), "^tiny".into()], ..Default::default() };
+        let cfg = crate::video_filter::ScanCfg { blacklist: vec!["最新地址".into(), "^tiny".into()], min_video_mb: 0, ..Default::default() };
         let r = scan(&root, None, &VideoFilter::new(&cfg), &CancellationToken::new(), &mut |_| {});
         assert_eq!(names(&r), ["SMPL-001-C.mp4"]);
         assert_eq!(r.skipped.iter().filter(|s| s.reason == SkipReason::Blacklisted).count(), 2);
@@ -1976,7 +2015,7 @@ mod tests {
         let mut settings = Settings::default();
         settings.routes.insert(crate::code::ContentType::Censored, vec!["fixture".into()]);
         settings.sources.push(crate::settings::SourceCfg { id: "fixture".into(), enabled: true, base: String::new(), cookie: String::new(), api_base: String::new(), proxy: Default::default(), solver: false });
-        let sc = Scraper { settings, http: http(), source_http: HashMap::new(), breaker: Default::default(), sources: vec![Box::new(FakeSource(calls.clone()))], translator: None };
+        let sc = Scraper { settings, http: http(), source_http: HashMap::new(), breaker: Default::default(), sources: vec![Box::new(FakeSource(calls.clone()))], translator: None, import_cache: None, cached_sources_only: false };
         let codes = ["AAA-111.mp4", "BBB-222.mp4", "CCC-333-CD1.mp4", "CCC-333-CD2.mp4"].map(|name| parse_code(name).unwrap());
         let successes = HashMap::from([("AAA-111".into(), meta("AAA-111")), ("BBB-222".into(), meta("BBB-222"))]);
         let before = successes.clone();
@@ -2537,6 +2576,7 @@ mod tests {
         // A:整理后只剩垃圾文件和样片 → 清理
         touch(&root.join("A/info.txt"));
         touch(&root.join("A/sample.mp4"));
+        fs::OpenOptions::new().write(true).open(root.join("A/sample.mp4")).unwrap().set_len(100 * 1024 * 1024).unwrap();
         // B:还剩一部没整理的正片 → 保留
         touch(&root.join("B/OTHER-001.mp4"));
         // C/sub:子目录清掉后,C 也空了 → 一并清理,只报告最外层

@@ -2,6 +2,8 @@
 //! 不依赖任何 UI / 服务化外壳，CLI 与 Tauri 共用。
 
 pub mod aggregate;
+pub mod actor_image;
+pub mod actor_hosting;
 pub mod assets;
 pub mod badge;
 pub mod code;
@@ -50,3 +52,9 @@ pub mod localization;
 pub mod recovery;
 
 pub mod batch_edit;
+
+mod durable_fs;
+
+pub mod import_cache;
+
+pub mod nas_ops;

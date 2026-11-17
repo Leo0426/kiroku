@@ -254,11 +254,11 @@ fn restore_permissions(path: &Path, r: &Replacement) -> io::Result<()> {
         permissions.set_readonly(readonly);
         fs::set_permissions(path, permissions)?;
     }
-    fs::File::open(path)?.sync_all()
+    crate::durable_fs::sync_file(path)
 }
 fn sync_parent(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
-    fs::File::open(path.parent().ok_or_else(|| io::Error::other("无父目录"))?)?.sync_all()?;
+    crate::durable_fs::sync_directory(path.parent().ok_or_else(|| io::Error::other("无父目录"))?)?;
     Ok(())
 }
 fn conflict(path: &Path) -> io::Error {

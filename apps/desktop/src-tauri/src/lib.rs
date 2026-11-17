@@ -15,6 +15,7 @@ pub fn run() {
     // 设置文件损坏时不覆盖它:用默认值启动,保存时才会写入
     let settings = Settings::load(&Settings::default_path()).unwrap_or_default();
     logging::init(logging::log_dir(&Settings::default_path()), &settings.log);
+    if let Err(e)=kiroku_core::nas_ops::configure_file(&Settings::default_path()){log::error!("NAS 配置加载失败：{e}");}
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -22,6 +23,18 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .manage(AppState::new(settings))
         .setup(|app| {
+            // 默认展示更多内容，同时避开小屏幕的菜单栏、Dock 和窗口标题栏。
+            if let Some(window) = app.get_webview_window("main") {
+                if let Ok(Some(monitor)) = window.current_monitor() {
+                    let area = monitor.work_area();
+                    let scale = monitor.scale_factor();
+                    let width = (area.size.width as f64 / scale - 32.0).clamp(320.0, 1280.0);
+                    let height = (area.size.height as f64 / scale - 64.0).clamp(240.0, 860.0);
+                    window.set_min_size(Some(tauri::LogicalSize::new(width.min(720.0), height.min(520.0))))?;
+                    window.set_size(tauri::LogicalSize::new(width, height))?;
+                    window.center()?;
+                }
+            }
             #[cfg(target_os = "macos")]
             macos_shutdown::install(app.handle())?;
             // App 内日志:转成 log:line 事件,带上当前任务的 jobId(无任务时为 0)
@@ -92,8 +105,10 @@ fn command_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send +
             commands::scrape_start,
             commands::scrape_url_start,
             commands::translation_cache_clear,
+            commands::import_cache_clear,
             commands::notify_finish,
             commands::tag_preset_merge,
+            commands::name_translation,
             commands::plan_build,
             commands::apply_start,
             commands::job_cancel,
@@ -115,6 +130,7 @@ fn command_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send +
             commands::library_export_csv,
             commands::library_prune_missing,
             commands::library_get,
+            commands::actor_image,
             commands::library_trash,
             commands::repair_images_start,
             commands::library_facets,

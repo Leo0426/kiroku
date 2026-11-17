@@ -19,6 +19,12 @@ fn normal_scrape_command_reuses_disk_metadata_and_indexes_appended_part() {
     lib.reindex_dir(&d).unwrap();
     drop(lib);
     fs::write(source.join("ABC-123-CD2.mp4"), b"two").unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(source.join("ABC-123-CD2.mp4"))
+        .unwrap()
+        .set_len(100 * 1024 * 1024)
+        .unwrap();
     let mut settings = Settings {
         cleanup_source: false,
         ..Default::default()

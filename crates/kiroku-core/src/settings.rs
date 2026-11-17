@@ -124,6 +124,8 @@ pub struct Settings {
     pub retention: crate::maintenance::RetentionPolicy,
     #[serde(default)]
     pub plex: PlexCfg,
+    #[serde(default)]
+    pub actor_hosting: crate::actor_hosting::Config,
     /// Jellyfin / Emby 联动(ADR-0010),与 Plex 可同时启用
     #[serde(default)]
     pub media_server: crate::media_server::MediaServerCfg,
@@ -210,6 +212,7 @@ impl Default for Settings {
             cleanup_source: true,
             retention: Default::default(),
             plex: PlexCfg::default(),
+            actor_hosting: Default::default(),
             media_server: Default::default(),
             log: Default::default(),
             scan: Default::default(),
@@ -278,6 +281,7 @@ impl Settings {
     /// 校验:引用的数据源必须存在;字段名合法;间隔不得为 0;模板非空。
     pub fn validate(&self) -> Result<(), String> {
         self.name_rules.validate()?;
+        self.actor_hosting.validate()?;
         self.ai.validate()?;
         if let Some(c) = self.sources.iter().find(|c| matches!(&c.proxy, SourceProxy::Custom { url } if reqwest::Proxy::all(url.trim()).is_err() || url.trim().is_empty())) {
             return Err(format!("数据源 {} 的自定义代理地址无效", c.id));

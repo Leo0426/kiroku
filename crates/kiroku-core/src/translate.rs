@@ -16,6 +16,8 @@ use serde_json::json;
 use std::{collections::HashMap, path::{Path, PathBuf}, sync::Mutex, time::Duration};
 
 mod config;
+mod names;
+pub use names::{suggest_name, NameKind};
 mod protocol;
 pub use config::{AiCfg, AiProtocol, AiProvider, OutputFormat};
 pub use protocol::{build_request, parse_response};
@@ -161,23 +163,7 @@ impl Translator {
 
     /// 按所选协议请求;只翻译传入的字段。
     async fn request(&self, title: Option<&str>, plot: Option<&str>) -> Result<Translated, String> {
-        let url = self.provider.endpoint()?;
-        let mut request = self.client.post(url).header("content-type", "application/json");
-        request = match self.provider.protocol {
-            AiProtocol::Anthropic => {
-                let r = request.header("x-api-key", self.provider.api_key.trim()).header("anthropic-version", "2023-06-01");
-                if self.provider.anthropic_fallback { r.header("anthropic-beta", "server-side-fallback-2026-07-01") } else { r }
-            },
-            AiProtocol::Openai => request.bearer_auth(self.provider.api_key.trim()),
-        };
-        let r = request.body(build_request(&self.provider, title, plot).to_string()).send().await
-            .map_err(|e| if e.is_timeout() { "请求超时".to_string() } else { "连不上 AI 服务，请检查地址、网络和 API Key 格式".to_string() })?;
-        let status = r.status().as_u16();
-        let body = r.text().await.map_err(|e| e.to_string())?;
-        if status != 200 {
-            return Err(http_error(status, &body));
-        }
-        let v: Value = serde_json::from_str(&body).map_err(|e| format!("响应不是 JSON:{e}"))?;
+        let v = self.send(build_request(&self.provider, title, plot)).await?;
         let mut t = parse_response(self.provider.protocol, &v)?;
         if (title.is_some() && t.title.is_none()) || (plot.is_some() && t.plot.is_none()) {
             return Err("模型没有返回请求字段的译文".into());
@@ -191,6 +177,27 @@ impl Translator {
         }
         Ok(t)
     }
+    async fn send(&self, payload: Value) -> Result<Value, String> {
+        let url = self.provider.endpoint()?;
+        let mut request = self.client.post(url).header("content-type", "application/json");
+        request = match self.provider.protocol {
+            AiProtocol::Anthropic => {
+                let r = request.header("x-api-key", self.provider.api_key.trim()).header("anthropic-version", "2023-06-01");
+                if self.provider.anthropic_fallback { r.header("anthropic-beta", "server-side-fallback-2026-07-01") } else { r }
+            },
+            AiProtocol::Openai => request.bearer_auth(self.provider.api_key.trim()),
+        };
+        let r = request.body(payload.to_string()).send().await
+            .map_err(|e| if e.is_timeout() { "请求超时".to_string() } else { "连不上 AI 服务，请检查地址、网络和 API Key 格式".to_string() })?;
+        let status = r.status().as_u16();
+        let body = r.text().await.map_err(|e| e.to_string())?;
+        if status != 200 {
+            return Err(http_error(status, &body));
+        }
+        let v: Value = serde_json::from_str(&body).map_err(|e| format!("响应不是 JSON:{e}"))?;
+        Ok(v)
+    }
+
 }
 
 #[cfg(test)]
@@ -233,6 +240,26 @@ mod tests {
         c.providers[0].api_key = "k".into();
         c.providers[0].base_url = base_url.into();
         c
+    }
+
+    #[tokio::test]
+    async fn single_movie_translation_preserves_originals_and_locked_fields() {
+        let (url, seen) = fake_api();
+        let mut movie = crate::Metadata::default();
+        movie.fields.title = Some("Locked title".into());
+        movie.text_versions.original.title = Some("海辺の旅行".into());
+        movie.text_versions.original.plot = Some("町を歩く。".into());
+        movie.locked_fields.insert("title".into());
+        let after = crate::localization::translate_movie(&movie, cfg(&url)).await.unwrap();
+        assert_eq!(after.fields.title, movie.fields.title);
+        assert_eq!(after.text_versions.original, movie.text_versions.original);
+        assert_eq!(after.fields.plot.as_deref(), Some("译:町を歩く。"));
+        assert_eq!(after.text_versions.localized["zh-Hans"].provenance["plot"], "ai");
+        assert!(seen.lock().unwrap()[0]["title"].as_str().unwrap_or("").is_empty());
+        movie.locked_fields.insert("plot".into());
+        assert!(crate::localization::translate_movie(&movie, cfg(&url)).await.unwrap_err().contains("没有可翻译"));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert!(crate::localization::translate_movie(&movie, AiCfg::default()).await.unwrap_err().contains("启用"));
     }
 
     #[tokio::test]

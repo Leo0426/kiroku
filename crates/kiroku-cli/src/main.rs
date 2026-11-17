@@ -13,7 +13,7 @@ use walkdir::WalkDir;
 
 fn usage() -> ExitCode {
     eprintln!(
-        "kiroku <command>\n\n  nfo-export <影片目录> [更多目录] --root <库目录> --language current|zh-Hans|original [--apply]   原位预览并导出 NFO，可用日志撤销\n  catalog names <preview|apply> <库目录> <影片目录...>  应用名称规则（明确选择影片）\n  maintenance <库目录> [--history-days 90] [--log-days 90] [--apply]   预览安全清理\n  health <库目录>   只读媒体库检查（JSON）\n  sources-check [source-id]   检测当前启用来源\n  append <code> <path> --root <库目录> [--target <影片目录>] [--video <字幕目标视频>] [--mode move|copy|hardlink|symlink] [--apply]   安全追加，默认预览\n  parse <path>           扫描目录/文件，输出番号、内容类型、分集、字幕、马赛克、清晰度 (JSON lines)\n  poc <javdb|dmm|url> [n] [reqwest|wreq]   反爬 PoC(wreq 需 --features wreq)，代理用环境变量 KIROKU_PROXY\n  scrape <dir> --out <库目录> [--tpl <模板>] [--create-library] [--mode move|copy|hardlink|symlink] [--keep-versions] [--apply]   刮削并整理;默认 dry-run,--apply 才落盘;--keep-versions 把同分片的不同内容作为新版本并存\n  scrape-url <文件名或番号> <详情页URL> [--config <设置>]   用指定站点详情页刮削一部影片，只输出预览（JSON）
+        "kiroku <command>\n\n  nfo-export <影片目录> [更多目录] --root <库目录> --language current|zh-Hans|original [--apply]   原位预览并导出 NFO，可用日志撤销\n  catalog names <preview|apply> <库目录> <影片目录...>  应用名称规则（明确选择影片）\n  maintenance <库目录> [--history-days 90] [--log-days 90] [--apply]   预览安全清理\n  health <库目录>   只读媒体库检查（JSON）\n  sources-check [source-id]   检测当前启用来源\n  append <code> <path> --root <库目录> [--target <影片目录>] [--video <字幕目标视频>] [--mode move|copy|hardlink|symlink] [--apply]   安全追加，默认预览\n  parse <path>           扫描目录/文件，输出番号、内容类型、分集、字幕、马赛克、清晰度 (JSON lines)\n  poc <javdb|dmm|url> [n] [reqwest|wreq]   反爬 PoC(wreq 需 --features wreq)，代理用环境变量 KIROKU_PROXY\n  scrape <dir> --out <库目录> [--tpl <模板>] [--create-library] [--mode move|copy|hardlink|symlink] [--keep-versions] [--cached-only] [--apply]   刮削并整理;默认 dry-run,--apply 才落盘;--keep-versions 把同分片的不同内容作为新版本并存\n  scrape-url <文件名或番号> <详情页URL> [--config <设置>]   用指定站点详情页刮削一部影片，只输出预览（JSON）
   rollback <journal.json>  按操作日志回滚一次整理
   index <库目录> [关键词]   从磁盘重建媒体库索引并列出前 10 部(调试用)
   template <tpl>         用示例元数据预览命名模板"
@@ -24,6 +24,8 @@ fn usage() -> ExitCode {
 #[tokio::main]
 async fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
+    let config=flag(&args,"--config").map(PathBuf::from).unwrap_or_else(Settings::default_path);
+    if let Err(e)=kiroku_core::nas_ops::configure_file(&config){eprintln!("NAS 配置加载失败：{e}");return ExitCode::FAILURE;}
     match args.first().map(String::as_str) {
         Some("catalog") if args.get(1).map(String::as_str)==Some("names") && args.len()>=4 => catalog_names(&args[2..]),
 
@@ -46,6 +48,7 @@ async fn main() -> ExitCode {
         Some("poc") if args.len() >= 2 => poc(&args[1], args.get(2).and_then(|n| n.parse().ok()).unwrap_or(50), args.get(3).map(String::as_str).unwrap_or("reqwest")).await,
         Some("scrape") if args.len() >= 2 => scrape(&args[1..]).await,
         Some("scrape-url") if args.len() >= 3 => scrape_url(&args[1], &args[2], flag(&args, "--config")).await,
+        Some("recover-pending") if args.len()>=2 => recover_pending(&args[1]),
         Some("rollback") if args.len() >= 2 => rollback(&args[1]),
         Some("index") if args.len() >= 2 => index(&args[1], args.get(2).map(String::as_str)),
         Some("template") if args.len() >= 2 => {
@@ -145,7 +148,7 @@ async fn scrape_url(name: &str, url: &str, config: Option<&str>) -> ExitCode {
     let mut settings = match Settings::load(&cfg_path) { Ok(s) => s, Err(e) => { eprintln!("设置无效 ({}): {e}", cfg_path.display()); return ExitCode::FAILURE } };
     if let Ok(p) = env::var("KIROKU_PROXY") { settings.proxy = Some(p); }
     let Some(code) = kiroku_core::code::parse_code(name).or_else(|| kiroku_core::code::parse_code(&format!("{name}.mp4"))) else { eprintln!("无法从「{name}」解析番号"); return ExitCode::from(2) };
-    let scraper = match Scraper::new(settings) { Ok(s) => s.with_translation_cache(kiroku_core::translate::cache_path(&cfg_path)), Err(e) => { eprintln!("{e}"); return ExitCode::FAILURE } };
+    let scraper = match Scraper::new(settings) { Ok(s) => s.with_translation_cache(kiroku_core::translate::cache_path(&cfg_path)).with_import_cache(kiroku_core::import_cache::cache_path(&cfg_path)), Err(e) => { eprintln!("{e}"); return ExitCode::FAILURE } };
     match scraper.scrape_url(&code, url, &cli_cancel()).await {
         Ok(m) => {
             println!("{}", serde_json::to_string_pretty(&serde_json::json!({"code": m.code, "fields": m.fields, "provenance": m.provenance, "notes": m.scrape_notes})).unwrap());
@@ -178,9 +181,11 @@ async fn scrape(args: &[String]) -> ExitCode {
     // 环境变量 KIROKU_PROXY 可临时覆盖设置里的代理
     if let Ok(p) = env::var("KIROKU_PROXY") { settings.proxy = Some(p); }
     let scraper = match Scraper::new(settings) {
-        Ok(s) => s.with_translation_cache(kiroku_core::translate::cache_path(&cfg_path)),
+        Ok(s) => s.with_translation_cache(kiroku_core::translate::cache_path(&cfg_path)).with_import_cache(kiroku_core::import_cache::cache_path(&cfg_path)),
         Err(e) => { eprintln!("{e}"); return ExitCode::FAILURE; }
     };
+
+    let scraper=if args.iter().any(|a|a=="--cached-only"){scraper.with_cached_sources_only()}else{scraper};
 
     // Ctrl-C 取消:已完成的整理仍会写日志
     let cancel = CancellationToken::new();
@@ -253,6 +258,7 @@ async fn scrape(args: &[String]) -> ExitCode {
     let roots = [src_dir.clone()];
     let cleanup = scraper.settings.cleanup_source.then_some(pipeline::Cleanup { roots: &roots, trash: pipeline::trash_to_system, filter: &filter });
     let outcome = pipeline::apply_with_progress(chosen, &scraper.http, &out, cleanup, &cancel, &|ev| {
+        eprintln!("整理进度 {}/{}",ev.done,ev.total);
         if let Some(e) = &ev.error { eprintln!("[{}/{}] {} 失败: {e}", ev.done, ev.total, ev.code); }
         for w in &ev.warnings { eprintln!("  警告 {}: {w}", ev.code); }
     }, &|progress| {
@@ -272,6 +278,14 @@ async fn scrape(args: &[String]) -> ExitCode {
     );
     for d in &outcome.cleaned { println!("已移到废纸篓: {}", d.display()); }
     if outcome.failed.is_empty() && !had_conflicts && index_errors.is_empty() { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+}
+
+fn recover_pending(path: &str) -> ExitCode {
+    let mut journal=match Journal::load(std::path::Path::new(path)){Ok(j)=>j,Err(e)=>{eprintln!("读取整理日志失败：{e}");return ExitCode::FAILURE}};
+    match journal.recover_pending(){
+        Ok(())=>{println!("中断操作已恢复，保留 {} 项已记录操作",journal.ops.len());ExitCode::SUCCESS},
+        Err(e)=>{eprintln!("中断恢复失败，文件已保留：{e}");ExitCode::FAILURE}
+    }
 }
 
 fn rollback(path: &str) -> ExitCode {

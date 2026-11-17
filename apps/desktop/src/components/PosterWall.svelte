@@ -4,7 +4,7 @@
   import { posterRequest } from '../lib/poster-requests'
   import { PosterPages, POSTER_PAGE_LIMIT, POSTER_REQUEST_LIMIT, type PosterPage } from '../lib/poster-pages'
   import type { MovieCard, Query } from '../lib/types'
-  import type { Layout, Density } from '../lib/library-browser'
+  import type { Layout } from '../lib/library-browser'
   import PosterCard from './PosterCard.svelte'
   import LoadingStatus from './LoadingStatus.svelte'
 
@@ -20,7 +20,7 @@
     ontotal,
     onloading,
     empty,
-    layout = 'posters', density = 'comfortable', initialScroll = 0, onscrollposition,
+    layout = 'posters', posterScale = 100, gridMode = false, columns = 4, visibleRows = 2, initialScroll = 0, onscrollposition,
   }: {
     query: Query
     version: number
@@ -30,7 +30,10 @@
     onloading?: (loading: boolean) => void
     empty?: Snippet
     layout?: Layout
-    density?: Density
+    posterScale?: number
+    gridMode?: boolean
+    columns?: number
+    visibleRows?: number
     initialScroll?: number
     onscrollposition?: (value: number) => void
   } = $props()
@@ -67,10 +70,15 @@
   let restore = untrack(() => initialScroll)
   let restorePending = true
 
-  const targetW = $derived(density === 'compact' ? 128 : density === 'large' ? 240 : baseW)
-  const cols = $derived(layout === 'list' ? 1 : Math.max(1, Math.floor((width + GAP) / (targetW + GAP))))
-  const cw = $derived(Math.max(1, (width - (cols - 1) * GAP) / cols))
-  const rowH = $derived(layout === 'list' ? 72 * appearance.value.textScale / 100 + 12 : (cw * 438) / 309 + cardGap + META * appearance.value.textScale / 100 + GAP)
+  const metaH = $derived(cardGap + META * appearance.value.textScale / 100)
+  const targetW = $derived(baseW * posterScale / 100)
+  const capacity = $derived(Math.max(1, Math.floor((width + GAP) / (100 + GAP))))
+  const cols = $derived(layout === 'list' ? 1 : gridMode ? Math.min(columns, capacity) : Math.max(1, Math.floor((width + GAP) / (targetW + GAP))))
+  const fitRows = $derived(Math.max(1, Math.min(visibleRows, Math.floor(height / (100 * 438 / 309 + metaH + GAP)))))
+  const columnW = $derived(Math.max(1, (width - (cols - 1) * GAP) / cols))
+  const cw = $derived(layout === 'list' ? width : gridMode ? Math.min(columnW, Math.max(100, (height / fitRows - metaH - GAP) * 309 / 438)) : Math.min(targetW, columnW))
+  const tracks = $derived(layout === 'list' ? 'minmax(0,1fr)' : `repeat(${cols},${cw}px)`)
+  const rowH = $derived(layout === 'list' ? 72 * appearance.value.textScale / 100 + 12 : (cw * 438) / 309 + metaH + GAP)
   const skeletonCount = $derived(cols * Math.max(1, Math.min(3, Math.ceil(height / rowH))))
   const rows = $derived(Math.ceil(total / cols))
   const first = $derived(Math.max(0, Math.floor(scrollTop / rowH) - OVERSCAN))
@@ -167,7 +175,7 @@
   })
   let presentation = ''
   $effect(() => {
-    const key = `${layout}:${density}`
+    const key = `${layout}:${posterScale}:${gridMode}:${columns}:${visibleRows}`
     untrack(() => {
       if (presentation && presentation !== key && scroller) {
         scroller.scrollTop = 0; scrollTop = 0; onscrollposition?.(0)
@@ -268,7 +276,7 @@
   })
 </script>
 
-<div class="scroller" tabindex="-1" role="region" aria-label="影片浏览，方向键移动，Home 和 End 跳到首尾" data-layout={layout} data-density={density} data-cached-pages={Object.keys(pages).length} data-cached-cards={Object.values(pages).reduce((n, p) => n + p.items.length, 0)} data-page-budget={Math.max(POSTER_PAGE_LIMIT, requiredPages.length)} aria-busy={busy} onwheel={() => focusTarget = null} onpointerdown={() => focusTarget = null} bind:this={scroller} onscroll={(e) => { scrollTop = e.currentTarget.scrollTop; if (!restorePending) onscrollposition?.(scrollTop) }}>
+<div class="scroller" tabindex="-1" role="region" aria-label="影片浏览，方向键移动，Home 和 End 跳到首尾" data-layout={layout} data-columns={cols} data-row-height={rowH} data-cached-pages={Object.keys(pages).length} data-cached-cards={Object.values(pages).reduce((n, p) => n + p.items.length, 0)} data-page-budget={Math.max(POSTER_PAGE_LIMIT, requiredPages.length)} aria-busy={busy} onwheel={() => focusTarget = null} onpointerdown={() => focusTarget = null} bind:this={scroller} onscroll={(e) => { scrollTop = e.currentTarget.scrollTop; if (!restorePending) onscrollposition?.(scrollTop) }}>
   <div class="loading-note">
     {#if busy}<LoadingStatus label={loaded ? '正在更新影片列表…' : query.text ? '正在查找匹配的影片…' : '正在读取媒体库…'} />{/if}
   </div>
@@ -279,14 +287,14 @@
     </div>
   {/if}
   {#if !loaded && !Object.keys(failures).length}
-    <div class="skeleton-grid" style="grid-template-columns:repeat({cols},minmax(0,1fr));gap:{GAP}px" aria-hidden="true">
+    <div class="skeleton-grid" style="grid-template-columns:{tracks};gap:{GAP}px" aria-hidden="true">
       {#each Array.from({ length: skeletonCount }) as _, i (i)}<PosterCard card={null} {layout} />{/each}
     </div>
   {:else if loaded && total === 0 && !Object.keys(failures).length}
     <div class="empty">{@render empty?.()}</div>
   {:else}
     <div class="spacer" bind:this={spacer} style="height:{rows * rowH}px">
-      <div class="grid" style="transform:translateY({first * rowH}px);grid-template-columns:repeat({cols},minmax(0,1fr));gap:{layout === 'list' ? 12 : GAP}px">
+      <div class="grid" style="transform:translateY({first * rowH}px);grid-template-columns:{tracks};gap:{layout === 'list' ? 12 : GAP}px">
         {#each indices as i (`${i}:${cardAt(i)?.code ?? 'placeholder'}`)}
           <PosterCard card={cardAt(i)} {layout} index={i} tabIndex={i === (indices.includes(focusIndex) ? focusIndex : indices[0]) ? 0 : -1} onfocus={() => { focusIndex = i; focusTarget = null }} delay={fresh ? Math.min(i - first * cols, 14) * 30 : -1} onopen={code => onopen(code, i)} {onmenu} />
         {/each}

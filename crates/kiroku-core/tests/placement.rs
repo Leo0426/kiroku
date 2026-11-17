@@ -201,7 +201,7 @@ async fn retained_multi_part_import_never_cleans_source_and_registers_all_media(
         let scan = pipeline::scan(
             &[input.clone()],
             Some(&root),
-            &Default::default(),
+            &kiroku_core::video_filter::VideoFilter::none(),
             &cancel,
             &mut |_| {},
         );

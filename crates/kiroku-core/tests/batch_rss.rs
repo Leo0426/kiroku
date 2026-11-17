@@ -76,7 +76,7 @@ async fn batch_rss() {
     let cancel = CancellationToken::new();
 
     let started = Instant::now();
-    let scanned = pipeline::scan(&[source.clone()], Some(&library), &VideoFilter::default(), &cancel, &mut |_| {});
+    let scanned = pipeline::scan(&[source.clone()], Some(&library), &VideoFilter::new(&kiroku_core::video_filter::ScanCfg { min_video_mb: 0, ..Default::default() }), &cancel, &mut |_| {});
     assert_eq!(scanned.items.len(), n);
     report("scan", started);
 

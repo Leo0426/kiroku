@@ -1,7 +1,7 @@
 <script lang="ts">
   import { setFavorite } from '../lib/favorite'
   import { fade } from 'svelte/transition'
-  import { untrack,onDestroy } from 'svelte'
+  import { untrack,onDestroy,onMount } from 'svelte'
   import {listen} from '../lib/events'
   import {cancellableJob,type CancellableJob} from '../lib/cancellable-job'
   import { repairFlow } from '../lib/repairflow.svelte'
@@ -11,11 +11,14 @@
   import { app } from '../lib/state.svelte'
   import { CONTENT_TYPE_LABEL, SOURCE_NAMES, type MovieDetail } from '../lib/types'
   import Icon from './Icon.svelte'
+  import ActorAvatar from './ActorAvatar.svelte'
+  import ActorHosting from './ActorHosting.svelte'
   import FieldSources from './FieldSources.svelte'
   import MetadataEditor from './MetadataEditor.svelte'
   import ArtworkEditor from './ArtworkEditor.svelte'
   import AppendFiles from './AppendFiles.svelte'
   import MetadataUpdater from './MetadataUpdater.svelte'
+  import MovieTranslation from './MovieTranslation.svelte'
   import LanguageExport from './LanguageExport.svelte'
   import LoadingStatus from './LoadingStatus.svelte'
 
@@ -51,7 +54,16 @@
   let preferredWidth = $state(storedWidth())
   let viewportWidth = $state(window.innerWidth)
   const narrow = $derived(viewportWidth <= 720)
-  const maxWidth = $derived(Math.max(360, viewportWidth - 48))
+  let contentWidth = $state(window.innerWidth)
+  const maxWidth = $derived(Math.max(360, Math.min(contentWidth, viewportWidth - 48)))
+  onMount(() => {
+    const container = panel?.parentElement
+    if (!container) return
+    contentWidth = container.clientWidth
+    const observer = new ResizeObserver(() => contentWidth = container.clientWidth)
+    observer.observe(container)
+    return () => observer.disconnect()
+  })
   const panelWidth = $derived(narrow ? viewportWidth : Math.min(maxWidth, Math.max(360, preferredWidth)))
   let drag = $state<{ id: number; x: number; width: number } | null>(null)
   function rememberWidth() { try { localStorage.setItem(WIDTH_KEY, String(preferredWidth)) } catch { /* Storage may be unavailable. */ } }
@@ -227,6 +239,7 @@
         <button class="btn" class:on={detail.favorite} aria-pressed={detail.favorite} disabled={favoriteBusy} onclick={toggleFavorite}><Icon name="star" size={14} />{detail.favorite ? '取消收藏' : '收藏'}</button>
         {#if repairRunning}<button class="btn" onclick={() => repairFlow.cancel()}>停止补图</button>{/if}
       </div>
+      {#key `${app.settings?.library_root}|${meta.code}`}<MovieTranslation {meta} onsaved={() => attempt++} />{/key}
       {#if mediaBusy}<div role="status" aria-label="媒体校验进度"><p>正在校验媒体来源…{mediaTotal?` ${Math.min(100,Math.round(mediaDone/mediaTotal*100))}%`:''}</p><button class="btn" onclick={()=>mediaTask?.cancel()}>取消媒体校验</button></div>{/if}
       {#if repairError||undoError}<p role="alert">补图失败：{repairError||undoError}</p>{/if}
       {#if repairResult}
@@ -245,8 +258,9 @@
           {#key `${code}:${app.settings?.library_root}`}
             <MetadataEditor onactive={active => activeTools.MetadataEditor = active} {meta} onsaved={() => attempt++} />
             <MetadataUpdater onactive={active => activeTools.MetadataUpdater = active} {meta} onsaved={() => attempt++} />
-            <section aria-label="海报裁剪"><button class="btn" onclick={() => (cropping = true)}>裁剪海报</button></section>
+            <section aria-label="海报裁剪"><button class="btn" onclick={() => (cropping = true)}><Icon name="image" size={15}/>裁剪海报</button></section>
             <AppendFiles onactive={active => activeTools.AppendFiles = active} {code} onsaved={() => attempt++} />
+            <ActorHosting onactive={active => activeTools.ActorHosting = active} {meta} onsaved={() => attempt++} />
             <LanguageExport onactive={active => activeTools.LanguageExport = active} {meta} onsaved={() => attempt++} />
           {/key}
         </div>
@@ -259,7 +273,7 @@
       {#if meta.actors.length}
         <section>
           <h3>演员</h3>
-          <div class="chips">{#each meta.actors as a, i}<span class="chip" style:--n={Math.min(i, 12)} class:male={a.gender === 'male'}>{#if a.thumb}<img class="avatar" src={a.thumb} alt="" referrerpolicy="no-referrer" loading="lazy" onerror={e => e.currentTarget.remove()} />{/if}{a.name}</span>{/each}</div>
+          <div class="chips">{#each meta.actors as a, i}<span class="chip" style:--n={Math.min(i, 12)} class:male={a.gender === 'male'}>{#if a.thumb}<ActorAvatar {code} url={a.thumb} libraryRoot={app.settings?.library_root} />{/if}{a.name}</span>{/each}</div>
         </section>
       {/if}
 
@@ -337,35 +351,39 @@
   .facts { display: flex; flex-wrap: wrap; gap: var(--s1) var(--s3); margin-top: var(--s2); color: var(--text-2); font-size: var(--fs-sm); }
   .facts span + span::before { content: '·'; margin-right: var(--s3); color: var(--text-3); }
   .score { color: var(--accent); display: inline-flex; align-items: center; gap: 3px; }
-  .toolbox { padding: 16px; border: 1px solid var(--line); border-radius: var(--r-md); }
-  .tool-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; align-items: stretch; }
-  .tool-grid > :global(section) { min-width: 0; margin: 0; }
-  .tool-grid > :global(section.expanded) { grid-column: 1 / -1; padding: 16px; border-radius: var(--r-sm); background: var(--surface-2); }
-  .tool-grid > :global(section:not(.expanded) > button:first-child) { width: 100%; height: 100%; min-height: 44px; margin: 0; padding: 10px 16px; text-align: left; justify-content: flex-start; }
+  .toolbox { padding: 16px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+  .tool-grid { display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: flex-start; }
+  .tool-grid > :global(section) { display: contents; }
+  .tool-grid :global(.tool-content) { order: 1; flex: 1 0 100%; min-width: 0; padding: 16px; margin-top: 8px; border-radius: var(--r-sm); background: var(--surface-2); }
+  .tool-grid > :global(section > button:first-child) { min-height: 36px; margin: 0; padding: 6px 8px; gap: 7px; background: transparent; box-shadow: none; color: var(--text-2); font-size: var(--fs-sm); font-weight: 500; text-align: left; justify-content: flex-start; }
+  .tool-grid > :global(section > button:first-child:hover) { color: var(--accent); background: var(--accent-soft); transform: none; }
+  .tool-grid > :global(section > button:first-child[aria-expanded=true]) { color: var(--accent); }
+  .tool-grid > :global(section > button:first-child > .i-chevron-down) { opacity: .75; transition: transform var(--d-fast); }
+  .tool-grid > :global(section > button:first-child[aria-expanded=true] > .i-chevron-down) { transform: rotate(180deg); }
+  .tool-grid > :global(section > button:first-child > svg) { flex-shrink: 0; }
   .tool-grid :global(input:not([type=checkbox])), .tool-grid :global(textarea), .tool-grid :global(select) { max-width: 100%; min-width: 0; }
   .tool-grid :global(p), .tool-grid :global(ins), .tool-grid :global(del) { overflow-wrap: anywhere; }
   .tool-grid :global(button) { max-width: 100%; white-space: normal; }
   .cta { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:12px; }
   .cta > .btn { min-width:0; min-height:44px; padding:10px 12px; white-space:normal; }
-  .toolbox > h3 { margin-bottom:12px; }
-  .tool-grid > :global(section.expanded > p) { margin:12px 0; line-height:1.6; }
-  .tool-grid > :global(section.expanded .btn) { min-height:40px; margin:6px 8px 6px 0; }
-  .tool-grid > :global(section.expanded > .btn.ghost:last-of-type) { margin-top:16px; }
+  .toolbox > h3 { margin-bottom:8px; }
+  .tool-grid :global(.tool-content > p) { margin:12px 0; line-height:1.6; }
+  .tool-grid :global(.tool-content .btn) { min-height:40px; margin:6px 8px 6px 0; }
+  .tool-grid :global(.tool-content > .btn.ghost:last-of-type) { margin-top:16px; }
   @container (min-width: 700px) { .cta { grid-template-columns:repeat(4, minmax(0, 1fr)); } }
   /* 收藏:星标转一圈弹出 */
   .cta .on { color: var(--warn); }
   .cta .on :global(svg) { animation: starPop 560ms var(--ease-back); }
   @keyframes starPop { 0% { transform: scale(0.4) rotate(-90deg); } 60% { transform: scale(1.35) rotate(12deg); } 100% { transform: scale(1) rotate(0); } }
   h3 { font-size: var(--fs-xs); font-weight: 600; letter-spacing: 0.06em; color: var(--text-3); margin-bottom: var(--s2); text-transform: uppercase; }
-  .plot { color: var(--text-1); font-size: var(--fs-md); line-height: 1.75; white-space: pre-wrap; }
+  .plot { overflow-wrap:anywhere; color: var(--text-1); font-size: var(--fs-md); line-height: 1.75; white-space: pre-wrap; }
   .chips { display: flex; flex-wrap: wrap; gap: 10px; }
-  .chip { padding: 4px 11px; border-radius: var(--r-pill); background: var(--accent-soft); color: var(--accent); font-size: var(--fs-sm); font-weight: 500; transition: transform var(--d-base) var(--ease-back), background var(--d-fast); }
+  .chip { max-width:100%; overflow-wrap:anywhere; padding: 4px 11px; border-radius: var(--r-pill); background: var(--accent-soft); color: var(--accent); font-size: var(--fs-sm); font-weight: 500; transition: transform var(--d-base) var(--ease-back), background var(--d-fast); }
   .chip:hover { transform: translateY(-2px); }
   .chip { animation: chipIn 360ms var(--ease-back) both; animation-delay: calc(240ms + var(--n, 0) * 28ms); }
   @keyframes chipIn { from { opacity: 0; transform: translateY(6px) scale(0.85); } }
   .chip.male { background: var(--info-soft); color: var(--info); }
-  .chip:has(.avatar) { display: inline-flex; align-items: center; gap: 6px; padding-left: 4px; }
-  .avatar { width: 20px; height: 20px; border-radius: 50%; object-fit: cover; }
+  .chip:has(:global(.avatar)) { display: inline-flex; align-items: center; gap: 6px; padding-left: 4px; }
   .chip.subtle { background: var(--surface-3); color: var(--text-2); }
   dl { display: grid; grid-template-columns: auto 1fr; gap: var(--s2) var(--s5); margin: 0; font-size: var(--fs-sm); }
   dt { color: var(--text-3); }
@@ -383,8 +401,8 @@
   @container (max-width: 430px) {
     .top { flex-direction:column; align-items:flex-start; }
     .poster { width:112px; }
-    .toolbox, .tool-grid > :global(section.expanded) { padding:12px; }
-    .tool-grid { grid-template-columns:minmax(0, 1fr); }
+    .tool-grid :global(.tool-content) { padding:12px; }
+    .tool-grid { gap:4px; }
     .tool-grid :global(.actor-row) { flex-wrap:wrap; }
   }
   @media (max-width: 720px) { .panel { bottom: calc(64px + env(safe-area-inset-bottom)); } }

@@ -82,7 +82,13 @@ pub(crate) fn fingerprint_stream(path:&Path,cancel:&dyn Fn()->bool,progress:&dyn
         #[cfg(unix)] {use std::os::unix::fs::MetadataExt;id.push_str(&format!(":{}:{}",m.dev(),m.ino()));}
         Ok(id)
     };
-    let id=identity(&before)?;let mut hash=Sha256::new();let mut buffer=[0;65536];let mut done=0;
+    let id=identity(&before)?;
+    if sink.is_none(){if let Some(result)=crate::nas_ops::digest(path,cancel){
+        let digest=result?;check_stopped(cancel)?;regular(path)?;
+        if identity(&file.metadata()?)?!=id || identity(&fs::symlink_metadata(path)?)?!=id || same_file::Handle::from_path(path)?!=handle{return Err(error("NAS 校验期间来源发生变化"))}
+        progress(before.len(),before.len());return Ok(format!("{id}:{digest}"));
+    }}
+    let mut hash=Sha256::new();let mut buffer=[0;65536];let mut done=0;
     loop{check_stopped(cancel)?;let n=file.read(&mut buffer)?;if n==0{break}
         #[cfg(test)] hash_reads::record(n);
         if let Some(output)=sink.as_mut() {

@@ -131,9 +131,10 @@ fn replace_content(xml: &str, node: &Node, content: &str) -> String {
 }
 /// Merge only Metadata fields that actually changed. Untouched XML is copied byte-for-byte.
 /// Unsupported XML is rejected before any write. Used by manual edits and `revision::prepare`.
-pub fn merge_revision(xml: &str, before: &Metadata, after: &Metadata) -> io::Result<String> { merge(xml,before,after,false) }
-pub fn merge_language_export(xml:&str,after:&Metadata)->io::Result<String>{merge(xml,after,after,true)}
-fn merge(xml:&str,before:&Metadata,after:&Metadata,language_export:bool)->io::Result<String>{
+pub fn merge_revision(xml: &str, before: &Metadata, after: &Metadata) -> io::Result<String> { merge(xml,before,after,false,false) }
+pub fn merge_language_export(xml:&str,after:&Metadata)->io::Result<String>{merge(xml,after,after,true,false)}
+pub fn merge_actor_export(xml:&str,after:&Metadata)->io::Result<String>{merge(xml,after,after,false,true)}
+fn merge(xml:&str,before:&Metadata,after:&Metadata,language_export:bool,actor_export:bool)->io::Result<String>{
     let document = parse(xml)?;
     let generated = super::to_nfo(after);
     let projection = parse(&generated)?;
@@ -146,6 +147,7 @@ fn merge(xml:&str,before:&Metadata,after:&Metadata,language_export:bool)->io::Re
         }
     }
     if language_export || before.nfo_language!=after.nfo_language {selected.extend(["title","sorttitle","plot","outline","originaltitle"]);}
+    if actor_export || before.hosted_actor_images != after.hosted_actor_images { selected.insert("actor"); }
     if before.scores != after.scores {
         selected.extend(["rating", "criticrating"]);
     }

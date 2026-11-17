@@ -85,7 +85,7 @@ fn import_plans_new_versions_unselected_with_a_notice() {
     let incoming = t.path().join("in");
     fs::create_dir_all(&incoming).unwrap();
     fs::write(incoming.join("ABC-123-C.mp4"), b"subtitled").unwrap();
-    let scan = pipeline::scan(&[incoming.clone()], Some(&root), &Default::default(), &CancellationToken::new(), &mut |_| {});
+    let scan = pipeline::scan(&[incoming.clone()], Some(&root), &kiroku_core::video_filter::VideoFilter::none(), &CancellationToken::new(), &mut |_| {});
     let item = &scan.items[0];
     let c = parse_code("ABC-123-C.mp4").unwrap();
     let meta = Metadata { code: "ABC-123".into(), ..Default::default() };

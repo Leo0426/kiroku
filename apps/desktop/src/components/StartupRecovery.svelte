@@ -13,15 +13,17 @@
    try{await recovery.undo(entry)}catch(e){app.toast('error',String(e))}
   }
  }
+ function acknowledge(){try{recovery.acknowledge()}catch{app.toast('error','无法保存提醒设置，请重试')}}
  async function reveal(id:string){try{await api.revealJournal(id)}catch(e){app.toast('error',String(e))}}
 </script>
-{#if recovery.root===app.settings?.library_root&&(recovery.entries.length||recovery.error||recovery.loading)}
+{#if recovery.root===app.settings?.library_root&&(recovery.visibleEntries.length||recovery.error||recovery.loading)}
 <section aria-label="启动恢复" class="recovery">
  <div class="summary">
   <Icon name="alert" size={16}/>
-  <div class="summary-text"><strong>{recovery.loading&&!recovery.entries.length?'正在检查整理日志':`${recovery.entries.length} 条整理记录待处理`}</strong>
-   {#if recovery.stale}<span>上次记录，尚未核对</span>{:else if recovery.entries.length}<span>{recovery.entries.slice(0,2).flatMap(e=>e.codes).join('、')||'请检查中断操作'}</span>{/if}
+  <div class="summary-text"><strong>{recovery.loading&&!recovery.visibleEntries.length?'正在检查整理日志':`${recovery.visibleEntries.length} 条整理记录待处理`}</strong>
+   {#if recovery.stale}<span>上次记录，尚未核对</span>{:else if recovery.visibleEntries.length}<span>{recovery.visibleEntries.slice(0,2).flatMap(e=>e.codes).join('、')||'请检查中断操作'}</span>{/if}
   </div>
+  {#if recovery.visibleEntries.length}<button class="btn sm ghost" disabled={recovery.loading||!!recovery.busyId} title="只隐藏这些记录的提醒，保留历史日志和媒体文件" onclick={acknowledge}>已知晓，不再提醒</button>{/if}
   <button class="btn sm ghost" aria-expanded={expanded} aria-controls="recovery-details" onclick={()=>expanded=!expanded}>{expanded?'收起恢复事项':'展开恢复事项'}</button>
  </div>
  {#if recovery.error}<p class="error" role="alert">{recovery.error}</p>{/if}
@@ -29,7 +31,7 @@
   <div class="detail-actions"><button class="btn sm" onclick={()=>recovery.refresh()} disabled={recovery.loading||!!recovery.busyId}>{recovery.loading?'正在核对…':'重新检查恢复事项'}</button><button class="btn sm" onclick={()=>app.navigate('history')}>查看完整历史</button></div>
   {#if recovery.stale}<p>媒体库不可用或检查未完成时，不执行撤销。</p>{/if}
   <p class="muted root">媒体库：{recovery.root}</p>
- {#each recovery.entries as entry(entry.id)}
+ {#each recovery.visibleEntries as entry(entry.id)}
  <div class="entry"><strong>{entry.codes.join('、')||`日志 ${entry.id}`}</strong><p>{entry.message}</p>
  <button class="btn sm" onclick={()=>reveal(entry.id)} disabled={recovery.stale||recovery.loading||!/^\d+$/.test(entry.id)}>查看日志位置</button>
  {#if entry.canUndo}<button class="btn sm" disabled={recovery.stale||recovery.loading||!!recovery.busyId} onclick={()=>undo(entry)}>{recovery.busyId===entry.id?'正在撤销…':'检查并撤销'}</button>{/if}</div>

@@ -251,6 +251,10 @@ fn match_number(basename: &str, escape: &[String], generic: bool) -> Option<(Str
         }
     }
     // 其余规则用 catalog
+    // 已确认的紧凑 FZ 编号:保留站点拼写与前导零，不套用通用三位补零规则。
+    if let Some(m) = caps(rx!(r"(?<![A-Z0-9])FZ[-_ ]?(\d{2,})(?![A-Z0-9])"), c) {
+        return Some((format!("FZ{}", &m[1]), Uncensored));
+    }
     if let Some(m) = find(rx!(r"XXX-AV-\d{4,}"), c) {
         return Some((m, Uncensored));
     }
@@ -598,6 +602,10 @@ impl Code {
 }
 
 pub fn search_key(id: &str) -> String {
+    if let Some(m) = caps(rx!(r"(?i)^FZ[-_ ]?(\d{2,})$"), id) {
+        let digits = m[1].trim_start_matches('0');
+        return format!("FZ{}", if digits.is_empty() { "0" } else { digits });
+    }
     match caps(rx!(r"^([A-Za-z]+)-(\d+)$"), id) {
         Some(m) => format!("{}-{:0>3}", &m[1], m[2].trim_start_matches('0')),
         None => id.to_string(),
