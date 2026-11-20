@@ -5,6 +5,89 @@ use kiroku_core::{
 use std::{collections::HashMap, fs, io::Cursor};
 use tokio_util::sync::CancellationToken;
 
+#[cfg(unix)]
+#[test]
+fn large_companion_batch_can_plan_under_a_small_descriptor_limit() {
+    use std::{os::unix::process::CommandExt, process::Command};
+
+    const CHILD: &str = "KIROKU_TEST_LOW_FD_IMPORT";
+    if std::env::var_os(CHILD).is_none() {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "large_companion_batch_can_plan_under_a_small_descriptor_limit",
+                "--nocapture",
+            ])
+            .env(CHILD, "1");
+        // Only lower the test child's soft limit before exec; parallel tests are unaffected.
+        unsafe {
+            command.pre_exec(|| {
+                let mut limit = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                limit.rlim_cur = limit.rlim_cur.min(256);
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        assert!(command.status().unwrap().success());
+        return;
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let source = temp.path().join("incoming");
+    let library = temp.path().join("library");
+    fs::create_dir(&library).unwrap();
+    const FILMS: usize = 320;
+    for index in 1..=FILMS {
+        let code = format!("TEST-{index:03}");
+        let dir = source.join(&code);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(format!("{code}.mp4")), b"synthetic video").unwrap();
+        fs::write(
+            dir.join(format!("{code}.nfo")),
+            "<movie><title>Local title</title></movie>",
+        )
+        .unwrap();
+    }
+    let mut settings = Settings::default();
+    settings.scan.min_video_mb = 0;
+    let cancel = CancellationToken::new();
+    let scan = pipeline::scan(
+        &[source],
+        Some(&library),
+        &settings.video_filter(),
+        &cancel,
+        &mut |_| {},
+    );
+    assert_eq!(scan.items.len(), FILMS);
+    let (_, ready) = pipeline::inspect_import(&scan.items, &cancel);
+    let items = scan
+        .items
+        .iter()
+        .map(|item| (item, item.code.as_ref().unwrap()))
+        .collect::<Vec<_>>();
+    let plans = pipeline::build_plans(&items, &ready, &library, "{code}", settings.plan_opts());
+    let first_conflict = plans.iter().find(|plan| !plan.selected);
+    assert!(
+        first_conflict.is_none(),
+        "{:?}",
+        first_conflict.map(|plan| &plan.notices)
+    );
+    assert_eq!(
+        plans.len(),
+        FILMS,
+        "every companion must be available for planning"
+    );
+}
+
 #[tokio::test]
 async fn import_uses_companion_nfo_and_artwork_without_a_source_route() {
     let temp = tempfile::tempdir().unwrap();

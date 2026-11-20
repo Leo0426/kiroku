@@ -13,13 +13,71 @@ use tokio_util::sync::CancellationToken;
 
 const NFO_LIMIT: usize = 4 * 1024 * 1024;
 
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+struct DirectoryIdentity {
+    device: u64,
+    inode: u64,
+    generation: DirectoryGeneration,
+}
+
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+enum DirectoryGeneration {
+    Birth(std::time::SystemTime),
+    Change(i64, i64),
+}
+
+#[cfg(unix)]
+impl DirectoryIdentity {
+    fn capture(dir: &Path) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = fs::symlink_metadata(dir)?;
+        if !metadata.is_dir() {
+            return Err(io::Error::other("来源配套路径不是目录"));
+        }
+        // Retain an identity instead of holding one open directory per imported movie.
+        // On filesystems without a birth time, reject a changed directory conservatively.
+        let generation = match metadata.created() {
+            Ok(time) if time != std::time::UNIX_EPOCH => DirectoryGeneration::Birth(time),
+            _ => DirectoryGeneration::Change(metadata.ctime(), metadata.ctime_nsec()),
+        };
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            generation,
+        })
+    }
+}
+
+#[cfg(not(unix))]
+#[derive(Debug, PartialEq, Eq)]
+struct DirectoryIdentity(same_file::Handle);
+
+#[cfg(not(unix))]
+impl DirectoryIdentity {
+    fn capture(dir: &Path) -> io::Result<Self> {
+        same_file::Handle::from_path(dir).map(Self)
+    }
+}
+
+impl DirectoryIdentity {
+    fn verify(&self, dir: &Path) -> io::Result<()> {
+        if Self::capture(dir)? != *self {
+            return Err(io::Error::other("来源目录已变化"));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct LocalImport {
     nfo: Option<String>,
     poster: Option<PathBuf>,
     fanart: Option<PathBuf>,
     dir: PathBuf,
-    directory_identity: Arc<same_file::Handle>,
+    directory_identity: Arc<DirectoryIdentity>,
     pub(super) refresh: bool,
 }
 
@@ -27,21 +85,14 @@ pub struct LocalImport {
 pub(super) struct LocalImage {
     path: PathBuf,
     dir: PathBuf,
-    directory_identity: Arc<same_file::Handle>,
+    directory_identity: Arc<DirectoryIdentity>,
 }
 
 impl LocalImage {
     pub(super) fn read(&self) -> io::Result<Vec<u8>> {
-        let verify_dir = || {
-            if same_file::Handle::from_path(&self.dir)? == *self.directory_identity {
-                Ok(())
-            } else {
-                Err(io::Error::other("来源图片所在目录已变化"))
-            }
-        };
-        verify_dir()?;
+        self.directory_identity.verify(&self.dir)?;
         let bytes = read_regular(&self.path, crate::net::IMAGE_RESPONSE_LIMIT)?;
-        verify_dir()?;
+        self.directory_identity.verify(&self.dir)?;
         Ok(bytes)
     }
 }
@@ -113,7 +164,7 @@ pub(super) fn discover(
         let Ok(canonical) = dir.canonicalize() else {
             continue;
         };
-        let Ok(identity) = same_file::Handle::from_path(&canonical) else {
+        let Ok(identity) = DirectoryIdentity::capture(&canonical) else {
             continue;
         };
         let identity = Arc::new(identity);
@@ -196,6 +247,9 @@ pub(super) fn discover(
             if nfo.is_none() && poster.is_none() && fanart.is_none() {
                 continue;
             }
+            if identity.verify(&canonical).is_err() {
+                break;
+            }
             if result
                 .get(id)
                 .is_some_and(|found| found.nfo.is_some() || nfo.is_none())
@@ -227,7 +281,7 @@ impl LocalImport {
         if found.is_some() || cancel.is_cancelled() { return found; }
         let dir = item.path.parent()?.canonicalize().ok()?;
         if !fs::symlink_metadata(dir.join(".actors")).ok()?.is_dir() { return None; }
-        let directory_identity = Arc::new(same_file::Handle::from_path(&dir).ok()?);
+        let directory_identity = Arc::new(DirectoryIdentity::capture(&dir).ok()?);
         Some(Arc::new(Self { nfo:None, poster:None, fanart:None, dir, directory_identity, refresh:false }))
     }
 
@@ -241,14 +295,14 @@ impl LocalImport {
     }
 
     pub(crate) fn has_actor_image(&self, name: &str) -> io::Result<bool> {
-        if same_file::Handle::from_path(&self.dir)? != *self.directory_identity { return Err(io::Error::other("来源目录已变化")); }
+        self.directory_identity.verify(&self.dir)?;
         crate::supplement::local_avatar_path(&self.dir, name).map(|p|p.is_some())
     }
 
     pub(crate) fn read_actor_image(&self, name: &str) -> io::Result<Vec<u8>> {
         if !self.has_actor_image(name)? {return Err(io::Error::other("来源头像已变化"));}
         let bytes = crate::supplement::read_local_avatar(&self.dir, name)?.ok_or_else(||io::Error::other("来源头像已变化"))?;
-        if same_file::Handle::from_path(&self.dir)? != *self.directory_identity {return Err(io::Error::other("来源目录已变化"));}
+        self.directory_identity.verify(&self.dir)?;
         Ok(bytes)
     }
 
