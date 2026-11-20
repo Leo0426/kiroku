@@ -1,5 +1,6 @@
 <script lang="ts" module>
-  export type SettingsTab = 'general' | 'organize' | 'naming' | 'scan' | 'names' | 'badges' | 'sources' | 'ai' | 'plex' | 'data' | 'advanced'
+  import type { SettingsTab } from '../lib/settings-search'
+  export type { SettingsTab }
   /** 离开设置页再回来时停在上次的分类 */
   let lastTab: SettingsTab = 'general'
   /** 其他页面跳到设置的某个分类前调用(下一次打开设置页时生效) */
@@ -9,7 +10,7 @@
 </script>
 
 <script lang="ts">
-  import { onMount, tick } from 'svelte'
+  import { onMount, tick, untrack } from 'svelte'
   import { slide } from 'svelte/transition'
   import { findSettings, type SettingLink } from '../lib/settings-search'
   import AppearanceSettings from '../components/AppearanceSettings.svelte'
@@ -19,6 +20,12 @@
   import InfoTip from '../components/InfoTip.svelte'
   import LibraryMaintenance from '../components/LibraryMaintenance.svelte'
   import SourceAuth from '../components/SourceAuth.svelte'
+  import ImportCacheSettings from '../components/ImportCacheSettings.svelte'
+  import LoadingScreen from '../components/LoadingScreen.svelte'
+  import LoadingStatus from '../components/LoadingStatus.svelte'
+  import PopupNotice from '../components/PopupNotice.svelte'
+  import ProgressBar from '../components/ProgressBar.svelte'
+  import NasDiagnostics from '../components/NasDiagnostics.svelte'
   import SourceChecks from '../components/SourceChecks.svelte'
   import SiteList from '../components/SiteList.svelte'
   import { api } from '../lib/api'
@@ -57,6 +64,18 @@
   let tab = $state<SettingsTab>(lastTab)
   const tabIndex = $derived(TABS.findIndex((t) => t.key === tab))
   const current = $derived(TABS[tabIndex])
+  let tabStrip: HTMLDivElement | undefined = $state()
+  let tabStripWidth = $state(0)
+  let windowWidth = $state(0)
+  $effect(() => {
+    const selected = tabStrip?.querySelector<HTMLElement>(`[data-tab="${tab}"]`)
+    if (!selected || !tabStrip || !tabStripWidth || tabStrip.scrollWidth <= tabStripWidth) return
+    const strip = tabStrip.getBoundingClientRect()
+    const button = selected.getBoundingClientRect()
+    if (button.left < strip.left || button.right > strip.right) {
+      tabStrip.scrollLeft += button.left - strip.left - (strip.width - button.width) / 2
+    }
+  })
 
   let search = $state('')
   const matches = $derived(findSettings(search))
@@ -66,13 +85,23 @@
     search = ''
     await tick()
     const target = item.target ? document.getElementById(item.target) : null
-    const focus = target && !target.matches(':disabled') ? target : document.querySelector<HTMLElement>('.pane-head')
+    const fallback = item.fallbackTarget ? document.getElementById(item.fallbackTarget) : null
+    const focus = target && !target.matches(':disabled') ? target : fallback ?? document.querySelector<HTMLElement>('.pane-head')
     if (focus && !focus.matches('input, select, textarea, button')) focus.tabIndex = -1
-    focus?.focus({ preventScroll:true })
-    ;(target ?? focus)?.scrollIntoView({ block:'center' })
+    focus?.focus({ preventScroll: true })
+    focus?.scrollIntoView({ block: focus.matches('section, details') ? 'start' : 'center' })
   }
 
+  $effect(() => {
+    const link = app.settingsLink
+    if (s && link) {
+      app.settingsLink = null
+      untrack(() => { void locate(link) })
+    }
+  })
+
   function go(t: SettingsTab) {
+    if (tab !== t) tabStrip?.closest('.view-shell')?.scrollTo({ top: 0 })
     tab = lastTab = t
   }
 
@@ -129,17 +158,18 @@
   const stampDir = $derived(/settings\.json$/.test(path) ? path.replace(/settings\.json$/, 'watermarks') : '')
 
   let rulesOpen = $state(false)
+  const proxyModes = [
+    { mode: 'global', label: '跟随全局代理' },
+    { mode: 'direct', label: '直连' },
+    { mode: 'custom', label: '自定义' },
+  ] as const
+
   /** 跟随全局时省略字段,与后端保存格式一致 */
   function setSourceProxy(src: SourceCfg, mode: SourceProxy['mode']) {
     if (mode === 'global') delete src.proxy
     else src.proxy = mode === 'custom' ? { mode, url: src.proxy?.mode === 'custom' ? src.proxy.url : '' } : { mode }
   }
 
-  async function clearImportCache() {
-    if (!await app.confirm({title:'清空抓取缓存',body:'将清除本机已缓存的来源信息和下载图片，下次抓取会重新联网。媒体文件、整理日志和 AI 译文缓存不受影响。',confirmLabel:'清空缓存'})) return
-    try { await api.clearImportCache(); app.toast('ok', '抓取缓存已清空') }
-    catch (e) { app.toast('error', String(e), 5000) }
-  }
   async function clearTranslationCache() {
     try { await api.clearTranslationCache(); app.toast('ok', '译文缓存已清空') }
     catch (e) { app.toast('error', String(e), 5000) }
@@ -152,7 +182,8 @@
     document.getElementById('settings-routes')?.scrollIntoView({ block: 'start' })
   }
   let more = $state(false)
-  let showCookie = $state(false)
+  let visibleCookie = $state<string | null>(null)
+  $effect(() => { if (tab !== 'sources') visibleCookie = null })
 
   function addSourceRoutes(id: string) {
     if (!s) return
@@ -192,7 +223,6 @@
     void load()
     const guard = () => {
       if (saving) {
-        app.toast('info', '正在保存设置，请稍候')
         return false
       }
       return !dirty || app.confirm({
@@ -307,7 +337,7 @@
   $effect(()=>{const directory=s?.dir_template,file=s?.plex.naming?'{code}[-{mosaic?|cracked=U,leaked=LEAK,censored=,uncensored=}{sub?}][ {title}][ - cd{cd?}]':s?.file_template;let alive=true;const timer=setTimeout(()=>{if(directory!=null&&file!=null)api.templatePreview(directory,file).then(p=>{if(alive)templateSample=p})},150);return ()=>{alive=false;clearTimeout(timer)}})
 </script>
 
-<svelte:window onbeforeunload={beforeUnload} />
+<svelte:window bind:innerWidth={windowWidth} onbeforeunload={beforeUnload} />
 
 <div class="page" in:rise>
   {#if s}
@@ -318,7 +348,7 @@
       <div class="actions">
         <button class="btn ghost" onclick={reset} disabled={saving || KEYS[tab].length === 0} title="只恢复「{current.label}」分类">恢复本页默认</button>
         <button class="btn primary save" class:pending={dirty} onclick={save} disabled={!dirty || saving || rootChanging}>
-          <Icon name="check" size={14} />{saving ? '保存中…' : dirty ? `保存更改(${changed.size})` : '已保存'}
+          <Icon name={saving ? 'loader' : 'check'} size={14} />{saving ? '保存中…' : dirty ? `保存更改(${changed.size})` : '已保存'}
         </button>
       </div>
     </header>
@@ -332,10 +362,10 @@
         </div>
       {/if}
     </div>
-    {#if error}<div class="error" role="alert" aria-label="保存失败"><Icon name="alert" size={16} />{error}</div>{/if}
+    {#if error}<PopupNotice title="保存失败" text={error} />{/if}
 
     <div class="layout">
-      <div class="cats" role="tablist" aria-orientation="vertical" aria-label="设置分类" tabindex="-1" style="--i:{tabIndex}" onkeydown={navKey}>
+      <div class="cats" bind:this={tabStrip} bind:clientWidth={tabStripWidth} role="tablist" aria-orientation={windowWidth <= 760 ? 'horizontal' : 'vertical'} aria-label="设置分类" tabindex="-1" onkeydown={navKey}>
         {#each TABS as t (t.key)}
           <button
             class="cat ripple-host" class:active={tab === t.key} data-tab={t.key}
@@ -357,10 +387,10 @@
         <div class="pane-head">
           <div class="tipped"><h2 class="pane-title">{current.label}</h2><InfoTip label="{current.label}说明"><p>{current.desc}</p></InfoTip></div>
         </div>
-    {#if tab === 'data'}<section class="card" id="import-cache" aria-label="抓取缓存"><h2>抓取缓存</h2><p class="hint">成功获取的来源信息和图片自动保存在本机。意外退出后，重新扫描并开始抓取即可复用；失败的部分会重试。缓存会占用本机磁盘空间，可按需清空。</p><button class="btn sm" type="button" onclick={clearImportCache}>清空抓取缓存</button></section><LibraryMaintenance {dirty} onpolicySaved={() => { if (s && app.settings) { s.retention = { ...app.settings.retention }; saved = JSON.stringify(s) } }} />{/if}
+    {#if tab === 'data'}<ImportCacheSettings settingsPath={path}/><LibraryMaintenance {dirty} onpolicySaved={() => { if (s && app.settings) { s.retention = { ...app.settings.retention }; saved = JSON.stringify(s) } }} />{/if}
     {#if tab === 'names'}<NameRules bind:rules={s.name_rules} {dirty}/>{/if}
     {#if tab === 'general'}
-    <section class="card">
+    <section id="library-location" class="card">
       <div class="tipped"><h2>媒体库</h2><InfoTip label="媒体库说明"><p>整理后的影片和海报将保存到此目录。</p></InfoTip></div>
       <div class="row">
         <span class="label">位置</span>
@@ -375,9 +405,11 @@
         <span class="label with-tip">索引<InfoTip label="索引说明"><p>从影片信息重建媒体库列表。</p></InfoTip></span>
         <span class="grow"></span>
         <button class="btn sm" onclick={() => app.rebuildIndex()} disabled={!app.settings?.library_root || app.rebuild.running || rootChanging}>
-          <Icon name="refresh" size={14} />{app.rebuild.running ? `重建中 ${app.rebuild.done}/${app.rebuild.total}` : '重建索引'}
+          <Icon name={app.rebuild.running ? 'loader' : 'refresh'} size={14} />{app.rebuild.running ? `重建中 ${app.rebuild.done}/${app.rebuild.total}` : '重建索引'}
         </button>
       </div>
+      {#if rootChanging}<LoadingStatus label="正在准备媒体库…" />{/if}
+      {#if app.rebuild.running}<ProgressBar label="索引重建进度" active value={app.rebuild.total ? app.rebuild.done / app.rebuild.total : undefined} />{/if}
     </section>
 
     <AppearanceSettings />
@@ -393,18 +425,20 @@
       </div>
       {#if s.organize_mode !== 'move'}<p class="hint">视频与字幕保留在原位置，执行和撤销都不会清理源目录。{s.organize_mode === 'hardlink' ? '硬链接共享内容，修改任一文件会影响另一文件；跨卷会明确失败，请选择复制。' : s.organize_mode === 'symlink' ? '软链接依赖源位置，移动、删除或修改源文件会阻止播放；源盘离线时保留库索引。' : '复制需要与媒体大小相同的新增空间。'}</p>{/if}
       <div class="tipped extra"><label class="switch extra">
-        <input class="checkbox" type="checkbox" disabled={s.organize_mode !== 'move'} bind:checked={s.cleanup_source} />
+        <input id="cleanup-source" class="checkbox" type="checkbox" disabled={s.organize_mode !== 'move'} bind:checked={s.cleanup_source} />
         <span>整理后清理原文件夹</span>
       </label><InfoTip label="整理后清理原文件夹说明"><p>仅将已整理完的源子文件夹移到废纸篓，可找回。仍有小于扫描体积阈值的视频时保留文件夹及其上级目录。</p></InfoTip></div>
       <div class="tipped extra"><label class="switch extra">
-        <input class="checkbox" type="checkbox" bind:checked={s.download_extrafanart} />
+        <input id="extra-artwork" class="checkbox" type="checkbox" bind:checked={s.download_extrafanart} />
         <span>下载剧照</span>
       </label><InfoTip label="下载剧照说明"><p>最多 12 张，开启后整理会更慢。</p></InfoTip></div>
       <div class="tipped extra"><label class="switch extra">
-        <input class="checkbox" type="checkbox" bind:checked={s.notify_on_finish} />
+        <input id="finish-notifications" class="checkbox" type="checkbox" bind:checked={s.notify_on_finish} />
         <span>任务完成时发系统通知</span>
       </label><InfoTip label="任务完成时发系统通知说明"><p>批量刮削、整理和重建索引结束时，如果窗口不在前台就提醒。</p></InfoTip></div>
     </section>
+
+    <NasDiagnostics/>
 
     {:else if tab === 'naming'}
     <section class="card">
@@ -451,7 +485,7 @@
     {:else if tab === 'badges'}
     <section class="card">
       <div class="tipped"><label class="switch">
-        <input class="checkbox" type="checkbox" bind:checked={s.badges.enabled} />
+        <input id="badges-enabled" class="checkbox" type="checkbox" bind:checked={s.badges.enabled} />
         <span>给封面加角标</span>
       </label><InfoTip label="给封面加角标说明"><p>只影响之后整理的封面。同一角的角标自动叠放。</p></InfoTip></div>
       <div class="badge-layout">
@@ -501,7 +535,7 @@
         <span class="with-tip">自定义角标图<InfoTip label="自定义角标图"><p>在下面的文件夹里放同名 PNG(透明背景)即可替换内置样式;清晰度还可以补上内置没有的档位。</p>
       {#if stampDir}<div class="row"><span class="label">文件夹</span><span class="grow root mono">{stampDir}</span></div>{/if}
       <dl class="stamp-files">
-        {#each [['subtitle.png', '中字'], ['uncensored.png', '无码'], ['cracked.png', '破解'], ['leaked.png', '流出'], ['4k.png / 8k.png', '清晰度(内置)'], ['1080p.png、720p.png、hd.png…', '其他清晰度,内置没有,放了才贴']] as [f, d] (f)}
+        {#each [['subtitle.png', '中字'], ['uncensored.png', '无码'], ['cracked.png', '破解'], ['leaked.png', '流出'], ['8k.png、4k.png、1440p.png、1080p.png、720p.png、480p.png、hd.png、sd.png', '清晰度']] as [f, d] (f)}
           <dt class="mono">{f}</dt><dd>{d}</dd>
         {/each}
       </dl></InfoTip></span>
@@ -510,7 +544,7 @@
 
     {:else if tab === 'sources'}
     <SourceChecks {dirty} />
-    <section class="card">
+    <section id="source-sites" class="card">
       <div class="tipped"><h2>站点</h2><InfoTip label="站点说明"><p>启用站点后需加入路线并保存。Cookie 明文保存在本机。</p></InfoTip></div>
       {#each s.sources as src (src.id)}
         <div class="source-entry">
@@ -540,8 +574,8 @@
         {#if src.id !== 'javdb' && SOURCE_HINTS[src.id] && src.enabled}
           <div class="row">
             <label class="label" for={`cookie-${src.id}`}>Cookie（可选）</label>
-            <input id={`cookie-${src.id}`} class="input grow mono" type={showCookie ? 'text' : 'password'} autocomplete="off" spellcheck="false" value={src.cookie ?? ''} oninput={(e) => (src.cookie = e.currentTarget.value.trim() || undefined)} />
-            <button class="btn sm ghost" type="button" onclick={() => (showCookie = !showCookie)}>{showCookie ? '隐藏' : '显示'}</button>
+            <input id={`cookie-${src.id}`} class="input grow mono" type={visibleCookie === src.id ? 'text' : 'password'} autocomplete="off" spellcheck="false" value={src.cookie ?? ''} oninput={(e) => (src.cookie = e.currentTarget.value.trim() || undefined)} />
+            <button class="btn sm ghost" type="button" aria-pressed={visibleCookie === src.id} onclick={() => (visibleCookie = visibleCookie === src.id ? null : src.id)}>{visibleCookie === src.id ? '隐藏' : '显示'}</button>
           </div>
         {/if}
         {#if src.id === 'javdb' && src.enabled}
@@ -549,24 +583,27 @@
             <div class="row">
               <span class="label with-tip"><label for="javdb-cookie">登录 Cookie<span class="sub">可选</span></label><InfoTip label="Cookie 获取方法"><p>FC2 等影片的详情页要求登录。获取方法:在浏览器登录 JavDB → 打开开发者工具「网络」面板 → 刷新页面 → 点第一个请求,复制请求头里 <span class="mono">Cookie</span> 的整行内容粘贴到这里。Cookie 以明文保存在本机设置文件里;过期后刮削会提示重新填写。</p></InfoTip></span>
               <input
-                id="javdb-cookie" class="input grow mono" type={showCookie ? 'text' : 'password'} autocomplete="off" spellcheck="false"
+                id="javdb-cookie" class="input grow mono" type={visibleCookie === src.id ? 'text' : 'password'} autocomplete="off" spellcheck="false"
                 placeholder="_jdb_session=…"
                 value={src.cookie ?? ''} oninput={(e) => (src.cookie = e.currentTarget.value.trim() || undefined)}
               />
-              <button class="btn sm ghost" type="button" onclick={() => (showCookie = !showCookie)}>{showCookie ? '隐藏' : '显示'}</button>
-              <span class="state" class:ok={!!src.cookie}>{src.cookie ? '已填写' : '未登录'}</span>
+              <button class="btn sm ghost" type="button" aria-pressed={visibleCookie === src.id} onclick={() => (visibleCookie = visibleCookie === src.id ? null : src.id)}>{visibleCookie === src.id ? '隐藏' : '显示'}</button>
+              <span class="state">{src.cookie ? '已填写' : '未填写'}</span>
             </div>
           </div>
         {/if}
         {#if src.enabled}
-          <div class="row">
-            <label class="label" for={`proxy-${src.id}`}>代理</label>
-            <select id={`proxy-${src.id}`} class="input" aria-label="{name(src.id)} 代理" value={src.proxy?.mode ?? 'global'}
-              onchange={(e) => setSourceProxy(src, e.currentTarget.value as SourceProxy['mode'])}>
-              <option value="global">跟随全局代理</option>
-              <option value="direct">直连</option>
-              <option value="custom">自定义</option>
-            </select>
+          <div class="row proxy-row">
+            <span class="label">代理</span>
+            <div class="proxy-modes" role="radiogroup" aria-label="{name(src.id)} 代理">
+              {#each proxyModes as { mode, label } (mode)}
+                <label>
+                  <input type="radio" name={`proxy-${src.id}`} value={mode} checked={(src.proxy?.mode ?? 'global') === mode}
+                    onchange={() => setSourceProxy(src, mode)} />
+                  {label}
+                </label>
+              {/each}
+            </div>
             {#if src.proxy?.mode === 'custom'}
               <input class="input grow" type="text" aria-label="{name(src.id)} 代理地址" placeholder="http://127.0.0.1:7890"
                 value={src.proxy.url} oninput={(e) => (src.proxy = { mode: 'custom', url: e.currentTarget.value.trim() })} />
@@ -614,7 +651,7 @@
     </section>
 
     {:else if tab === 'advanced'}
-    <section class="card log-card">
+    <section id="log-options" class="card log-card">
       <div class="tipped"><h2>日志</h2><InfoTip label="日志说明"><p>记录运行过程，方便排查问题。</p></InfoTip><span class="tip-links"><span class="with-tip">设置文件位置<InfoTip label="设置文件位置"><p class="mono file-path">{path}</p></InfoTip></span></span></div>
       <div class="log-options">
       <div class="tipped extra"><label class="switch extra">
@@ -673,11 +710,12 @@
     <section class="card" aria-label="演员头像托管">
       <h2>演员头像托管</h2>
       <p class="hint">下载头像到共享目录，NFO 使用稳定的 NAS 主机名地址。静态文件服务需由 NAS 或其他设备提供，kiroku 不启动服务器。</p>
-      <label class="switch extra"><input type="checkbox" class="checkbox" bind:checked={s.actor_hosting.enabled}/>启用演员头像托管</label>
+      <label class="switch extra"><input id="actor-hosting-enabled" type="checkbox" class="checkbox" bind:checked={s.actor_hosting.enabled}/>启用演员头像托管</label>
       {#if s.actor_hosting.enabled}
       <div class="row"><label class="label" for="actor-directory">头像保存目录</label><input id="actor-directory" class="input grow mono" bind:value={s.actor_hosting.directory} placeholder="/Volumes/NAS/avatars"/><button class="btn sm" onclick={async()=>{const dir=await api.pickDirectory('选择已有头像共享目录');if(dir&&s)s.actor_hosting.directory=dir}}>选择头像目录</button></div>
       <div class="row"><label class="label" for="actor-base-url">头像 URL 前缀</label><input id="actor-base-url" class="input grow mono" bind:value={s.actor_hosting.base_url} placeholder="http://nas.home.arpa:8088/actors/"/></div>
-      <p class="hint">保存目录应为这台电脑可访问、只存头像的专用文件夹，URL 前缀应映射到同一个文件夹。建议在路由器配置固定主机名和 DHCP 地址保留；无需把服务开放到公网。</p>
+      <p class="hint">kiroku 从保存目录读取已发布的 PNG，Plex 通过对应的 HTTP(S) 地址读取同一张图。文件名由图片内容决定，共用头像会复用同一个文件。</p>
+      {#if s.actor_hosting.base_url.trim()}<p class="mono file-path">{s.actor_hosting.base_url.trim().replace(/\/+$/, '')}/&lt;图片摘要&gt;.png</p>{/if}
       <ol><li>在 NAS 配置只读静态图片服务，并把主机名解析到 NAS。</li><li>保存此页设置。</li><li>打开影片详情 → 影片工具 → 演员头像，预览后确认保存。</li><li>打开生成的头像链接检查，再到 Plex 刷新本片元数据。</li></ol>
       <p class="hint">更换 URL 前缀后，对影片重新预览并保存即可重写 NFO；已有头像缓存会复用。启用本项不会自动改写现有影片或导入任务。</p>
       {/if}
@@ -689,7 +727,7 @@
         <span>Plex 友好命名</span>
       </label><InfoTip label="Plex 友好命名说明"><p>之后整理的文件名包含标题与分集号，并覆盖自定义文件名模板。</p></InfoTip></div>
       <label class="switch extra">
-        <input class="checkbox" type="checkbox" bind:checked={s.plex.enabled} />
+        <input id="plex-enabled" class="checkbox" type="checkbox" bind:checked={s.plex.enabled} />
         <span>整理和撤销后通知 Plex 刷新</span>
       </label>
       {#if s.plex.enabled}
@@ -726,7 +764,7 @@
     <section class="card" aria-label="Jellyfin 与 Emby">
       <div class="tipped"><h2>Jellyfin / Emby</h2><InfoTip label="Jellyfin / Emby 配置方法"><p>Jellyfin 和 Emby 读取影片目录里的 NFO、海报与背景图。在服务器里把媒体库文件夹建成「电影」库并启用 NFO 元数据读取；API Key 在服务器后台「API 密钥」中创建。</p></InfoTip></div>
       <label class="switch extra">
-        <input class="checkbox" type="checkbox" bind:checked={s.media_server.enabled} />
+        <input id="server-enabled" class="checkbox" type="checkbox" bind:checked={s.media_server.enabled} />
         <span>整理和撤销后通知 Jellyfin / Emby 刷新</span>
       </label>
       {#if s.media_server.enabled}
@@ -780,7 +818,7 @@
     <div class="error" role="alert">无法读取设置：{error}</div>
     <button class="btn" onclick={load} disabled={loading}>重试</button>
   {:else}
-    <p class="muted">加载中…</p>
+    <LoadingScreen title="设置" label="正在读取设置…" />
   {/if}
 </div>
 
@@ -849,6 +887,11 @@
   .card > .tip-links { margin-top: var(--s3); }
   .row { display: flex; align-items: center; gap: var(--s3); margin: var(--s2) 0; }
   .row.top { align-items: flex-start; }
+  .proxy-row { flex-wrap: wrap; }
+  .proxy-row .input { flex-basis: 180px; }
+  .proxy-modes { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s1) var(--s3); }
+  .proxy-modes label { display: inline-flex; align-items: center; gap: var(--s1); min-height: 32px; white-space: nowrap; cursor: pointer; }
+  .proxy-modes input { margin: 0; accent-color: var(--accent); }
   textarea.input { resize: vertical; min-height: 64px; padding-top: 6px; line-height: 1.5; }
   .label { min-width: 150px; color: var(--text-2); font-size: var(--fs-sm); }
   .grow { flex: 1; min-width: 0; }
@@ -867,7 +910,6 @@
   .cookie { margin: 0 0 var(--s2) var(--s5); padding-left: var(--s4); border-left: 2px solid var(--line); }
   .cookie .label { min-width: 126px; }
   .state { font-size: var(--fs-xs); font-weight: 600; padding: 2px 8px; border-radius: var(--r-pill); background: var(--surface-3); color: var(--text-3); white-space: nowrap; transition: background var(--d-base), color var(--d-base); }
-  .state.ok { background: var(--ok-soft); color: var(--ok); animation: pop 300ms var(--ease-back); }
   .badge-layout { display: flex; gap: var(--s5); align-items: flex-start; }
   .range { accent-color: var(--accent); }
   .num-out { width: 40px; text-align: right; font-size: var(--fs-sm); color: var(--text-2); }
@@ -921,7 +963,7 @@
   .help[open] summary { margin-bottom: var(--s3); color: var(--text-1); }
   .help.card { padding: var(--s4); margin: 0 0 var(--s4); }
   .file-path { overflow-wrap: anywhere; }
-  #settings-routes { scroll-margin-top: 100px; }
+  .pane :global([id]) { scroll-margin-top: 78px; }
   .source-entry { padding: var(--s3) 0; border-top: 1px solid var(--line); }
   .source-entry:first-of-type { border-top: 0; }
   @media (min-width: 761px) and (max-width: 1150px) {

@@ -32,4 +32,22 @@ test('cancelled crop writes nothing and settings change rejects prepared crop',a
  const error=await page.evaluate(async code=>{const api=(window as any).testApi;const o=await api.artworkOpen(code);const p=await api.artworkPreview(o.token,o.root,code,{x:1,y:1,width:200,height:300});const s=await api.getSettings();s.badges.enabled=!s.badges.enabled;await api.saveSettings(s);try{await api.revisionSave(p.revision.token,p.revision.root,code);return 'saved'}catch(e){return String(e)}},code)
  expect(error).toContain('设置已变化');expect(await page.evaluate(async code=>(await (window as any).testApi.libraryGet(code)),code)).toEqual(before)
 })
-test('switching away and back invalidates original tokens',async({page})=>{await overrideApi(page,'window.testApi=api;');await page.goto('/');const error=await page.evaluate(async()=>{const api=(window as any).testApi;const code=(await api.libraryList({})).items[0].code;const o=await api.artworkOpen(code);await api.setLibraryRoot('/other-library',true);await api.setLibraryRoot(o.root,true);try{await api.artworkPreview(o.token,o.root,code,{x:0,y:0,width:100,height:100});return 'accepted'}catch(e){return String(e)}});expect(error).not.toBe('accepted')})
+test('switching away and back invalidates original tokens', async ({ page }) => {
+  await overrideApi(page, 'window.testApi=api;')
+  await page.goto('/')
+  await expect(page.locator('button.pcard').first()).toBeVisible()
+  const error = await page.evaluate(async () => {
+    const api = (window as any).testApi
+    const code = (await api.libraryList({})).items[0].code
+    const original = await api.artworkOpen(code)
+    await api.setLibraryRoot('/other-library', true)
+    await api.setLibraryRoot(original.root, true)
+    try {
+      await api.artworkPreview(original.token, original.root, code, { x: 0, y: 0, width: 100, height: 100 })
+      return 'accepted'
+    } catch (error) {
+      return String(error)
+    }
+  })
+  expect(error).not.toBe('accepted')
+})

@@ -21,23 +21,64 @@
 </script>
 <section class:expanded={opened} aria-label="NFO 语言导出">
  <button class="btn" type="button" aria-expanded={opened} disabled={busy} title={opened ? '收起（保留当前填写内容）' : '展开'} onclick={()=>opened=!opened}><Icon name="globe" size={15}/>语言与 NFO<Icon name="chevron-down" size={16}/></button>
- <div class="export-body tool-content" hidden={!opened}>
- <p class="muted">原文标题：{meta.text_versions?.original.title??meta.original_title??'原文未保存'}<br/>原文简介：{meta.text_versions?.original.plot??'原文未保存'}</p>
- {#each Object.entries(meta.text_versions?.localized??{}) as [tag,text]}<div><strong>{tag} 已保存文本</strong><p>{text.title??'标题未保存'}</p><p>{text.plot??'简介未保存'}</p><button class="btn" disabled={busy} onclick={()=>selectSaved(tag)}>预览选择 {tag} 为当前文本</button></div>{/each}
- <button class="btn" aria-expanded={editVersions} onclick={()=>editVersions=!editVersions}>保存已有语言文本</button>{#if editVersions}<div><p>这里保存您提供的文本，AI 汉化仍只生成 zh-Hans；勾选字段后空白也会作为明确版本保存。</p><label>语言标签 <input aria-label="文本语言标签" bind:value={languageTag}/></label><label><input type="checkbox" bind:checked={includeTitle}/>保存标题 <input aria-label="语言版本标题" bind:value={versionTitle}/></label><label><input type="checkbox" bind:checked={includePlot}/>保存简介 <textarea aria-label="语言版本简介" bind:value={versionPlot}></textarea></label><label><input type="checkbox" bind:checked={selectVersion}/>同时选为当前文本（锁定字段优先）</label><button class="btn" disabled={busy} onclick={inspectText}>预览保存语言版本</button></div>{/if}
- <label>导出语言 <select aria-label="NFO 导出语言" bind:value={language} disabled={busy}><option value="current">当前文本</option><option value="zh-Hans">简体中文</option><option value="original">来源原文</option></select></label>
- <button class="btn" disabled={busy} onclick={inspect}>预览 NFO 导出</button>
- {#if preview}<div aria-label="NFO 语言差异">{#each preview.changes as change}<p>{change.field}：<del>{String(change.before??'（空）')}</del> → {String(change.after??'（空）')}</p>{/each}{#each preview.warnings??[] as warning}<p role="status">{warning}</p>{/each}<p>只更新 NFO 与文本版本记录，影片路径保持原位。人工锁定字段（包括空值）优先。</p><button class="btn primary" disabled={busy} onclick={save}>确认导出 NFO</button></div>{/if}
- {#if journalId}<button class="btn" disabled={busy} onclick={undo}>撤销 NFO 导出</button>{/if}
+ <div class="tool-content" hidden={!opened}>
+ <div class="tool-fields">
+  <div class="export-group">
+   <h3>影片文本</h3>
+   <p class="muted">原文标题：{meta.text_versions?.original.title??meta.original_title??'原文未保存'}<br/>原文简介：{meta.text_versions?.original.plot??'原文未保存'}</p>
+   {#each Object.entries(meta.text_versions?.localized??{}) as [tag,text]}
+    <div class="saved-text"><strong>{tag} 已保存文本</strong><p>{text.title??'标题未保存'}</p><p>{text.plot??'简介未保存'}</p><div class="tool-actions start"><button class="btn" disabled={busy} onclick={()=>selectSaved(tag)}>预览选择 {tag} 为当前文本</button></div></div>
+   {/each}
+   <div class="tool-actions start"><button class="btn" aria-expanded={editVersions} disabled={busy} onclick={()=>editVersions=!editVersions}>保存已有语言文本</button></div>
+  </div>
+  <div class="export-group">
+   <h3>NFO 导出</h3>
+   <p class="muted">将所选语言的文本写回这部影片目录中的 NFO。</p>
+   <label class="tool-field">导出语言<select class="input" aria-label="NFO 导出语言" bind:value={language} disabled={busy}><option value="current">当前文本</option><option value="zh-Hans">简体中文</option><option value="original">来源原文</option></select></label>
+   <div class="tool-actions start">
+    <button class="btn" disabled={busy} onclick={inspect}>预览 NFO 导出</button>
+    {#if journalId}<button class="btn" disabled={busy} onclick={undo}>撤销 NFO 导出</button>{/if}
+   </div>
+  </div>
+ </div>
+ {#if editVersions}
+  <fieldset disabled={busy}>
+   <legend>语言版本</legend>
+   <p>勾选的字段会保存为此语言的版本，支持保存空值。AI 汉化生成简体中文。</p>
+   <div class="tool-fields">
+    <label class="tool-field">语言标签<input class="input" aria-label="文本语言标签" bind:value={languageTag}/></label>
+    <label class="check"><input class="checkbox" type="checkbox" bind:checked={selectVersion}/>同时选为当前文本（锁定字段优先）</label>
+    <div class="tool-field wide">
+     <label class="check"><input class="checkbox" type="checkbox" bind:checked={includeTitle}/>保存标题</label>
+     <input class="input" aria-label="语言版本标题" bind:value={versionTitle}/>
+    </div>
+    <div class="tool-field wide">
+     <label class="check"><input class="checkbox" type="checkbox" bind:checked={includePlot}/>保存简介</label>
+     <textarea class="input" aria-label="语言版本简介" bind:value={versionPlot} rows="3"></textarea>
+    </div>
+   </div>
+   <div class="tool-actions"><button class="btn" onclick={inspectText}>预览保存语言版本</button></div>
+  </fieldset>
+ {/if}
+ {#if preview}
+  <div aria-label="NFO 语言差异">
+   <p>写入位置 <span class="mono">{preview.nfoPath??preview.dir}</span></p>
+   {#each preview.changes as change}<p>{change.field}：<del>{String(change.before??'（空）')}</del> → {String(change.after??'（空）')}</p>{/each}
+   {#each preview.warnings??[] as warning}<p role="status">{warning}</p>{/each}
+   <p>只更新 NFO 与文本版本记录，影片路径保持原位。人工锁定字段（包括空值）优先。</p>
+   <div class="tool-actions"><button class="btn primary" disabled={busy} onclick={save}>确认导出 NFO</button></div>
+  </div>
+ {/if}
  {#if error}<p role="alert">{error}</p>{/if}
 </div>
 </section>
 
 <style>
- .export-body { margin-top: var(--s3); }
  p { font-size: var(--fs-sm); overflow-wrap: anywhere; }
- label { display: flex; flex-wrap: wrap; gap: var(--s2); align-items: center; margin: var(--s3) 0; }
- input:not([type=checkbox]), select, textarea { min-width: 0; max-width: 100%; }
- textarea { width: 100%; }
- button { margin: var(--s1) var(--s1) var(--s1) 0; }
+ h3 { margin-bottom: var(--s2); font-size: var(--fs-sm); }
+ .export-group, fieldset { min-width: 0; padding: var(--s3); border: 1px solid var(--line); border-radius: var(--r-sm); }
+ fieldset { margin: var(--s4) 0 0; }
+ legend { padding-inline: var(--s2); }
+ fieldset > p, .saved-text { margin-block: var(--s2) var(--s3); }
+ .check { display: flex; gap: var(--s2); align-items: center; }
 </style>

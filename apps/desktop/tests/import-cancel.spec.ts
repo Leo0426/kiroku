@@ -5,14 +5,24 @@ type Kind = 'scrape' | 'url' | 'apply'
 
 // Hold only the native start response; the real flow still owns events and UI state.
 async function prepare(page: Page, kind: Kind) {
-  await seedLibrary(page)
+  if (kind === 'apply') {
+    await page.addInitScript(() => localStorage.setItem('kiroku-mock-settings-v2', JSON.stringify({
+      library_root:'/mock/library', source_dirs:['/mock/companion-import'],
+    })))
+  } else await seedLibrary(page)
   await page.goto('/')
+  if (kind === 'apply') {
+    await page.getByRole('button', { name:'导入整理', exact:true }).click()
+    await page.getByRole('button', { name:'开始扫描', exact:true }).click()
+    await page.getByRole('button', { name:'预览整理', exact:true }).click()
+    await expect(page.getByRole('button', { name:/确认整理/ })).toBeEnabled()
+  }
   await page.evaluate(async kind => {
     const { api } = await import('/src/lib/api.ts')
     const { flow } = await import('/src/lib/importflow.svelte.ts')
     const { emitMock } = await import('/src/lib/events.ts')
     await flow.init()
-    flow.items = [{ id: 0, path: '/source/ABC-123.mp4', size: 1,
+    if (kind !== 'apply') flow.items = [{ id: 0, path: '/source/ABC-123.mp4', size: 1,
       info: { number: 'ABC-123', content_type: 'censored', prefix: 'ABC', cd: null,
         has_subtitle: false, mosaic: 'censored', definition: null, matched: true },
       code: { kind: 'Standard', id: 'ABC-123', content_type: 'censored', part: null,
@@ -21,7 +31,11 @@ async function prepare(page: Page, kind: Kind) {
     const start = () => new Promise<number>((resolve, reject) => state.starts.push({ resolve, reject }))
     api.scrapeStart = start
     api.scrapeUrlStart = start
-    api.applyStart = start
+    const reviewedToken=flow.planToken
+    api.applyStart = (ids,token) => {
+      if (!reviewedToken || token!==reviewedToken || !ids.length) throw new Error('测试未提交已确认的整理计划')
+      return start()
+    }
     api.jobCancel = async jobId => { state.cancelled.push(jobId ?? null); return true }
     state.start = () => kind === 'apply' ? flow.startApply()
       : kind === 'url' ? flow.scrapeUrl('ABC-123', 'https://example.test/movie/ABC-123') : flow.startScrape()
@@ -30,14 +44,14 @@ async function prepare(page: Page, kind: Kind) {
       else emitMock('scrape:event', { jobId, code: 'ABC-123', status: { kind: 'scraping', site: 'example' }, done: 0, total: 1, preview: null, note: null })
     }
     state.done = (jobId: number) => {
-      if (kind === 'apply') emitMock('apply:done', { jobId, journalId: 'test', applied: 0, failed: [],
+      if (kind === 'apply') emitMock('apply:done', { jobId, journalId: 'test', canRollback: false, applied: 0, failed: [],
         cancelled: true, indexError: null, cleaned: [] })
       else emitMock('scrape:done', { jobId, found: 0, notFound: 0, failed: 0, cancelled: true })
     }
     state.pending = state.start()
     ;(window as any).cancelTest = state
   }, kind)
-  await page.getByRole('button', { name: '导入整理', exact: true }).click()
+  if (kind !== 'apply') await page.getByRole('button', { name: '导入整理', exact: true }).click()
 }
 
 test('another task’s logs cannot claim a pending apply or receive its stop request', async ({ page }) => {

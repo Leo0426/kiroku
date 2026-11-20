@@ -24,6 +24,8 @@ use tokio_util::sync::CancellationToken;
 use walkdir::WalkDir;
 
 mod images;
+mod local_import;
+pub use local_import::LocalImport;
 
 pub const VIDEO_EXT: &[&str] = &["mp4", "mkv", "avi", "wmv", "mov", "ts", "m2ts", "flv", "rmvb"];
 
@@ -136,6 +138,7 @@ pub enum ScrapeError {
     /// 该内容类型没有启用的数据源路由
     NoRoute,
     NotFound,
+    CacheMiss,
     Cancelled,
     /// 每个站点的失败说明
     Failed(Vec<String>),
@@ -146,6 +149,7 @@ impl ScrapeError {
         match self {
             Self::NoRoute => "该内容类型没有可用的数据源".into(),
             Self::NotFound => "所有数据源都没有找到".into(),
+            Self::CacheMiss => "没有可复用的来源缓存；请关闭仅缓存模式后补刮".into(),
             Self::Cancelled => "已取消".into(),
             Self::Failed(v) => v.join("; "),
         }
@@ -196,12 +200,18 @@ pub struct Preview {
     pub score: Option<f32>,
     /// 实际给出数据的站点
     pub sources: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_assets: Option<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub local_cover: bool,
 }
 
 impl Preview {
     pub fn of(m: &Metadata) -> Self {
         let f = &m.fields;
+        let local_cover = m.import_local.as_ref().is_some_and(|local| local.prefers_local_poster());
         let (cover, landscape) = match (f.thumb_urls.first(), f.poster_urls.first()) {
+            _ if local_cover => (None, false),
             (Some(t), _) => (Some(t.clone()), true),
             (None, Some(p)) => (Some(p.clone()), false),
             _ => (None, false),
@@ -220,8 +230,37 @@ impl Preview {
             actors: f.actors.iter().take(4).map(|a| a.name.clone()).collect(),
             score: m.mean_score(),
             sources,
+            local_assets: m.import_local.as_ref().map(|local| local.notice()),
+            local_cover,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LocalImportEntry {
+    pub code: String,
+    pub reusable: bool,
+    pub preview: Preview,
+}
+
+/// Prepare reusable NFO metadata and report local companions without contacting sources.
+pub fn inspect_import(items: &[ScanItem], cancel: &CancellationToken) -> (Vec<LocalImportEntry>, HashMap<String, Metadata>) {
+    let mut discovered: Vec<_> = local_import::discover(items, cancel).into_iter().collect();
+    discovered.sort_by(|(a, _), (b, _)| a.cmp(b));
+    let mut entries = Vec::with_capacity(discovered.len());
+    let mut ready = HashMap::new();
+    for (code, local) in discovered {
+        let reusable = local.has_nfo();
+        let mut meta = local.metadata(&code);
+        meta.import_local = Some(local);
+        let mut preview = Preview::of(&meta);
+        // Scanning is an offline step, including the metadata thumbnails.
+        preview.cover = None;
+        preview.cover_is_landscape = false;
+        entries.push(LocalImportEntry { code: code.clone(), reusable, preview });
+        if reusable { ready.insert(code, meta); }
+    }
+    (entries, ready)
 }
 
 pub struct Scraper {
@@ -235,6 +274,7 @@ pub struct Scraper {
     translator: Option<crate::translate::Translator>,
     import_cache: Option<crate::import_cache::ImportCache>,
     cached_sources_only: bool,
+    cache_summary: std::sync::Mutex<crate::import_cache::CacheSummary>,
 }
 
 /// 页面里是否出现了番号的常见写法(`midv-018`、`midv018`、DMM cid `midv00018`),不区分大小写。
@@ -291,6 +331,8 @@ pub(crate) fn source_clients(settings: &Settings, global: &Http) -> reqwest::Res
 }
 
 impl Scraper {
+    pub fn cache_summary(&self)->crate::import_cache::CacheSummary {self.cache_summary.lock().unwrap_or_else(|e|e.into_inner()).clone()}
+
     pub fn new(settings: Settings) -> Result<Self, String> {
         let sources = settings.build_sources();
         Self::with_sources(settings, sources)
@@ -329,7 +371,7 @@ impl Scraper {
             sources,
             translator,
             import_cache: None,
-            cached_sources_only: false,
+            cached_sources_only: false, cache_summary: Default::default(),
         })
     }
 
@@ -356,8 +398,19 @@ impl Scraper {
     ) -> Result<Metadata, ScrapeError> {
         let mut combined=std::collections::BTreeMap::new();
         if !force {if let Some(cache)=self.import_cache.clone(){
-            let code=code.clone();let sites=self.settings.sources.iter().map(|s|s.id.clone()).collect::<Vec<_>>();
-            combined=tokio::task::spawn_blocking(move||sites.into_iter().filter_map(|site|cache.source(&code,&site).map(|s|(site,s))).collect()).await.unwrap_or_default();
+            let chains=self.settings.chains_for(code.content_type);
+            let sites=self.sources.iter().filter(|s|s.supports(code)&&chains.route.iter().any(|id|id==s.id())&&!cached.contains_key(s.id())&&self.settings.sources.iter().any(|cfg|cfg.id==s.id()&&cfg.enabled)).map(|s|s.id().to_owned()).collect::<Vec<_>>();
+            let code=code.clone();
+            if let Ok((loaded,summary))=tokio::task::spawn_blocking(move||{
+                let mut loaded=std::collections::BTreeMap::new();let mut summary=crate::import_cache::CacheSummary::default();
+                for site in sites {match cache.source(&code,&site){
+                    Ok(snapshot)=>{loaded.insert(site,snapshot);},
+                    Err(error)=>match error.kind(){std::io::ErrorKind::NotFound=>summary.missing+=1,std::io::ErrorKind::InvalidData=>summary.corrupt+=1,_=>summary.unreadable+=1}
+                }}
+                (loaded,summary)
+            }).await {
+                combined=loaded;self.cache_summary.lock().unwrap_or_else(|e|e.into_inner()).merge(&summary);
+            }
         }}
         combined.extend(cached.clone());
         self.scrape_with(code, &combined, force, None, cancel, on_site).await
@@ -443,10 +496,12 @@ impl Scraper {
                 if let Some(snapshot) = cached.get(site).filter(|snapshot| {
                     snapshot.matches_config(code, cfg, self.settings.proxy_for(cfg))
                 }) {
+                    self.cache_summary.lock().unwrap_or_else(|e|e.into_inner()).reused+=1;
                     slots.push(Slot::Ready(s.id(), snapshot.fields.clone()));
                     continue;
                 }
             }
+            if !force && cached.contains_key(site) {self.cache_summary.lock().unwrap_or_else(|e|e.into_inner()).invalidated+=1;}
             if self.cached_sources_only {not_found+=1;continue;}
             if let Some(reason) = self.breaker.lock().unwrap_or_else(|e| e.into_inner()).paused.get(site.as_str()) {
                 paused.push(format!("{site}: 来源暂停(本批连续 {PAUSE_AFTER} 次失败:{reason}),可稍后重试未完成项"));
@@ -510,6 +565,10 @@ impl Scraper {
         }
         if parts.is_empty() {
             errors.extend(paused);
+            if self.cached_sources_only && asked>0 {
+                self.cache_summary.lock().unwrap_or_else(|e|e.into_inner()).skipped_movies+=1;
+                return Err(ScrapeError::CacheMiss);
+            }
             return Err(if !errors.is_empty() {
                 ScrapeError::Failed(errors)
             } else if asked == 0 || not_found > 0 {
@@ -625,7 +684,7 @@ pub async fn scrape_all(
         }
         let on_site = |site: &str| on_event(ScrapeEvent { code: code.id.clone(), status: ScrapeStatus::Scraping { site: site.to_string() }, done: i, total, preview: None, note: None });
         let r = sc.scrape_item(code, cancel, &on_site).await;
-        out.insert(code.id.clone(), finish_item(sc, &code.id, (i, total), r, cancel, on_event).await);
+        out.insert(code.id.clone(), finish_item(sc, &code.id, (i, total), r, true, cancel, on_event).await);
     }
     out
 }
@@ -638,10 +697,23 @@ pub async fn scrape_url_one(
     cancel: &CancellationToken,
     on_event: &(dyn Fn(ScrapeEvent) + Send + Sync),
 ) -> Result<Metadata, ScrapeError> {
+    scrape_import_url(sc, code, url, None, cancel, on_event).await
+}
+
+pub async fn scrape_import_url(
+    sc: &Scraper,
+    code: &Code,
+    url: &str,
+    previous: Option<Metadata>,
+    cancel: &CancellationToken,
+    on_event: &(dyn Fn(ScrapeEvent) + Send + Sync),
+) -> Result<Metadata, ScrapeError> {
     let site = sc.settings.source_for_url(url).map(|c| c.id.clone()).unwrap_or_default();
     on_event(ScrapeEvent { code: code.id.clone(), status: ScrapeStatus::Scraping { site }, done: 0, total: 1, preview: None, note: None });
     let r = sc.scrape_url(code, url, cancel).await;
-    finish_item(sc, &code.id, (0, 1), r, cancel, on_event).await
+    let local = previous.as_ref().and_then(|m| m.import_local.clone());
+    let (r, translate) = resolve_import(r, previous, local, true);
+    finish_item(sc, &code.id, (0, 1), r, translate, cancel, on_event).await
 }
 
 /// 一部影片刮削后的共同收尾:AI 汉化(失败只记提示)、合并提示、日志和结果事件。
@@ -650,6 +722,7 @@ async fn finish_item(
     id: &str,
     (i, total): (usize, usize),
     mut r: Result<Metadata, ScrapeError>,
+    translate: bool,
     cancel: &CancellationToken,
     on_event: &(dyn Fn(ScrapeEvent) + Send + Sync),
 ) -> Result<Metadata, ScrapeError> {
@@ -657,14 +730,16 @@ async fn finish_item(
         on_event(ScrapeEvent { code: id.to_string(), status, done, total, preview, note })
     };
     let mut note = None;
-    if let (Ok(m), Some(tr)) = (r.as_mut(), sc.translator.as_ref()) {
+    if let (Ok(m), Some(tr)) = (r.as_mut(), sc.translator.as_ref().filter(|_| translate)) {
         let f = &m.fields;
-        if f.title.as_deref().is_some_and(crate::translate::has_kana) || f.plot.as_deref().is_some_and(crate::translate::has_kana) {
+        let from_web = |field| m.provenance.get(field).is_none_or(|source| source != "local_nfo");
+        let title = f.title.as_deref().filter(|_| from_web("title"));
+        let plot = f.plot.as_deref().filter(|_| from_web("plot"));
+        if title.is_some_and(crate::translate::has_kana) || plot.is_some_and(crate::translate::has_kana) {
             emit(ScrapeStatus::Translating, i, None, None);
-            let (title, plot) = (f.title.clone(), f.plot.clone());
             let t = tokio::select! {
                 _ = cancel.cancelled() => Err("已取消".to_string()),
-                t = tr.translate(title.as_deref(), plot.as_deref()) => t,
+                t = tr.translate(title, plot) => t,
             };
             match t {
                 Ok(t) => apply_translation(m, t),
@@ -679,6 +754,7 @@ async fn finish_item(
     let status = match &r {
         Ok(_) => ScrapeStatus::Found,
         Err(ScrapeError::NotFound) => ScrapeStatus::NotFound,
+        Err(error @ ScrapeError::CacheMiss) => {note=Some(error.message());ScrapeStatus::NotFound},
         Err(ScrapeError::NoRoute) => ScrapeStatus::NoRoute,
         Err(ScrapeError::Cancelled) => ScrapeStatus::Cancelled,
         Err(e @ ScrapeError::Failed(_)) => ScrapeStatus::Failed { message: e.message() },
@@ -703,6 +779,63 @@ pub async fn scrape_missing(sc: &Scraper, codes: &[Code], successful: &HashMap<S
     if !cancel.is_cancelled() { for code in &codes { if let Some(meta)=successful.get(&code.id) { reused+=1;on_event(ScrapeEvent{code:code.id.clone(),status:ScrapeStatus::Found,done:reused,total:codes.len(),preview:Some(Preview::of(meta)),note:Some("复用已有元数据，不重新联网".into())}); } } }
     let missing: Vec<_> = codes.iter().filter(|code| !successful.contains_key(&code.id)).map(|code|(*code).clone()).collect();
     scrape_all(sc, &missing, cancel, &|mut ev| { ev.done+=reused;ev.total=codes.len();on_event(ev) }).await
+}
+
+/// Resolve the selected files of an import batch.
+pub async fn scrape_import(sc: &Scraper, items: &[ScanItem], successful: &HashMap<String, Metadata>, refresh: bool, cancel: &CancellationToken, on_event: &(dyn Fn(ScrapeEvent) + Send + Sync)) -> HashMap<String, Result<Metadata, ScrapeError>> {
+    let mut seen = HashSet::new();
+    let codes: Vec<_> = items.iter().filter_map(|item| item.code.as_ref()).filter(|code| seen.insert(&code.id)).collect();
+    let pending: Vec<_> = items.iter().filter(|item| item.code.as_ref().is_some_and(|c| refresh || !successful.contains_key(&c.id))).cloned().collect();
+    let discovery_cancel = cancel.clone();
+    let local = tokio::task::spawn_blocking(move || local_import::discover(&pending, &discovery_cancel)).await.unwrap_or_default();
+    let total = codes.len();
+    let mut out = HashMap::new();
+    for (i, code) in codes.into_iter().enumerate() {
+        if cancel.is_cancelled() { break; }
+        let previous = successful.get(&code.id);
+        if let Some(meta) = previous.filter(|_| !refresh) {
+            on_event(ScrapeEvent { code: code.id.clone(), status: ScrapeStatus::Found, done: i + 1, total, preview: Some(Preview::of(meta)), note: Some("复用已有元数据".into()) });
+            continue;
+        }
+        let companions = local.get(&code.id).cloned().or_else(|| previous.and_then(|meta| meta.import_local.clone()));
+        let baseline = previous.cloned().or_else(|| companions.as_ref().map(|local| local.metadata(&code.id)));
+        let use_nfo = !refresh && companions.as_ref().is_some_and(|local| local.has_nfo());
+        let (resolved, translate) = if use_nfo {
+            (with_import_companions(Ok(baseline.expect("local NFO has metadata")), companions, false), false)
+        } else {
+            let on_site = |site: &str| on_event(ScrapeEvent { code: code.id.clone(), status: ScrapeStatus::Scraping { site: site.into() }, done: i, total, preview: None, note: None });
+            let online = sc.scrape_cached(code, &Default::default(), refresh, cancel, &on_site).await;
+            resolve_import(online, baseline, companions, refresh)
+        };
+        out.insert(code.id.clone(), finish_item(sc, &code.id, (i, total), resolved, translate, cancel, on_event).await);
+    }
+    out
+}
+
+fn resolve_import(online: Result<Metadata, ScrapeError>, baseline: Option<Metadata>, companions: Option<Arc<LocalImport>>, refresh: bool) -> (Result<Metadata, ScrapeError>, bool) {
+    let translate = online.is_ok();
+    let resolved = match (online, baseline) {
+        (Ok(fresh), Some(before)) => local_import::merge_remote(&before, &fresh).map_err(|error| ScrapeError::Failed(vec![error.to_string()])),
+        (Ok(fresh), None) => Ok(fresh),
+        (Err(ScrapeError::Cancelled), _) => Err(ScrapeError::Cancelled),
+        (Err(error), Some(mut before)) => {
+            before.scrape_notes = vec![format!("站点未返回可用资料，沿用现有资料（{}）", error.message())];
+            Ok(before)
+        }
+        (Err(error), None) => Err(error),
+    };
+    (with_import_companions(resolved, companions, refresh && translate), translate)
+}
+
+fn with_import_companions(resolved: Result<Metadata, ScrapeError>, companions: Option<Arc<LocalImport>>, refresh: bool) -> Result<Metadata, ScrapeError> {
+    resolved.map(|mut meta| {
+        if let Some(mut local) = companions {
+            Arc::make_mut(&mut local).refresh = refresh;
+            meta.scrape_notes.push(local.notice());
+            meta.import_local = Some(local);
+        }
+        meta
+    })
 }
 
 /// 把译文写回元数据；调用方在来源聚合/字段采用时保存原文。旧元数据只恢复可靠原文。
@@ -757,7 +890,7 @@ pub struct PlanItem {
     pub selected: bool,
     /// 作为同分片新版本并存(ADR-0008),默认不选
     pub new_version: bool,
-    #[serde(skip)]
+    #[serde(rename = "actions", serialize_with = "serialize_actions")]
     pub ops: Vec<Op>,
     #[serde(skip)]
     pub root: PathBuf,
@@ -765,12 +898,21 @@ pub struct PlanItem {
     #[serde(skip)]
     pub image_candidates: HashMap<PathBuf, Vec<ImageCandidate>>,
     pub notices: Vec<String>,
-    #[serde(skip)]
+    #[serde(rename = "existingMovie", serialize_with = "serialize_existing_movie")]
     pub append_preview: Option<crate::append::AppendPreview>,
     #[serde(skip)]
     pub root_guard: Option<RootGuard>,
 }
 
+fn serialize_existing_movie<S: serde::Serializer>(preview: &Option<crate::append::AppendPreview>, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_bool(preview.is_some())
+}
+
+fn serialize_actions<S: serde::Serializer>(ops: &[Op], serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.collect_seq(ops.iter().map(Op::describe))
+}
+
+pub mod import_rules;
 mod root_guard;
 pub use root_guard::RootGuard;
 
@@ -779,6 +921,13 @@ pub fn build_plans(items: &[(&ScanItem, &Code)], metas: &HashMap<String, Metadat
 }
 
 pub fn build_plans_cancellable(items:&[(&ScanItem,&Code)],metas:&HashMap<String,Metadata>,root:&Path,tpl:&str,opts:PlanOpts,cancel:&CancellationToken)->io::Result<Vec<PlanItem>> {
+    build_import_plans(items, metas, root, tpl, opts, &HashMap::new(), cancel)
+}
+
+pub fn build_import_plans(items:&[(&ScanItem,&Code)],metas:&HashMap<String,Metadata>,root:&Path,tpl:&str,opts:PlanOpts,renames:&HashMap<u32,String>,cancel:&CancellationToken)->io::Result<Vec<PlanItem>> {
+    for name in renames.values() {
+        import_rules::validate_literal(name).map_err(|message|io::Error::new(io::ErrorKind::InvalidInput,message))?;
+    }
     crate::append::check_cancel(cancel)?;
     let requested:Vec<_>=items.iter().filter(|(_,code)|metas.contains_key(&code.id)).map(|(_,code)|code.id.as_str()).collect();
     if requested.is_empty(){return Ok(vec![]);}
@@ -834,13 +983,14 @@ pub fn build_plans_cancellable(items:&[(&ScanItem,&Code)],metas:&HashMap<String,
         }};
         {
             if !dirs.is_empty() {
-                let preview = crate::append::preview_from_targets(root, &code.id, std::slice::from_ref(&item.path), None, None, cancel, &dirs);
+                let preview = crate::append::preview_import_target(root, &code.id, &item.path, cancel, &dirs, renames.get(&item.id).map(String::as_str));
                 let (ops, guard, messages) = match preview {
                     Ok(mut p) => {let _=p.set_mode(opts.mode);(p.ops.clone(), Some(p.clone()), p.conflicts.clone())},
                     Err(e) => (vec![], None, vec![e.to_string()]),
                 };
                 let to = ops.first().map(|o| o.target().to_path_buf()).unwrap_or_else(|| dirs[0].join(item.path.file_name().unwrap_or_default()));
-                let mut conflicts: Vec<_> = messages.iter().map(|_| ConflictDetail { kind: Conflict::TargetExists, path: to.clone() }).collect();
+                let reason = if guard.is_none() { Conflict::InvalidLibrary } else { Conflict::TargetExists };
+                let mut conflicts: Vec<_> = messages.iter().map(|_| ConflictDetail { kind: reason, path: to.clone() }).collect();
                 for op in &ops { if !taken.insert(op.target().to_path_buf()) { conflicts.push(ConflictDetail { kind: Conflict::DuplicateInBatch, path: op.target().to_path_buf() }); } }
                 let conflict = conflicts.first().map(|c| c.kind);
                 let new_version=guard.as_ref().is_some_and(|p|!p.new_versions.is_empty());
@@ -848,20 +998,39 @@ pub fn build_plans_cancellable(items:&[(&ScanItem,&Code)],metas:&HashMap<String,
                 continue;
             }
         }
+        let renamed;
+        let opts = if let Some(suffix) = renames.get(&item.id) {
+            let tpl = if opts.plex_naming { crate::template::PLEX_FILE_TEMPLATE } else if opts.file_template.is_empty() { crate::template::DEFAULT_FILE_TEMPLATE } else { &opts.file_template };
+            renamed = PlanOpts { plex_naming: false, file_template: format!("{tpl} - {suffix}"), ..opts.clone() };
+            &renamed
+        } else { &opts };
         let with_meta = first_of.get(code.id.as_str()).is_some_and(|(first, _)| *first == i);
         let companions = item.path.parent().map(|dir| subtitle_dirs.entry(dir.to_path_buf()).or_insert_with(|| crate::subtitle::Directory::read(dir)).siblings(&item.path, code)).unwrap_or_default();
-        let naming=organize::preview_paths_with_subtitles(&item.path,code,meta,tpl,&opts,&companions);
+        let naming=organize::preview_paths_with_subtitles(&item.path,code,meta,tpl,opts,&companions).and_then(|paths| {
+            if renames.get(&item.id).is_some_and(|suffix| !paths.1.ends_with(&format!(" - {suffix}"))) {
+                return Err("文件名太长，无法保留另存后缀。请缩短文件名模板或后缀".into());
+            }
+            Ok(paths)
+        });
         let mut naming_error=naming.as_ref().err().cloned();
         let mut notices=naming.map(|(_,_,warnings)|warnings).unwrap_or_else(|message|vec![message]);
         notices.extend(crate::localization::project(meta,&opts.nfo_language).warnings);
         notices.extend(crate::names::warnings(meta));
-        let mut ops = if naming_error.is_some(){vec![]}else{organize::plan_with_subtitles(&item.path, code, meta, root, tpl, with_meta, &opts, &phases[code.id.as_str()], &companions).ops};
+        let mut ops = if naming_error.is_some(){vec![]}else{organize::plan_with_subtitles(&item.path, code, meta, root, tpl, with_meta, opts, &phases[code.id.as_str()], &companions).ops};
         if ops.is_empty() && naming_error.is_none(){let message="无法在 240 UTF-8 字节内保留番号、分片及字幕扩展名".to_string();notices.push(message.clone());naming_error=Some(message);}
         ops.retain(|op| match op {
             op if op.source().is_some_and(|from|from != item.path) => subs_claimed.insert(op.source().unwrap().to_path_buf()),
             _ => true,
         });
         let to = ops.iter().find(|o|o.source().is_some()).map(|o|o.target().to_path_buf()).unwrap_or_default();
+        let mut candidates = image_candidates(&ops, meta);
+        if let (true, Some(local), Some(dir)) = (with_meta, &meta.import_local, to.parent()) {
+            notices.push(local.notice());
+            if let Err(error) = local.attach(&mut ops, &mut candidates, meta, dir) {
+                notices.push(error.to_string());
+                naming_error = Some(error.to_string());
+            }
+        }
         let mut conflicts: Vec<_> = ops.iter().filter_map(|op| {
             let path = op.target();
             let kind = if !taken.insert(path.to_path_buf()) { Some(Conflict::DuplicateInBatch) }
@@ -889,7 +1058,7 @@ pub fn build_plans_cancellable(items:&[(&ScanItem,&Code)],metas:&HashMap<String,
             conflict,
             conflicts,
             notices,
-            image_candidates: image_candidates(&ops, meta),
+            image_candidates: candidates,
             ops,
             root: root.to_path_buf(),
             append_preview: None,
@@ -924,7 +1093,7 @@ pub fn build_plans_cancellable(items:&[(&ScanItem,&Code)],metas:&HashMap<String,
         }
         p.conflict = p.conflicts.first().map(|c| c.kind);
         // 新版本并存(ADR-0008)需要用户明确勾选
-        p.selected = p.conflict.is_none() && !p.new_version;
+        p.selected = p.conflict.is_none() && !p.new_version && !p.ops.is_empty();
     }
     crate::append::check_cancel(cancel)?;
     let validity=root_guard.as_ref().map(RootGuard::verify).transpose().and_then(|_|{
@@ -940,18 +1109,27 @@ pub fn build_plans_cancellable(items:&[(&ScanItem,&Code)],metas:&HashMap<String,
 
 /// A candidate carries its own transform: portrait fallback must not inherit landscape cropping.
 #[derive(Debug, Clone)]
-pub struct ImageCandidate { pub url: String, pub crop: Option<organize::Crop> }
+pub struct ImageCandidate {
+    pub url: String,
+    pub crop: Option<organize::Crop>,
+    local: Option<local_import::LocalImage>,
+    fresh: bool,
+}
+
+impl ImageCandidate {
+    fn remote(url: String, crop: Option<organize::Crop>) -> Self { Self { url, crop, local: None, fresh: false } }
+}
 
 fn image_candidates(ops: &[Op], meta: &Metadata) -> HashMap<PathBuf, Vec<ImageCandidate>> {
     ops.iter().filter_map(|op| {
         let Op::Download { path, url, crop, .. } = op else { return None };
         let mut candidates = vec![];
         if crate::assets::is_poster(path) {
-            candidates.extend(meta.fields.thumb_urls.iter().map(|url| ImageCandidate { url: url.clone(), crop: Some(organize::Crop::PosterRight) }));
-            candidates.extend(meta.fields.poster_urls.iter().map(|url| ImageCandidate { url: url.clone(), crop: None }));
+            candidates.extend(meta.fields.thumb_urls.iter().map(|url| ImageCandidate::remote(url.clone(), Some(organize::Crop::PosterRight))));
+            candidates.extend(meta.fields.poster_urls.iter().map(|url| ImageCandidate::remote(url.clone(), None)));
         } else if crate::assets::is_fanart(path) {
-            candidates.extend(meta.fields.thumb_urls.iter().map(|url| ImageCandidate { url: url.clone(), crop: None }));
-        } else { candidates.push(ImageCandidate { url: url.clone(), crop: *crop }); }
+            candidates.extend(meta.fields.thumb_urls.iter().map(|url| ImageCandidate::remote(url.clone(), None)));
+        } else { candidates.push(ImageCandidate::remote(url.clone(), *crop)); }
         Some((path.clone(), candidates))
     }).collect()
 }
@@ -1010,6 +1188,8 @@ async fn prepare_images(http: &Http, plans: &mut [PlanItem], cancel: &Cancellati
     // Serial requests already bound concurrency to one. Artwork must not inherit
     // the scraper's 5s host interval; retry backoff/Retry-After still apply.
     let http = http.for_images();
+    let fresh: HashSet<_> = plans.iter().flat_map(|plan| plan.image_candidates.values().flatten())
+        .filter(|candidate| candidate.fresh).map(|candidate| candidate.url.clone()).collect();
     let total = plans.iter().flat_map(|p| &p.ops).filter(|op| matches!(op, Op::Download { .. })).count();
     let (mut done, mut failed) = (0, 0);
     on_progress(ApplyProgress { phase: ApplyPhase::Images, done, total, failed, code: None });
@@ -1018,26 +1198,30 @@ async fn prepare_images(http: &Http, plans: &mut [PlanItem], cancel: &Cancellati
     for plan in plans {
         warnings.entry(plan.item_id).or_default().extend(plan.notices.clone());
         for op in &mut plan.ops {
-            let Op::Download { url, path, crop, .. } = op else { continue };
+            let Op::Download { url, path, crop, stamp } = op else { continue };
             if cancel.is_cancelled() { return (images, warnings); }
             on_progress(ApplyProgress { phase: ApplyPhase::Images, done, total, failed, code: Some(plan.code.clone()) });
-            let candidates = plan.image_candidates.get(path).cloned().unwrap_or_else(|| vec![ImageCandidate { url: url.clone(), crop: *crop }]);
+            let candidates = plan.image_candidates.get(path).cloned().unwrap_or_else(|| vec![ImageCandidate::remote(url.clone(), *crop)]);
             let is_poster = crate::assets::is_poster(path);
             let mut valid = vec![];
             for candidate in candidates {
                 if cancel.is_cancelled() { return (images, warnings); }
+                let is_local = candidate.local.is_some();
+                if is_local && !valid.is_empty() { break; }
                 if !images.contains(&candidate.url) {
-                    let result = if candidate.url.trim().is_empty() { Err("候选 URL 为空".into()) } else {
-                        let response = tokio::select! { _ = cancel.cancelled() => return (images, warnings), response = http.get_image_bytes(&candidate.url, crate::net::IMAGE_RESPONSE_LIMIT) => response };
-                        match response {
+                    let result = if is_local { None } else if candidate.url.trim().is_empty() { Some(Err("候选 URL 为空".into())) } else {
+                        let response = tokio::select! { _ = cancel.cancelled() => return (images, warnings), response = http.image_bytes(&candidate.url, crate::net::IMAGE_RESPONSE_LIMIT, !fresh.contains(&candidate.url)) => response };
+                        Some(match response {
                             Ok((200, bytes)) => Ok(bytes),
                             Ok((status, _)) => Err(format!("HTTP {status}")),
                             Err(e) => Err(e.to_string()),
-                        }
+                        })
                     };
                     // Normalization, hashing and spill I/O stay off the async runtime.
                     let url = candidate.url.clone();
+                    let local = candidate.local.clone();
                     images = tokio::task::spawn_blocking(move || {
+                        let result = result.unwrap_or_else(|| local.expect("source companion").read().map_err(|error| error.to_string()));
                         let prepared = result.and_then(|bytes| crate::artwork::PreparedImage::normalize(&bytes)
                             .map_err(|e| format!("无效图片: {e}")));
                         images.insert(url, prepared);
@@ -1050,7 +1234,7 @@ async fn prepare_images(http: &Http, plans: &mut [PlanItem], cancel: &Cancellati
                 match images.info(&candidate.url) {
                     Ok(((w,h), _)) => {
                         valid.push((candidate, w, h));
-                        if !is_poster { break; }
+                        if !is_poster || is_local { break; }
                     }
                     Err(error) => {
                         let message = format!("{} 候选 {}: {error}", path.display(), candidate.url);
@@ -1063,6 +1247,7 @@ async fn prepare_images(http: &Http, plans: &mut [PlanItem], cancel: &Cancellati
             if let Some(index) = if is_poster {crate::artwork::preferred(&dims)} else {(!valid.is_empty()).then_some(0)} {
                 let chosen = &valid[index].0;
                 *url = chosen.url.clone(); *crop = chosen.crop;
+                if chosen.local.is_some() { *stamp = None; }
                 images.select(url);
                 log::info!(target: "kiroku::organize", "图片 {} 使用 {}", path.display(), url);
             } else { failed += 1; warnings.entry(plan.item_id).or_default().push(format!("{}: 无有效图片候选", path.display())); }
@@ -1070,7 +1255,7 @@ async fn prepare_images(http: &Http, plans: &mut [PlanItem], cancel: &Cancellati
             on_progress(ApplyProgress { phase: ApplyPhase::Images, done, total, failed, code: Some(plan.code.clone()) });
         }
         // Imports retain the actual unprocessed original. Repair deliberately never rewrites metadata.
-        let selected = plan.ops.iter().find_map(|op| match op {Op::Download{path,url,..} if crate::assets::is_poster(path) => images.info(url).ok().map(|(_,hash)|(path.parent().unwrap().to_path_buf(),url.clone(),hash.to_owned())),_=>None});
+        let selected = plan.ops.iter().find_map(|op| match op {Op::Download{path,url,..} if crate::assets::is_poster(path) && !url.starts_with("local-artwork:") => images.info(url).ok().map(|(_,hash)|(path.parent().unwrap().to_path_buf(),url.clone(),hash.to_owned())),_=>None});
         if let Some((dir,url,hash))=selected {
             if let Some(Op::WriteFile{content,..})=plan.ops.iter_mut().find(|op|matches!(op,Op::WriteFile{path,..} if path.file_name().is_some_and(|n|n==organize::SIDECAR))) {
                 if let Ok(mut meta)=serde_json::from_str::<Metadata>(content){
@@ -1114,6 +1299,7 @@ pub struct AppliedItem {
 
 #[derive(Debug)]
 pub struct ApplyOutcome {
+    pub image_failures: usize,
     pub journal: Journal,
     pub applied: Vec<AppliedItem>,
     /// (番号, 原因)
@@ -1286,11 +1472,19 @@ async fn apply_with_image_budget(
     // A rejected naming preview cannot acquire files or even create a journal on disk.
     if plans.iter().any(|p| p.conflicts.iter().any(|c|c.kind==Conflict::InvalidTemplate)) {
         let failed=plans.iter().map(|p|(p.code.clone(),"目录或文件模板无效，请重新预览".into())).collect();
-        return ApplyOutcome{journal:Journal::new(root),applied:vec![],failed,cancelled:false,cleaned:vec![]};
+        return ApplyOutcome{image_failures:0,journal:Journal::new(root),applied:vec![],failed,cancelled:false,cleaned:vec![]};
     }
     // Delay initial group metadata until all retained media records can be written together.
     let last:HashMap<String,usize>=plans.iter().enumerate().filter(|(_,p)|p.ops.iter().any(Op::retained)).map(|(i,p)|(p.code.clone(),i)).collect();
-    for i in 0..plans.len(){if let Some(&end)=last.get(&plans[i].code){if end!=i && plans[i].append_preview.is_none(){let mut media=vec![];let mut metadata=vec![];for op in std::mem::take(&mut plans[i].ops){if op.source().is_some(){media.push(op)}else{metadata.push(op)}}plans[i].ops=media;plans[end].ops.extend(metadata);}}}
+    for i in 0..plans.len() {
+        let Some(&end) = last.get(&plans[i].code) else { continue };
+        if end == i || plans[i].append_preview.is_some() { continue; }
+        let (media, metadata): (Vec<_>, Vec<_>) = std::mem::take(&mut plans[i].ops).into_iter().partition(|op| op.source().is_some());
+        plans[i].ops = media;
+        let candidates = std::mem::take(&mut plans[i].image_candidates);
+        plans[end].image_candidates.extend(candidates);
+        plans[end].ops.extend(metadata);
+    }
     let retains_sources=plans.iter().flat_map(|p|&p.ops).any(Op::retained);
     let cleanup=cleanup.filter(|_|!retains_sources);
     let root_guards:Vec<_>=plans.iter().filter_map(|p|p.root_guard.clone()).collect();
@@ -1300,9 +1494,13 @@ async fn apply_with_image_budget(
         let mut journal=Journal::new(root);journal.status=JournalStatus::Partial;
         let failed=plans.iter().map(|p|(p.code.clone(),format!("媒体库不可用，未执行：{error}"))).collect();
         for (i,p) in plans.iter().enumerate(){on_event(ApplyEvent{code:p.code.clone(),item_id:p.item_id,done:i+1,total:plans.len(),ok:false,error:Some(error.to_string()),warnings:vec![]});}
-        return ApplyOutcome{journal,applied:vec![],failed,cancelled:false,cleaned:vec![]};
+        return ApplyOutcome{image_failures:0,journal,applied:vec![],failed,cancelled:false,cleaned:vec![]};
     }
-    let (images, mut image_warnings) = prepare_images(http, &mut plans, cancel, on_progress, memory_budget).await;
+    let image_failures=std::sync::atomic::AtomicUsize::new(0);
+    let (images, mut image_warnings) = prepare_images(http, &mut plans, cancel, &|progress|{
+        image_failures.store(progress.failed,std::sync::atomic::Ordering::Relaxed);on_progress(progress);
+    }, memory_budget).await;
+    let image_failures=image_failures.load(std::sync::atomic::Ordering::Relaxed);
     let images = Arc::new(images);
     let guards=root_guards.clone();
     let initialized=tokio::task::spawn_blocking(move||guards.iter().try_for_each(RootGuard::initialize)).await.map_err(|error|io::Error::other(error.to_string())).and_then(|result|result);
@@ -1311,7 +1509,7 @@ async fn apply_with_image_budget(
         let failed=plans.iter().map(|plan|(plan.code.clone(),format!("媒体库不可用，未执行：{error}"))).collect();
         for (index,plan)in plans.iter().enumerate(){on_event(ApplyEvent{code:plan.code.clone(),item_id:plan.item_id,done:index+1,total:plans.len(),ok:false,error:Some(error.to_string()),warnings:vec![]});}
         let _=tokio::task::spawn_blocking(move||drop(images)).await;
-        return ApplyOutcome{journal,applied:vec![],failed,cancelled:cancel.is_cancelled(),cleaned:vec![]};
+        return ApplyOutcome{image_failures,journal,applied:vec![],failed,cancelled:cancel.is_cancelled(),cleaned:vec![]};
     }
     let total = plans.len();
     if !cancel.is_cancelled() {
@@ -1423,7 +1621,7 @@ async fn apply_with_image_budget(
         if !failed.iter().any(|(code,_)| code == "整理日志") { failed.push(("整理日志".into(), e.to_string())); }
     }
     log::info!(target: "kiroku::organize", "整理结束:成功 {} 项,失败 {} 项{}", applied.len(), failed.len(), if cancelled { ",已取消" } else { "" });
-    ApplyOutcome { journal, applied, failed, cancelled, cleaned }
+    ApplyOutcome { image_failures, journal, applied, failed, cancelled, cleaned }
 }
 
 #[cfg(test)]
@@ -1644,6 +1842,7 @@ mod tests {
         fs::create_dir_all(root.join("different-layout")).unwrap();fs::write(root.join("different-layout/kiroku.json"),serde_json::to_vec(&meta("ABC-123")).unwrap()).unwrap();
         let outcome=apply(plans,&http(),&root,None,&CancellationToken::new(),&|_|{}).await;
         assert!(outcome.applied.is_empty());assert!(!outcome.failed.is_empty());assert!(scan.items[0].path.exists());assert!(!root.join("ABC-123").exists());assert!(!root.join(".kiroku").exists());
+        assert_eq!(outcome.journal.recorded_rollback_work().unwrap(), None);
     }
 
     #[test]
@@ -1994,6 +2193,7 @@ mod tests {
         assert!(out.cancelled);
         assert!(out.applied.is_empty());
         assert!(out.journal.ops.is_empty());
+        assert_eq!(out.journal.recorded_rollback_work().unwrap(), Some(false));
         assert!(from.exists());
         assert_eq!(events.lock().unwrap().len(), 1);
         assert_eq!(events.lock().unwrap()[0].done, 0);
@@ -2015,7 +2215,7 @@ mod tests {
         let mut settings = Settings::default();
         settings.routes.insert(crate::code::ContentType::Censored, vec!["fixture".into()]);
         settings.sources.push(crate::settings::SourceCfg { id: "fixture".into(), enabled: true, base: String::new(), cookie: String::new(), api_base: String::new(), proxy: Default::default(), solver: false });
-        let sc = Scraper { settings, http: http(), source_http: HashMap::new(), breaker: Default::default(), sources: vec![Box::new(FakeSource(calls.clone()))], translator: None, import_cache: None, cached_sources_only: false };
+        let sc = Scraper { settings, http: http(), source_http: HashMap::new(), breaker: Default::default(), sources: vec![Box::new(FakeSource(calls.clone()))], translator: None, import_cache: None, cached_sources_only: false, cache_summary: Default::default() };
         let codes = ["AAA-111.mp4", "BBB-222.mp4", "CCC-333-CD1.mp4", "CCC-333-CD2.mp4"].map(|name| parse_code(name).unwrap());
         let successes = HashMap::from([("AAA-111".into(), meta("AAA-111")), ("BBB-222".into(), meta("BBB-222"))]);
         let before = successes.clone();
@@ -2312,6 +2512,8 @@ mod tests {
         let mut out = apply(vec![plan], &http(), d.path(), None, &CancellationToken::new(), &|_| {}).await;
         server.join().unwrap();
         assert!(out.failed.is_empty()); assert!(dir.join("poster.jpg").exists());
+        assert!(out.applied.is_empty());
+        assert_eq!(out.journal.recorded_rollback_work().unwrap(), Some(true));
         lib.reindex_dir(&dir).unwrap(); assert!(lib.get("ABC-123").unwrap().unwrap().card.poster.is_some());
         assert!(out.journal.rollback().is_empty());
         assert!(!dir.join("poster.jpg").exists());

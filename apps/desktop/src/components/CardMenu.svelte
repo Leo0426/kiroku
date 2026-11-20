@@ -13,7 +13,7 @@
     card: MovieCard
     x: number
     y: number
-    onopen: (code: string) => void
+    onopen: () => void
     oncrop: (code: string) => void
     ontrashed: (code: string) => void
     onclose: () => void
@@ -81,7 +81,7 @@
 
 <div class="catcher" role="presentation" onpointerdown={onclose} oncontextmenu={(e) => { e.preventDefault(); onclose() }}></div>
 <div class="menu" role="menu" aria-label="{card.code} 操作" bind:this={menu} style:left="{left}px" style:top="{top}px" transition:fade={{ duration: dur(120) }}>
-  <button role="menuitem" onclick={() => { const { code } = card; onclose(); onopen(code) }}><Icon name="info" size={14} />查看详情</button>
+  <button role="menuitem" onclick={onopen}><Icon name="info" size={14} />查看详情</button>
   <button role="menuitem" onclick={play}><Icon name="play" size={13} />播放</button>
   <button role="menuitem" onclick={reveal}><Icon name="folder" size={14} />在文件夹中显示</button>
   <button role="menuitem" onclick={() => { const { code } = card; onclose(); oncrop(code) }}><Icon name="pencil" size={14} />裁剪海报…</button>

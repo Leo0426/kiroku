@@ -28,7 +28,12 @@ test('history keeps metadata together and long errors below it at every window s
 test('all main pages and settings categories fit compact and large windows with long paths', async ({page}) => {
   test.setTimeout(60000)
   await seedLibrary(page)
-  await overrideApi(page, `const originalSettings=api.getSettings;api.getSettings=async()=>({...await originalSettings(),library_root:'/mock/'+ 'long-library-path/'.repeat(30)});`)
+  await overrideApi(page, `
+    const root = '/mock/' + 'long-library-path/'.repeat(30);
+    const originalSettings = api.getSettings;
+    api.getSettings = async () => ({ ...await originalSettings(), library_root: root });
+    api.recoveryInspect = async () => ({ root, entries: [] });
+  `)
   await page.goto('/')
   for (const width of [480,720,820,960,1280,1920]) {
     await page.setViewportSize({width,height:720})

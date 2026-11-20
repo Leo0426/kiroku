@@ -47,6 +47,42 @@ fn legacy_sidecar_actors_without_thumb_still_load_and_serialize_unchanged() {
 }
 
 #[test]
+fn manual_avatar_revision_keeps_existing_paths_and_can_be_undone() {
+    use kiroku_core::{nfo_read::parse_nfo, revision};
+    use serde_json::json;
+    use std::fs;
+
+    let library = tempfile::tempdir().unwrap();
+    let dir = library.path().join("SMPL-001");
+    fs::create_dir(&dir).unwrap();
+    let path = dir.join("movie.nfo");
+    let original = "<movie><title>Sample</title><actor><name>Performer A</name><thumb>.actors/a.jpg</thumb></actor></movie>";
+    fs::write(&path, original).unwrap();
+    let patch = |url: &str| json!({"actors": [
+        {"name": "Performer A", "thumb": ".actors/a.jpg"},
+        {"name": "Performer B", "thumb": url},
+    ]});
+
+    let error = revision::preview(library.path(), &dir, "SMPL-001", patch("file:///a.jpg")).unwrap_err();
+    assert!(error.to_string().contains("HTTP 或 HTTPS"));
+    let url = "https://images.example.invalid/b.png?a=1&b=2";
+    let preview = revision::preview(library.path(), &dir, "SMPL-001", patch(url)).unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    let outcome = revision::apply(&preview).unwrap();
+    assert!(outcome.error.is_none(), "{:?}", outcome.error);
+
+    let xml = fs::read_to_string(&path).unwrap();
+    let nfo = parse_nfo(&xml, "SMPL-001").unwrap();
+    let sidecar: Metadata = serde_json::from_slice(&fs::read(dir.join("kiroku.json")).unwrap()).unwrap();
+    assert_eq!(nfo.fields.actors, sidecar.fields.actors);
+    assert_eq!(nfo.fields.actors[0].thumb.as_deref(), Some(".actors/a.jpg"));
+    assert_eq!(nfo.fields.actors[1].thumb.as_deref(), Some(url));
+    assert!(outcome.journal.clone().rollback().is_empty());
+    assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    assert!(!dir.join("kiroku.json").exists());
+}
+
+#[test]
 fn merged_aliases_keep_a_thumb() {
     use kiroku_core::names::{self, NameRule, NameRules};
     let m = Metadata {

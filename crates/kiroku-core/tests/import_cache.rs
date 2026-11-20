@@ -76,3 +76,25 @@ async fn cached_only_resume_never_requests_missing_sites(){
  assert!(sc.scrape_item(&parse_code("ABC-999").unwrap(),&cancel,&|_|panic!("cache miss must not request sites")).await.is_err());
  assert!(calls.lock().unwrap().is_empty());
 }
+
+
+#[tokio::test]
+async fn cache_summary_distinguishes_reuse_invalidation_damage_and_cache_only_skip(){
+ let temp=tempfile::tempdir().unwrap();let calls=Arc::new(Mutex::new(vec![]));let settings=Settings::default();let code=parse_code("ABC-001").unwrap();let cancel=CancellationToken::new();
+ let sc=scraper(temp.path(),settings.clone(),calls.clone(),false,false);
+ sc.scrape_item(&code,&cancel,&|_|{}).await.unwrap();assert_eq!(sc.cache_summary().missing,3);
+ let sc=scraper(temp.path(),settings.clone(),calls.clone(),false,false);
+ sc.scrape_item(&code,&cancel,&|_|{}).await.unwrap();assert_eq!(sc.cache_summary().reused,3);
+ let mut changed=settings.clone();changed.sources.iter_mut().find(|s|s.id=="javdb").unwrap().cookie="neutral-secret".into();
+ let sc=scraper(temp.path(),changed,calls.clone(),false,false);
+ sc.scrape_item(&code,&cancel,&|_|{}).await.unwrap();assert_eq!(sc.cache_summary().invalidated,1);assert_eq!(sc.cache_summary().reused,2);
+ let file=std::fs::read_dir(temp.path().join("sources")).unwrap().next().unwrap().unwrap().path();std::fs::write(file,b"broken").unwrap();
+ let sc=scraper(temp.path(),settings.clone(),calls.clone(),false,false);
+ sc.scrape_item(&code,&cancel,&|_|{}).await.unwrap();assert_eq!(sc.cache_summary().corrupt,1);
+ let sc=scraper(temp.path(),settings,calls.clone(),false,false).with_cached_sources_only();
+ assert!(matches!(sc.scrape_item(&parse_code("ABC-999").unwrap(),&cancel,&|_|panic!("no network")).await,Err(kiroku_core::pipeline::ScrapeError::CacheMiss)));
+ assert_eq!(sc.cache_summary().skipped_movies,1);
+ let cache=kiroku_core::import_cache::ImportCache::new(temp.path().into());
+ let usage=cache.usage(&cancel).unwrap();assert_eq!(usage.sources.files,3);assert!(usage.sources.bytes>0);assert_eq!(usage.images.files,0);
+ cancel.cancel();assert_eq!(cache.usage(&cancel).unwrap_err().kind(),std::io::ErrorKind::Interrupted);
+}

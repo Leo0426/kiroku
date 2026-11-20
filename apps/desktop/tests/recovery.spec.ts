@@ -193,18 +193,31 @@ test('retrying failed event setup restores scan completion listeners', async ({ 
 
 test('details repair missing artwork and show its reversible journal', async ({ page }) => {
   await seedLibrary(page)
-  await overrideApi(page, `const list = api.libraryList; api.libraryList = async (q) => list({ ...q, text: 'ABQ-100' });`)
+  await overrideApi(page, `
+    const list = api.libraryList; api.libraryList = async (q) => list({ ...q, text: 'ABQ-100' });
+    const { listen } = await import('/src/lib/events.ts');
+    await listen('repair:done', result => window.repairJournal = result.journalId);
+  `)
   await page.goto('/')
   await page.locator('button.pcard').first().click()
+  const files = () => page.evaluate(async () => (await (await import('/src/lib/api.ts')).api.libraryGet('ABQ-100'))!.files)
+  const before = await files()
+  const journal = () => page.evaluate(async () => (await import('/src/lib/api.ts')).api.historyDetail(
+    crypto.randomUUID(), (window as any).repairJournal, 0, '/mock/library'))
   await page.getByRole('button', { name: '补缺图', exact: true }).click()
   await page.getByRole('button', { name: '停止补图', exact: true }).click()
   await expect(page.getByRole('status', { name: '补图结果' })).toContainText('补图已停止：写入 0 张图片')
   await expect(page.getByLabel('影片详情').locator('.poster img')).toHaveCount(0)
+  expect(await journal()).toMatchObject({ status: 'partial', total: 0, operations: [] })
   await page.getByRole('button', { name: '补缺图', exact: true }).click()
   await expect(page.getByRole('status', { name: '补图结果' })).toContainText('补图完成：写入 1 张图片')
   await expect(page.getByLabel('影片详情').locator('.poster img')).toBeVisible()
+  expect(await journal()).toMatchObject({ status: 'applied', total: 1, operations: [{ description: expect.stringContaining('海报'), state: 'recorded' }] })
+  expect(await files()).toEqual(before)
   await page.getByRole('button', { name: '撤销本次补图', exact: true }).click()
   await expect(page.getByLabel('影片详情').locator('.poster img')).toHaveCount(0)
+  expect(await journal()).toMatchObject({ status: 'rolledBack', operations: [{ state: 'undone' }] })
+  expect(await files()).toEqual(before)
   await expect(page.getByLabel('影片详情')).toBeVisible()
 })
 

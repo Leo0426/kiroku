@@ -1,4 +1,6 @@
 mod commands;
+mod linked_artwork;
+mod portability_commands;
 mod state;
 mod pending;
 mod history;
@@ -7,7 +9,6 @@ mod macos_shutdown;
 
 use kiroku_core::{logging, settings::Settings};
 use state::{AppState, Shutdown};
-use std::path::Path;
 use tauri::{AppHandle, Manager, RunEvent, WindowEvent};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -43,11 +44,20 @@ pub fn run() {
                 let job = handle.state::<AppState>().current_job_id().unwrap_or(0);
                 state::emit(&handle, "log:line", job, line.clone());
             }));
-            // 启动时恢复媒体库
-            if let Some(root) = app.state::<AppState>().library_root().filter(|r| r.is_dir()) {
-                if let Err(e) = commands::open_library(app.handle(), &root) {
-                    eprintln!("打开媒体库失败 {}: {e}", Path::new(&root).display());
-                }
+            // Network-index snapshot migration and disk I/O run off the UI thread.
+            // get_settings waits asynchronously so initial queries never race the open.
+            if let Some(root) = app.state::<AppState>().library_root() {
+                let handle = app.handle().clone();
+                let ready = app.state::<AppState>().begin_library_startup().drop_guard();
+                let (id, _) = app.state::<AppState>().begin_job("library-open")?;
+                tauri::async_runtime::spawn_blocking(move || {
+                    let _ready = ready;
+                    let _job = state::JobGuard { app: handle.clone(), id };
+                    if !root.is_dir() { return; }
+                    if let Err(e) = commands::open_library(&handle, &root) {
+                        log::error!(target: "kiroku::library", "打开媒体库失败：{e}");
+                    }
+                });
             }
             Ok(())
         })
@@ -65,6 +75,12 @@ fn app_context() -> tauri::Context<tauri::Wry> {
 /// Shared with native smoke checks so command names and argument decoding stay real.
 fn command_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync + 'static {
     tauri::generate_handler![
+            portability_commands::package_preview,
+            portability_commands::package_export,
+            commands::package_restore::package_restore_preview,
+            commands::package_restore::package_restore_apply,
+            commands::supplement::supplement_preview,
+            commands::supplement::supplement_apply,
             commands::get_settings,
             commands::catalog_inventory,
             commands::catalog_preview,
@@ -88,6 +104,7 @@ fn command_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send +
             commands::default_settings,
             commands::settings_path,
             commands::save_settings,
+            commands::save_import_defaults,
             commands::set_library_root,
             commands::pick_directory,
             commands::media_dirs,
@@ -106,6 +123,7 @@ fn command_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send +
             commands::scrape_url_start,
             commands::translation_cache_clear,
             commands::import_cache_clear,
+            commands::import_cache_usage,
             commands::notify_finish,
             commands::tag_preset_merge,
             commands::name_translation,
@@ -116,6 +134,9 @@ fn command_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send +
             history::history_detail,
             history::history_cancel,
             commands::recovery_inspect,
+            commands::recovery_preserve,
+            commands::nas_status,
+            commands::nas_diagnose,
             commands::reveal_journal,
             commands::rollback,
             commands::revision_preview,
@@ -129,6 +150,7 @@ fn command_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send +
             commands::library_overview,
             commands::library_export_csv,
             commands::library_prune_missing,
+            commands::cached_poster,
             commands::library_get,
             commands::actor_image,
             commands::library_trash,

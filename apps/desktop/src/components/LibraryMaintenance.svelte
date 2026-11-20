@@ -22,7 +22,7 @@
  }
  async function collect(ids:string[]=[...selected]){if(busy||!preview||!ids.length)return;const g=generation,p=preview;const wanted=new Set(ids);const targets=p.candidates.filter(c=>wanted.has(c.id));const ok=await app.confirm({title:'确认删除生成数据',body:`将 ${targets.length} 项生成数据移到系统废纸篓：\n${targets.slice(0,5).map(c=>`${c.description}：${c.paths[0]??''}`).join('\n')+(targets.length>5?`\n另有 ${targets.length-5} 项，详见预览列表。`:'')}\n\n旧记录移走后不再出现在操作历史；有效撤销记录及其依赖继续保留。执行前会重新核对文件与引用。`,confirmLabel:'移到废纸篓'});if(!ok||g!==generation||preview!==p)return;busy=true;error='';const request=cancellableJob(id=>api.maintenanceApply(p.token,ids,id),e=>{if(g===generation)error=String(e)});task=request;try{const next=await request.promise;if(g===generation){result=next;preview=null;selected=[];app.libraryVersion++;void app.recovery.refresh()}}catch(e){if(g===generation){error=String(e);preview=null}}finally{if(g===generation){busy=false;task=null}}}
 </script>
-<section aria-label="安全空间维护"><div class="tipped"><h2>安全空间维护</h2><InfoTip label="安全空间维护说明"><p>只提供无引用旧原图、已完整撤销且无依赖的历史与备份、旧文件日志；不会自动清理。</p><p>影片视频、字幕、当前 NFO 与海报、仍用于裁剪或撤销的数据和当日日志会保留。删除的文件移到废纸篓。</p></InfoTip></div>
+<section id="space-maintenance" aria-label="安全空间维护"><div class="tipped"><h2>安全空间维护</h2><InfoTip label="安全空间维护说明"><p>只提供无引用旧原图、已完整撤销且无依赖的历史与备份、旧文件日志；不会自动清理。</p><p>影片视频、字幕、当前 NFO 与海报、仍用于裁剪或撤销的数据和当日日志会保留。删除的文件移到废纸篓。</p></InfoTip></div>
  <p class="description">按保留期限检查旧数据，预览后再选择清理。</p>
  <div class="policy-fields"><label>历史与原图保留天数 <input class="input" type="number" min="0" step="1" bind:value={historyDays} disabled={busy||dirty}/></label>
  <label>文件日志保留天数 <input class="input" type="number" min="0" step="1" bind:value={logDays} disabled={busy||dirty}/></label>

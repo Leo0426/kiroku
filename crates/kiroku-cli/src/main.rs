@@ -13,7 +13,7 @@ use walkdir::WalkDir;
 
 fn usage() -> ExitCode {
     eprintln!(
-        "kiroku <command>\n\n  nfo-export <影片目录> [更多目录] --root <库目录> --language current|zh-Hans|original [--apply]   原位预览并导出 NFO，可用日志撤销\n  catalog names <preview|apply> <库目录> <影片目录...>  应用名称规则（明确选择影片）\n  maintenance <库目录> [--history-days 90] [--log-days 90] [--apply]   预览安全清理\n  health <库目录>   只读媒体库检查（JSON）\n  sources-check [source-id]   检测当前启用来源\n  append <code> <path> --root <库目录> [--target <影片目录>] [--video <字幕目标视频>] [--mode move|copy|hardlink|symlink] [--apply]   安全追加，默认预览\n  parse <path>           扫描目录/文件，输出番号、内容类型、分集、字幕、马赛克、清晰度 (JSON lines)\n  poc <javdb|dmm|url> [n] [reqwest|wreq]   反爬 PoC(wreq 需 --features wreq)，代理用环境变量 KIROKU_PROXY\n  scrape <dir> --out <库目录> [--tpl <模板>] [--create-library] [--mode move|copy|hardlink|symlink] [--keep-versions] [--cached-only] [--apply]   刮削并整理;默认 dry-run,--apply 才落盘;--keep-versions 把同分片的不同内容作为新版本并存\n  scrape-url <文件名或番号> <详情页URL> [--config <设置>]   用指定站点详情页刮削一部影片，只输出预览（JSON）
+        "kiroku <command>\n\n  nfo-export <影片目录> [更多目录] --root <库目录> --language current|zh-Hans|original [--apply]   原位预览并导出 NFO，可用日志撤销\n  catalog names <preview|apply> <库目录> <影片目录...>  应用名称规则（明确选择影片）\n  maintenance <库目录> [--history-days 90] [--log-days 90] [--apply]   预览安全清理\n  health <库目录>   只读媒体库检查（JSON）\n  sources-check [source-id]   检测当前启用来源\n  append <code> <path> --root <库目录> [--target <影片目录>] [--video <字幕目标视频>] [--mode move|copy|hardlink|symlink] [--apply]   安全追加，默认预览\n  parse <path>           扫描目录/文件，输出番号、内容类型、分集、字幕、马赛克、清晰度 (JSON lines)\n  poc <javdb|dmm|url> [n] [reqwest|wreq]   反爬 PoC(wreq 需 --features wreq)，代理用环境变量 KIROKU_PROXY\n  scrape <dir> --out <库目录> [--tpl <模板>] [--create-library] [--mode move|copy|hardlink|symlink] [--keep-versions] [--cached-only | --refresh] [--apply]   优先复用本地资料；--refresh 优先联网；默认 dry-run,--apply 才落盘;--keep-versions 把同分片的不同内容作为新版本并存\n  scrape-url <文件名或番号> <详情页URL> [--config <设置>]   用指定站点详情页刮削一部影片，只输出预览（JSON）
   rollback <journal.json>  按操作日志回滚一次整理
   index <库目录> [关键词]   从磁盘重建媒体库索引并列出前 10 部(调试用)
   template <tpl>         用示例元数据预览命名模板"
@@ -185,7 +185,8 @@ async fn scrape(args: &[String]) -> ExitCode {
         Err(e) => { eprintln!("{e}"); return ExitCode::FAILURE; }
     };
 
-    let scraper=if args.iter().any(|a|a=="--cached-only"){scraper.with_cached_sources_only()}else{scraper};
+    let refresh = args.iter().any(|a| a == "--refresh");
+    let scraper=if args.iter().any(|a|a=="--cached-only") && !refresh {scraper.with_cached_sources_only()}else{scraper};
 
     // Ctrl-C 取消:已完成的整理仍会写日志
     let cancel = CancellationToken::new();
@@ -211,10 +212,12 @@ async fn scrape(args: &[String]) -> ExitCode {
     // 2. 刮削(按内容类型路由、按番号去重)
     let codes: Vec<Code> = scan.items.iter().filter_map(|i| i.code.clone()).collect();
     let previous = match kiroku_core::append::existing_metadata_cancellable(&out, &codes.iter().map(|c|c.id.clone()).collect::<Vec<_>>(),&cancel) { Ok(metadata)=>metadata,Err(error)=>{eprintln!("读取已有影片失败: {error}");return ExitCode::FAILURE;} };
-    let results = pipeline::scrape_missing(&scraper, &codes, &previous, &cancel, &|ev| {
-        eprintln!("[{}/{}] {} {:?}", ev.done, ev.total, ev.code, ev.status);
+    let results = pipeline::scrape_import(&scraper, &scan.items, &previous, refresh, &cancel, &|ev| {
+        eprintln!("[{}/{}] {} {:?}{}", ev.done, ev.total, ev.code, ev.status, ev.note.map(|note| format!(" · {note}")).unwrap_or_default());
     })
     .await;
+    let cache=scraper.cache_summary();
+    println!("来源缓存：复用 {}，缺失 {}，配置失效 {}，损坏 {}，不可读 {}；仅缓存模式跳过 {} 部",cache.reused,cache.missing,cache.invalidated,cache.corrupt,cache.unreadable,cache.skipped_movies);
     let mut metas: HashMap<String, Metadata> = previous;
     for (code, r) in results {
         match r {
@@ -253,8 +256,10 @@ async fn scrape(args: &[String]) -> ExitCode {
     let plans_were_missing=plans.is_empty();
     // 新版本并存(ADR-0008)默认不执行,需显式 --keep-versions
     let keep_versions = args.iter().any(|a| a == "--keep-versions");
+    let planned_count=plans.len();
     let chosen: Vec<_> = plans.into_iter().filter(|p| p.selected || (keep_versions && p.new_version && p.conflict.is_none())).collect();
     if chosen.is_empty() { if !plans_were_missing && !had_conflicts {println!("相同文件已存在，未移动源文件");return ExitCode::SUCCESS} eprintln!("没有可执行项目（未找到元数据或目标存在冲突）"); return ExitCode::FAILURE; }
+    let skipped=planned_count.saturating_sub(chosen.len());
     let roots = [src_dir.clone()];
     let cleanup = scraper.settings.cleanup_source.then_some(pipeline::Cleanup { roots: &roots, trash: pipeline::trash_to_system, filter: &filter });
     let outcome = pipeline::apply_with_progress(chosen, &scraper.http, &out, cleanup, &cancel, &|ev| {
@@ -276,15 +281,25 @@ async fn scrape(args: &[String]) -> ExitCode {
         outcome.applied.len(), outcome.failed.len(), if outcome.cancelled { "已取消," } else { "" },
         outcome.journal.path().display()
     );
+    println!("未选择或冲突跳过 {skipped} 项；图片下载失败 {} 张；索引错误 {} 项",outcome.image_failures,index_errors.len());
+    if had_conflicts && outcome.failed.is_empty() && index_errors.is_empty(){println!("本次可执行项目已完成；退出码非零表示另有跳过冲突，请核对清单");}
     for d in &outcome.cleaned { println!("已移到废纸篓: {}", d.display()); }
     if outcome.failed.is_empty() && !had_conflicts && index_errors.is_empty() { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
 
 fn recover_pending(path: &str) -> ExitCode {
-    let mut journal=match Journal::load(std::path::Path::new(path)){Ok(j)=>j,Err(e)=>{eprintln!("读取整理日志失败：{e}");return ExitCode::FAILURE}};
-    match journal.recover_pending(){
-        Ok(())=>{println!("中断操作已恢复，保留 {} 项已记录操作",journal.ops.len());ExitCode::SUCCESS},
-        Err(e)=>{eprintln!("中断恢复失败，文件已保留：{e}");ExitCode::FAILURE}
+    let path=std::path::Path::new(path);
+    if path.parent().and_then(std::path::Path::file_name)!=Some(std::ffi::OsStr::new(".kiroku")){eprintln!("日志必须位于媒体库的 .kiroku 目录");return ExitCode::FAILURE;}
+    let Some(root)=path.parent().and_then(std::path::Path::parent) else {eprintln!("日志路径无效");return ExitCode::FAILURE;};
+    let Some(id)=path.file_name().and_then(|n|n.to_str()).and_then(|n|n.strip_prefix("journal-")).and_then(|n|n.strip_suffix(".json")) else {eprintln!("日志路径无效");return ExitCode::FAILURE;};
+    match kiroku_core::recovery::preserve(root,id,&CancellationToken::new()) {
+        Ok(result)=>{
+            println!("已保留 {} 项记录操作",result.recorded_operations);
+            if let Some(error)=&result.recovery_error{eprintln!("中断恢复失败，文件已保留：{error}");}
+            for error in &result.index_errors{eprintln!("索引更新失败，可重试恢复：{error}");}
+            if result.recovery_error.is_none()&&result.index_errors.is_empty()&&result.index_pending==0&&!result.cancelled{ExitCode::SUCCESS}else{ExitCode::FAILURE}
+        },
+        Err(error)=>{eprintln!("无法恢复，文件已保留：{error}");ExitCode::FAILURE}
     }
 }
 

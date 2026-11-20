@@ -2,6 +2,7 @@
   import { overviewRequest } from '../lib/overview-requests'
   import { app } from '../lib/state.svelte'
   import { fmtBytes } from '../lib/format'
+  import LoadingStatus from './LoadingStatus.svelte'
   import type { LibraryOverview, Query } from '../lib/types'
   let { query }: { query:Query } = $props()
   let data = $state<LibraryOverview | null>(null)
@@ -20,7 +21,7 @@
 <section aria-label="当前筛选概览">
   <h3>当前筛选概览</h3>
   {#if error}<p role="alert">{error}</p><button class="btn sm" onclick={() => retry++}>重试概览</button>
-  {:else if !data}<p role="status">正在统计全部匹配影片…</p>
+  {:else if !data}<LoadingStatus label="正在统计全部匹配影片…" />
   {:else}
     <dl>
       <div><dt>影片</dt><dd>{data.movies.toLocaleString()}</dd></div>

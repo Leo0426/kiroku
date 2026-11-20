@@ -2,6 +2,7 @@ import {RecoveryStore} from './recovery.svelte'
 import { api } from './api'
 import { listen } from './events'
 import { notifyFinish, rebuildNotice } from './notify'
+import type { SettingLink } from './settings-search'
 import type { MediaDirs, ProgressEvent, RebuiltEvent, Settings } from './types'
 
 export interface ConfirmOptions {
@@ -11,6 +12,8 @@ export interface ConfirmOptions {
   cancelLabel?: string
 }
 
+type DialogChoice = 'confirm' | 'alternative' | 'dismiss'
+
 export type View = 'library' | 'import' | 'history' | 'settings'
 
 export interface Toast {
@@ -18,6 +21,7 @@ export interface Toast {
   kind: 'info' | 'ok' | 'error'
   text: string
   action?: { label: string; run: () => void }
+  title?: string
 }
 
 interface RebuildTask {
@@ -30,14 +34,17 @@ class AppStore {
   recovery=new RecoveryStore(()=>this.settings?.library_root??null)
   view = $state<View>('library')
   commandsOpen = $state(false)
+  settingsLink = $state.raw<SettingLink | null>(null)
   settings = $state<Settings | null>(null)
   ready = $state(false)
   /** 媒体库有变化时 +1,列表据此重新加载 */
   libraryVersion = $state(0)
   toasts = $state<Toast[]>([])
   rebuild = $state({ running: false, done: 0, total: 0 })
+  private rebuildIssue = $state<{ root: string; message: string } | null>(null)
+  rebuildMessage = $derived(this.rebuildIssue && this.rebuildIssue.root === this.settings?.library_root ? this.rebuildIssue.message : '')
   /** 当前显示的确认框(同一时间只有一个) */
-  dialog = $state<(ConfirmOptions & { resolve: (ok: boolean) => void }) | null>(null)
+  dialog = $state<(ConfirmOptions & { resolve: (choice: DialogChoice) => void }) | null>(null)
 
   /** 系统影片/下载目录,用作默认位置与对话框起点 */
   media = $state<MediaDirs | null>(null)
@@ -51,7 +58,7 @@ class AppStore {
    */
   beforeNavigate: (() => boolean | Promise<boolean>) | null = null
   /** 正在等离开确认时用户又点了别的页:只记住最后一次点击,确认后去那里 */
-  private pendingView: View | null = null
+  private pendingNavigation: { view: View; setting: SettingLink | null } | null = null
   private rebuildTask: RebuildTask | null = null
 
   async init() {
@@ -76,9 +83,9 @@ class AppStore {
   }
 
   /** A zero duration keeps an actionable notice until dismissed or resolved. */
-  toast(kind: Toast['kind'], text: string, ms = 3200, action?: Toast['action']): number {
+  toast(kind: Toast['kind'], text: string, ms = 3200, action?: Toast['action'], title?: string): number {
     const id = this.nextToast++
-    this.toasts = [...this.toasts, { id, kind, text, action }]
+    this.toasts = [...this.toasts, { id, kind, text, action, title }]
     if (ms > 0) setTimeout(() => this.dismiss(id), ms)
     return id
   }
@@ -88,14 +95,18 @@ class AppStore {
   }
 
   /** 应用内确认框;用户点确认返回 true */
-  confirm(opts: ConfirmOptions): Promise<boolean> {
-    if (this.dialog) return Promise.resolve(false)
+  async confirm(opts: ConfirmOptions): Promise<boolean> {
+    return await this.dialogChoice(opts) === 'confirm'
+  }
+
+  private dialogChoice(opts: ConfirmOptions): Promise<DialogChoice> {
+    if (this.dialog) return Promise.resolve('dismiss')
     return new Promise((resolve) => {
       this.dialog = {
         ...opts,
-        resolve: (ok) => {
+        resolve: (choice) => {
           this.dialog = null
-          resolve(ok)
+          resolve(choice)
         },
       }
     })
@@ -105,39 +116,52 @@ class AppStore {
    * 切换页面。点击永远不会被吞掉:无需确认时同步切换;等待确认期间的点击更新目标(以最后一次为准);
    * 等待中却没有确认框在显示(异常情况)时不再干等,直接放行这次点击。
    */
-  navigate(v: View) {
-    if (this.pendingView !== null) {
+  navigate(v: View, setting: SettingLink | null = null) {
+    if (this.pendingNavigation) {
       if (this.dialog) {
-        this.pendingView = v
+        this.pendingNavigation.view = v
+        this.pendingNavigation.setting = setting
         return
       }
-      this.pendingView = null
+      this.pendingNavigation = null
     }
-    if (this.view === v) return
-    const verdict = this.beforeNavigate ? this.beforeNavigate() : true
-    if (typeof verdict === 'boolean') {
-      if (verdict) this.view = v
+    if (this.view === v) {
+      if (setting) this.settingsLink = setting
       return
     }
-    this.pendingView = v
+    const verdict = this.beforeNavigate ? this.beforeNavigate() : true
+    if (typeof verdict === 'boolean') {
+      if (verdict) {
+        this.settingsLink = setting
+        this.view = v
+      }
+      return
+    }
+    const target = { view: v, setting }
+    this.pendingNavigation = target
     verdict
       .then((ok) => {
-        if (ok && this.pendingView !== null) this.view = this.pendingView
+        if (ok && this.pendingNavigation === target) {
+          this.settingsLink = target.setting
+          this.view = target.view
+        }
       })
       .catch(() => {})
-      .finally(() => (this.pendingView = null))
+      .finally(() => { if (this.pendingNavigation === target) this.pendingNavigation = null })
   }
 
   async refreshSettings() {
     this.settings = await api.getSettings()
-    await this.recovery.refresh()
+    void this.recovery.refresh()
   }
 
-  async setLibraryRoot(path: string, create = false): Promise<boolean> {
+  async setLibraryRoot(path: string, create = false, rebuild = false): Promise<boolean> {
     try {
       this.settings = await api.setLibraryRoot(path, create)
+      this.rebuildIssue = null
       this.libraryVersion++
-      await this.recovery.refresh()
+      const indexing = rebuild ? this.rebuildIndex() : undefined
+      await Promise.all([indexing, this.recovery.refresh()])
       return true
     } catch (e) {
       this.toast('error', String(e), 5000)
@@ -169,20 +193,16 @@ class AppStore {
   private async adoptLibraryRoot(dir: string, create: boolean): Promise<boolean> {
     const info = await api.inspectDirectory(dir).catch(() => null)
     if (info && info.videos > 0 && info.nfos === 0) {
-      const ok = await this.confirm({
+      const choice = await this.dialogChoice({
         title: '这个文件夹里有还没整理的视频',
-        body: `里面有 ${info.videos}${info.truncated ? '+' : ''} 个视频,但没有任何 NFO。媒体库只显示 kiroku 整理过(或已带 NFO)的影片,这些视频不会出现在海报墙,而且「导入整理」也不能再把它们当作待整理的来源。\n\n建议另选一个专门放整理结果的空文件夹。`,
-        confirmLabel: '仍然使用它',
-        cancelLabel: '重新选择',
+        body: `已找到 ${info.videos}${info.truncated ? '+' : ''} 个视频，暂未发现 NFO。把这里用作媒体库后，这些视频将无法作为待整理来源导入。\n\n可以另选一个空文件夹存放整理结果，稍后再导入这里的视频。`,
+        confirmLabel: '重新选择',
+        cancelLabel: '仍然使用它',
       })
-      if (!ok) return false
+      if (choice === 'confirm') return this.chooseLibraryRoot()
+      if (choice === 'dismiss') return false
     }
-    if (!(await this.setLibraryRoot(dir, create))) return false
-    if (info && info.nfos > 0) {
-      this.toast('info', `检测到已有 ${info.nfos} 部影片的 NFO,正在建立索引…`, 4500)
-      await this.rebuildIndex()
-    }
-    return true
+    return this.setLibraryRoot(dir, create, !!info?.nfos)
   }
 
   /** 把用户目录显示成 ~ 开头,更短更好认 */
@@ -211,7 +231,9 @@ class AppStore {
     this.rebuildTask = null
     this.rebuild = { running: false, done: 0, total: 0 }
     if (task.root !== this.settings?.library_root) return
-    this.toast(e.error ? 'error' : 'ok', e.error ? `索引重建失败：${e.error}` : e.cancelled ? '已取消重建，保留原索引' : `索引已重建:${e.count} 部影片`)
+    const issue = e.error ? `索引重建失败：${e.error}` : e.cancelled ? '已取消重建，保留原索引' : ''
+    if (issue) this.rebuildIssue = { root: task.root, message: issue }
+    this.toast(e.error ? 'error' : e.cancelled ? 'info' : 'ok', issue || `索引已重建:${e.count} 部影片`)
     notifyFinish(rebuildNotice(e))
     this.libraryVersion++
   }
@@ -220,6 +242,7 @@ class AppStore {
     if (this.rebuildTask) return
     const task: RebuildTask = { root: this.settings?.library_root ?? '', jobId: null, early: new Map() }
     this.rebuildTask = task
+    this.rebuildIssue = null
     this.rebuild = { running: true, done: 0, total: 0 }
     try {
       const id = await api.libraryRebuild()
@@ -233,7 +256,11 @@ class AppStore {
       if (this.rebuildTask !== task) return
       this.rebuildTask = null
       this.rebuild = { running: false, done: 0, total: 0 }
-      if (task.root === this.settings?.library_root) this.toast('error', String(e), 5000)
+      if (task.root === this.settings?.library_root) {
+        const message = `无法启动索引重建：${e}`
+        this.rebuildIssue = { root: task.root, message }
+        this.toast('error', message, 5000)
+      }
     }
   }
 }

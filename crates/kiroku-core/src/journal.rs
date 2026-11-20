@@ -2,6 +2,7 @@
 //! 兼容 CLI 早期写出的「裸 `Vec<Op>`」格式。
 
 mod durable;
+mod ownership;
 mod storage;
 mod history;
 mod detail;
@@ -181,8 +182,8 @@ impl Journal {
                     // v2 deliberately strips WriteFile content; its proof is the byte authority.
                     let stage = recorded_path(&self.root, &self.root, &proof.stage)?;
                     if digest(&bytes) != proof.digest
-                        || !durable::verified(&stage,proof)?
-                        || !durable::owned(&side,proof)
+                        || !ownership::verified(&stage,proof)?
+                        || !ownership::owned(&side,proof)
                     {
                         return Err(conflict());
                     }
@@ -223,6 +224,12 @@ impl Journal {
         dir(&self.root).join(format!("journal-{}.json", self.id))
     }
 
+    fn has_rollback_work(&self) -> bool {
+        self.status != JournalStatus::RolledBack && (self.pending.is_some()
+            || self.ops.len() > self.rolled_back_ops.len()
+            || self.replacements.iter().any(|entry| !entry.undone))
+    }
+
     /// 追加已完成的操作。文本内容不入日志(回滚只需要路径),避免日志膨胀。
     pub fn push_ops(&mut self, done: impl IntoIterator<Item = Op>) {
         self.ops.extend(done.into_iter().map(|op| match op {
@@ -258,7 +265,7 @@ impl Journal {
         fs::rename(&tmp, &p)?;
         #[cfg(unix)]
         crate::durable_fs::sync_directory(p.parent().expect("journal dir"))?;
-        self.mark_snapshot()?;
+        self.mark_snapshot(Some(&owner))?;
         Ok(p)
     }
 
@@ -295,6 +302,7 @@ impl Journal {
     /// 逐操作回滚并保存进度;失败项可重试,日志不可写时立即停止。
     /// 文件操作与进度落盘之间仍有崩溃窗口,不会仅凭文件存在推断已撤销。
     pub fn rollback(&mut self) -> Vec<String> {
+        if let Err(error)=crate::nas_ops::ensure_writes_allowed(){return vec![error.to_string()]};
         if let Err(error)=self.check_storage(){return vec![error.to_string()]}
         if let Err(error) = self.protect_original_references() { return vec![error.to_string()]; }
         if !self.replacements.is_empty() {
@@ -328,12 +336,7 @@ impl Journal {
                 }
                 if let Some(proof) = self.proofs.get(&i) {
                     // 成功进度持久化后再清暂存链接,也清理其空目录。
-                    if proof.published_identity.is_none() && crate::nas_ops::mapped_pair(&proof.stage,self.ops[i].target()) {
-                        let anchor=self.ops[i].source().unwrap_or(&proof.stage);
-                        let _=crate::nas_ops::remove_owned(&proof.stage,anchor);
-                        let mut parent=proof.stage.parent();
-                        while let Some(dir)=parent {if dir==self.root || !dir.starts_with(&self.root) || fs::remove_dir(dir).is_err(){break}parent=dir.parent();}
-                    } else {let _ = crate::organize::rollback(&[Op::Download { path: proof.stage.clone(), url: String::new(), crop: None, stamp: None }], Some(&self.root));}
+                    proof.cleanup(&self.root, &self.ops[i]);
                 }
             } else {
                 failures.extend(errors);
@@ -358,6 +361,38 @@ mod tests {
     fn rapid_batches_have_distinct_journal_ids() {
         let ids: std::collections::HashSet<_> = (0..100).map(|_| Journal::new(Path::new("library")).id).collect();
         assert_eq!(ids.len(), 100);
+    }
+
+    #[test]
+    fn rollback_offer_comes_from_this_batches_persisted_operations() {
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = Journal::new(root.path());
+        assert_eq!(journal.recorded_rollback_work().unwrap(), None);
+        journal.save().unwrap();
+        storage::metrics::take_reads();
+        assert_eq!(journal.recorded_rollback_work().unwrap(), Some(false));
+        assert_eq!(storage::metrics::take_reads(), 0, "a just-saved journal should not be replayed");
+
+        // A later error can leave memory ahead of the last saved checkpoint.
+        journal.pending = Some(Pending {
+            op: Op::MoveFile { from: root.path().join("a"), to: root.path().join("b") },
+            proof: Proof { stage: root.path().join("stage"), digest: String::new(), link: None, source_proof: None, published_identity: None },
+        });
+        assert_eq!(journal.recorded_rollback_work().unwrap(), Some(false));
+        journal.save().unwrap();
+        assert_eq!(journal.recorded_rollback_work().unwrap(), Some(true));
+        journal.persist_progress().unwrap();
+        journal.pending = None;
+        assert_eq!(journal.recorded_rollback_work().unwrap(), Some(true), "use the persisted checkpoint after interrupted work");
+        // An interrupted append can leave a verified prefix followed by a torn frame.
+        use std::io::Write;
+        fs::OpenOptions::new().append(true).open(journal.path()).unwrap().write_all(&[1]).unwrap();
+        assert_eq!(journal.recorded_rollback_work().unwrap(), Some(true));
+
+        let original = journal.path().with_extension("original");
+        fs::rename(journal.path(), &original).unwrap();
+        fs::copy(original, journal.path()).unwrap();
+        assert!(journal.recorded_rollback_work().is_err());
     }
 
     #[test]

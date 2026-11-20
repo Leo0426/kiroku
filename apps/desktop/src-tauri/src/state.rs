@@ -16,6 +16,7 @@ use std::{
     },
 };
 use tauri::{AppHandle, Emitter, Manager};
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 /// Only the first close request schedules a waiter; later requests keep it alive.
@@ -41,15 +42,18 @@ pub struct Session {
     pub metas: HashMap<String, Metadata>,
     pub plans: Vec<PlanItem>,
     pub plan_settings: Option<Settings>,
+    pub plan_token: Option<String>,
 }
 
 pub struct PendingRevision {
+    pub artwork_library: Option<LibraryReadSnapshot>,
     pub token: String,
     pub preview: kiroku_core::revision::Preview,
     pub settings: Option<Settings>,
 }
 
 pub struct PendingArtwork {
+ pub library: LibraryReadSnapshot,
  pub token:String, pub original:kiroku_core::artwork::Original, pub settings:Settings,
 }
 pub struct PendingLanguageExport {
@@ -62,10 +66,14 @@ struct LibraryReadSlot { handle: Option<LibraryReadHandle>, generation: u64 }
 pub struct HistoryReadSnapshot {pub root:PathBuf,generation:u64}
 pub struct AppState {
     pub history:crate::history::HistoryState,
+    library_startup: Mutex<Option<CancellationToken>>,
     library_read: Mutex<LibraryReadSlot>,
     pub pending: Mutex<crate::pending::PendingCache>,
     pub catalog: Mutex<Option<(String,kiroku_core::catalog::Preview,Settings)>>,
     pub batch_edit: Mutex<Option<PendingLanguageExport>>,
+    pub package_export: Mutex<Option<crate::portability_commands::PendingExport>>,
+    pub supplement: Mutex<Option<crate::commands::supplement::Pending>>,
+    pub package_restore: Mutex<Option<crate::commands::package_restore::Pending>>,
     pub language_export: Mutex<Option<PendingLanguageExport>>,
     pub artwork: Mutex<Option<PendingArtwork>>,
     pub maintenance: Mutex<Option<(String, kiroku_core::maintenance::MaintenancePreview, Settings)>>,
@@ -77,6 +85,8 @@ pub struct AppState {
     pub session: Mutex<Session>,
     pub revision: Mutex<Option<PendingRevision>>,
     next_job: AtomicU64,
+    // Some while journals can be read. A writer invalidates overlapping reads.
+    journal_reads: watch::Sender<Option<CancellationToken>>,
     // Changes are serialized with begin_job/end_job under the job mutex.
     shutting_down: AtomicBool,
     shutdown_ready: CancellationToken,
@@ -87,14 +97,22 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+fn writes_library(kind: &str) -> bool {
+    matches!(kind, "supplement-apply" | "apply" | "rollback" | "recovery-preserve" | "repair" | "append" | "revision-save" | "package-restore-apply" | "nfo-export-apply" | "catalog-apply" | "batch-edit-apply" | "maintenance" | "trash")
+}
+
 impl AppState {
     pub fn new(settings: Settings) -> Self {
         Self {
             history:Default::default(),
+            library_startup: Mutex::new(None),
             library_read: Mutex::new(LibraryReadSlot::default()),
             pending: Mutex::new(crate::pending::PendingCache::default()),
             catalog: Mutex::new(None),
             batch_edit: Mutex::new(None),
+            package_export: Mutex::new(None),
+            supplement: Mutex::new(None),
+            package_restore: Mutex::new(None),
             language_export: Mutex::new(None),
             artwork: Mutex::new(None),
             maintenance: Mutex::new(None),
@@ -106,9 +124,20 @@ impl AppState {
             session: Mutex::new(Session::default()),
             revision: Mutex::new(None),
             next_job: AtomicU64::new(1),
+            journal_reads: watch::Sender::new(Some(CancellationToken::new())),
             shutting_down: AtomicBool::new(false),
             shutdown_ready: CancellationToken::new(),
         }
+    }
+
+    pub fn begin_library_startup(&self) -> CancellationToken {
+        let ready = CancellationToken::new();
+        *lock(&self.library_startup) = Some(ready.clone());
+        ready
+    }
+    pub async fn wait_library_startup(&self) {
+        let ready = lock(&self.library_startup).clone();
+        if let Some(ready) = ready { ready.cancelled().await; }
     }
 
     pub fn settings(&self) -> Settings {
@@ -130,6 +159,8 @@ impl AppState {
             std::mem::replace(&mut *writer, candidate)
         };
         drop(previous);
+        lock(&self.package_export).take();
+        lock(&self.package_restore).take();
         self.history.cancel_all();
     }
     pub fn history_snapshot(&self)->Result<HistoryReadSnapshot,String>{
@@ -161,6 +192,10 @@ impl AppState {
 
     /// 同一时间只允许一个任务。
     pub fn begin_job(&self, kind: &'static str) -> Result<(u64, CancellationToken), String> {
+        let writes = writes_library(kind);
+        if writes {
+            kiroku_core::nas_ops::ensure_writes_allowed().map_err(|e| e.to_string())?;
+        }
         let mut g = lock(&self.job);
         if self.shutting_down.load(Ordering::SeqCst) {
             return Err("应用正在退出，请等待当前任务结束".into());
@@ -170,6 +205,11 @@ impl AppState {
         }
         let id = self.next_job.fetch_add(1, Ordering::SeqCst);
         let cancel = CancellationToken::new();
+        if writes {
+            self.journal_reads.send_modify(|read| {
+                if let Some(token) = read.take() { token.cancel(); }
+            });
+        }
         *g = Some(JobHandle { id, kind, cancel: cancel.clone() });
         Ok((id, cancel))
     }
@@ -183,6 +223,10 @@ impl AppState {
 
     pub fn job_running(&self) -> bool {
         lock(&self.job).is_some()
+    }
+
+    pub fn journal_reads(&self) -> watch::Receiver<Option<CancellationToken>> {
+        self.journal_reads.subscribe()
     }
 
     /// Close admission and cancel the current job in the same critical section.
@@ -209,7 +253,10 @@ impl AppState {
 
     fn end_job(&self, id: u64) {
         let mut g = lock(&self.job);
-        if g.as_ref().is_some_and(|j| j.id == id) {
+        if let Some(job) = g.as_ref().filter(|job| job.id == id) {
+            if writes_library(job.kind) {
+                self.journal_reads.send_replace(Some(CancellationToken::new()));
+            }
             *g = None;
             if self.shutting_down.load(Ordering::SeqCst) {
                 self.shutdown_ready.cancel();
@@ -254,6 +301,28 @@ pub fn allow_library_assets(app: &AppHandle, root: &std::path::Path) {
 #[cfg(test)]
 mod history_scope_tests {
     use super::*;
+
+    #[test]
+    fn journal_reads_wait_for_writer_completion_but_not_scan() {
+        let state = AppState::new(Default::default());
+        let reads = state.journal_reads();
+        let before = reads.borrow().clone().unwrap();
+
+        let (scan, _) = state.begin_job("scan").unwrap();
+        assert!(!before.is_cancelled());
+        assert!(reads.borrow().is_some());
+        state.end_job(scan);
+
+        let (writer, _) = state.begin_job("apply").unwrap();
+        assert!(before.is_cancelled());
+        assert!(reads.borrow().is_none());
+        state.cancel_job_for(Some(writer));
+        assert!(reads.borrow().is_none());
+
+        state.end_job(writer);
+        assert!(!reads.borrow().as_ref().unwrap().is_cancelled());
+    }
+
     #[test] fn old_history_snapshot_fails_after_library_a_b_a_without_an_index(){
         let mut settings=Settings::default();settings.library_root=Some("/library-a".into());let state=AppState::new(settings);let old=state.history_snapshot().unwrap();
         lock(&state.settings).library_root=Some("/library-b".into());state.replace_library(None);lock(&state.settings).library_root=Some("/library-a".into());state.replace_library(None);

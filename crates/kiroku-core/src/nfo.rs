@@ -5,6 +5,12 @@ use crate::metadata::Metadata;
 #[path = "nfo_edit.rs"]
 mod edit;
 pub use edit::{merge_revision,merge_language_export,merge_actor_export};
+pub(crate) use edit::merge_version_export;
+
+fn version_labels(m: &Metadata) -> Vec<String> {
+    m.artwork_phase.as_ref().or_else(|| m.artwork.as_ref().map(|a| &a.phase))
+        .map(crate::badge::Phase::nfo_labels).unwrap_or_default()
+}
 
 /// 先剥非法 XML 字符(存量脏数据兜底),再转义;换行原样保留。
 fn esc(s: &str) -> String {
@@ -80,7 +86,8 @@ pub fn to_nfo(m: &Metadata) -> String {
         line(format!("<publisher>{}</publisher>", esc(&p)));
         line(format!("<label>{}</label>", esc(&p)));
     }
-    for t in f.tags.iter().filter(|t| !t.is_empty()) {
+    let versions = version_labels(m);
+    for t in f.tags.iter().filter(|t| !t.is_empty() && !versions.contains(t)).chain(&versions) {
         line(format!("<tag>{}</tag>", esc(t)));
         line(format!("<genre>{}</genre>", esc(t)));
     }

@@ -1,5 +1,6 @@
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
+import { api } from '../../src/lib/api'
 import { flow } from '../../src/lib/importflow.svelte'
 import { app } from '../../src/lib/state.svelte'
 import type { ScanItem, Settings } from '../../src/lib/types'
@@ -69,7 +70,7 @@ export async function runNetworkChecks(passed: string[]) {
     equal(partial.metas, { 'NET-101': { title: 'Neutral NET-101', source: 'javbus' } }, 'Backend lost completed metadata')
     await invoke('bridge_network_release')
 
-    await flow.startScrape(true)
+    await flow.startScrape()
     await until(() => !flow.scrape.running, 'retry remaining films')
     checkSummary(false, 2)
     equal(flow.found.map(item => [item.code, item.preview.title, item.preview.sources]), [
@@ -109,6 +110,22 @@ export async function runNetworkChecks(passed: string[]) {
     assert((await job()).jobId === null && !flow.busy && (await job()).cancels.every(id => typeof id === 'number'), 'Detail retry left an active job/unscoped cancellation')
     await invoke('bridge_verify', { journals: 2 })
     passed.push('network_detail_cancel_retry')
+
+    const code = 'SMPL-001'
+    const thumbnail = `${fixture.base}/avatar.png`
+    const detail = await api.libraryGet(code)
+    assert(detail, 'Avatar fixture is missing')
+    const preview = await api.revisionPreview(code, {
+      actors: [...detail.meta.actors, { name: 'Performer Example', gender: 'unknown', thumb: thumbnail }],
+    })
+    for (const [target, token] of [[code, undefined], ['SMPL-002', preview.token]] as const) {
+      const failure = await api.actorImage(target, thumbnail, token).catch(String)
+      assert(typeof failure === 'string' && failure.includes('没有此头像地址'), 'Avatar request was not scoped to its preview')
+    }
+    const image = await api.actorImage(code, thumbnail, preview.token)
+    assert(image.mime === 'image/png' && image.bytes[0] === 137, 'Avatar preview did not return a PNG')
+    equal((await network()).requests, ['/NET-102', '/NET-102', '/avatar.png'], 'Only the matching avatar preview should request the image')
+    passed.push('actor_avatar_preview')
   } finally {
     unlisten()
   }

@@ -8,7 +8,7 @@ test('scan prioritizes unknown files while recognized files remain editable on d
   await page.goto('/')
   await page.getByRole('button', { name: '导入整理', exact: true }).click()
   await expect(page.getByText(/mp4 \/ mkv/)).not.toBeVisible()
-  await page.getByRole('button', { name: '待整理的文件夹说明', exact: true }).hover()
+  await page.getByRole('button', { name: '待整理来源说明', exact: true }).hover()
   await expect(page.getByText(/mp4 \/ mkv/)).toBeVisible()
   await page.getByRole('button', { name: '开始扫描', exact: true }).click()
   await expect(page.getByRole('button', { name: /查找影片信息/ })).toBeEnabled()
@@ -47,6 +47,11 @@ test('lookup shows failures first and keeps full results behind disclosures', as
 
 for (const [mode, label] of [['move', '移动'], ['copy', '复制'], ['hardlink', '硬链接'], ['symlink', '软链接']] as const) {
   test(`${mode} import explains the actual file operation before confirmation`, async ({ page }) => {
+    await page.route('**/src/lib/state.svelte.ts*', async route => {
+      const response=await route.fetch()
+      await route.fulfill({response,body:(await response.text())+
+        "\nwindow.changeLiveImportMode=()=>{app.settings.organize_mode=app.settings.organize_mode==='move'?'copy':'move'};"})
+    })
     await overrideApi(page, `
       const s = await api.getSettings(); s.source_dirs = ['/mock/source']; s.organize_mode = '${mode}'; s.cleanup_source = true; await api.saveSettings(s);
       const scrape = api.scrapeStart; api.scrapeStart = ids => scrape(ids.filter(id => id === 3));
@@ -68,10 +73,7 @@ for (const [mode, label] of [['move', '移动'], ['copy', '复制'], ['hardlink'
     else { await expect(hint).toContainText('保留'); await expect(hint).not.toContainText('废纸篓') }
     await page.getByRole('button', { name: /确认整理/ }).click()
     await expect(page.getByRole('status', { name: '当前整理方式' })).toContainText(label)
-    await page.evaluate(async () => {
-      const { app } = await import('/src/lib/state.svelte.ts' as string)
-      app.settings.organize_mode = app.settings.organize_mode === 'move' ? 'copy' : 'move'
-    })
+    await page.evaluate(() => (window as any).changeLiveImportMode())
     await expect(page.getByRole('status', { name: '当前整理方式' })).toContainText(label)
   })
 }

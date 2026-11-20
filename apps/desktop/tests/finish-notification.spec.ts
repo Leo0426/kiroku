@@ -39,7 +39,8 @@ test('scrape and organize send a system notification while the window is in the 
   expect(scrape).toMatchObject({ title: '刮削完成', sent: true })
   expect(scrape.body).toMatch(/^找到 \d+ 部/)
   expect(organized).toMatchObject({ title: '整理完成', sent: true })
-  expect(organized.body).toMatch(/^已整理 \d+ 部$/)
+  expect(organized.body).toContain('项已写入视频或字幕')
+  await expect(page.getByLabel('本批整理结果')).toContainText(organized.body)
 })
 
 test('no system notification while the window is focused or the setting is off', async ({ page }) => {

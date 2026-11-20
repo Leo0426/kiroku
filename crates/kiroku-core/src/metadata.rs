@@ -126,7 +126,7 @@ impl SourceSnapshot {
         fields: &PartialMetadata,
     ) -> Self {
         let mut snapshot = Self::new(code, &cfg.base, fields);
-        snapshot.cache_identity = config_digest(&cfg.base, &cfg.cookie, proxy, cfg.effective_api_base());
+        snapshot.cache_identity = configured_digest(cfg, proxy);
         snapshot
     }
     pub fn matches_config(
@@ -136,7 +136,7 @@ impl SourceSnapshot {
         proxy: Option<&str>,
     ) -> bool {
         self.matches(code, &cfg.base)
-            && self.cache_identity == config_digest(&cfg.base, &cfg.cookie, proxy, cfg.effective_api_base())
+            && self.cache_identity == configured_digest(cfg, proxy)
     }
     pub fn matches(&self, code: &crate::code::Code, base: &str) -> bool {
         self.code == code.id
@@ -155,6 +155,13 @@ pub fn public_url(value: &str) -> String {
         value.into()
     }
 }
+fn configured_digest(cfg: &crate::settings::SourceCfg, proxy: Option<&str>) -> String {
+    let identity = config_digest(&cfg.base, &cfg.cookie, proxy, cfg.effective_api_base());
+    // Only invalidate the source whose parser changed. Other source/image
+    // caches keep their identities; old persisted metadata remains readable.
+    if cfg.id == "jav321" { base_digest(&format!("{identity}:detail-artwork-v2")) } else { identity }
+}
+
 fn config_digest(base: &str, cookie: &str, proxy: Option<&str>, api_base: &str) -> String {
     // Preserve Task3 identities for sources with no second origin.
     let value = if api_base.is_empty() { serde_json::to_string(&(base, cookie, proxy)) }
@@ -223,6 +230,9 @@ pub struct Metadata {
     /// 本次刮削的提示(如来源结果不一致),只随刮削事件展示,不落盘
     #[serde(skip)]
     pub scrape_notes: Vec<String>,
+    /// Source companions captured for a pending import. Never serialized into the library.
+    #[serde(skip)]
+    pub import_local: Option<std::sync::Arc<crate::pipeline::LocalImport>>,
     #[serde(default, deserialize_with = "deserialize_snapshots")]
     pub raw_sources: BTreeMap<String, SourceSnapshot>,
 }
@@ -253,4 +263,21 @@ fn deserialize_snapshots<'de, D: serde::Deserializer<'de>>(
                 .map(|snapshot| (site.clone(), snapshot))
         })
         .collect())
+}
+
+#[cfg(test)]
+mod artwork_parser_cache_tests {
+    use super::*;
+    #[test]
+    fn jav321_old_parser_cache_is_invalidated_without_affecting_other_sources() {
+        let code = crate::parse_code("TEST-001").unwrap();
+        let fields = PartialMetadata { title: Some("Neutral sample".into()), ..Default::default() };
+        let settings = crate::settings::Settings::default();
+        for cfg in settings.sources.iter().filter(|cfg| ["jav321", "javdb"].contains(&cfg.id.as_str())) {
+            let mut old = SourceSnapshot::configured(&code, cfg, None, &fields);
+            assert!(old.matches_config(&code, cfg, None));
+            old.cache_identity = config_digest(&cfg.base, &cfg.cookie, None, cfg.effective_api_base());
+            assert_eq!(old.matches_config(&code, cfg, None), cfg.id != "jav321");
+        }
+    }
 }

@@ -15,7 +15,7 @@ impl Clone for Storage {fn clone(&self)->Self {Self(Mutex::new(self.0.lock().unw
 // Storage cursors are not domain state or serialized data.
 impl PartialEq for Storage {fn eq(&self,_:&Self)->bool {true}}
 #[derive(Debug,Clone)]
-struct Cursor {root:Arc<same_file::Handle>,file:Binding,bytes:u64,physical:u64,seq:u64,counts:Counts,last_proof:Option<usize>,framed:bool}
+struct Cursor {root:Arc<same_file::Handle>,file:Binding,bytes:u64,physical:u64,seq:u64,counts:Counts,last_proof:Option<usize>,framed:bool,snapshot_rollback:Option<(Token,bool)>}
 #[derive(Debug,Clone)]
 enum Binding {Active(Arc<same_file::Handle>),Cold(Token,[u8;32])}
 #[derive(Debug,Clone,PartialEq)]
@@ -104,7 +104,7 @@ fn create_directory(root:&Path)->io::Result<()> {
     crate::append::confined_path(root,&parent)?;Ok(())
 }
 impl Cursor {
-    fn capture(j:&Journal,bytes:u64,seq:u64)->io::Result<Self>{Ok(Self{root:shared_root(same_file::Handle::from_path(&j.root)?),file:Binding::Active(Arc::new(handle(&j.path())?)),bytes,physical:bytes,seq,counts:Counts::of(j),last_proof:j.proofs.last_key_value().map(|(i,_)|*i),framed:true})}
+    fn capture(j:&Journal,bytes:u64,seq:u64)->io::Result<Self>{Ok(Self{root:shared_root(same_file::Handle::from_path(&j.root)?),file:Binding::Active(Arc::new(handle(&j.path())?)),bytes,physical:bytes,seq,counts:Counts::of(j),last_proof:j.proofs.last_key_value().map(|(i,_)|*i),framed:true,snapshot_rollback:None})}
     fn verify(&self,j:&Journal)->io::Result<()> {
         if same_file::Handle::from_path(&j.root)?!=*self.root {return Err(changed())}
         let current=handle(&j.path())?;
@@ -202,9 +202,35 @@ impl Journal {
         let cursor=state.as_mut().ok_or_else(changed)?;cursor.activate_checked(self,cancel)?;
         if fs::metadata(self.path())?.len()!=cursor.physical{return Err(changed())}Ok(())
     }
-    pub(super) fn mark_snapshot(&self)->io::Result<()> {
+    pub(super) fn mark_snapshot(&self, written: Option<&same_file::Handle>)->io::Result<()> {
         let mut cursor=Cursor::capture(self,fs::metadata(self.path())?.len(),0)?;cursor.framed=false;
+        if let Some(written) = written {
+            if cursor.active_file() != written { return Err(changed()); }
+            // Remember the serialized state, not subsequent in-memory changes.
+            // Rollback itself always reopens the journal and verifies ownership.
+            cursor.snapshot_rollback = Token::of(written).ok().map(|stamp| (stamp, self.has_rollback_work()));
+        }
         *self.storage.0.lock().unwrap_or_else(|e|e.into_inner())=Some(cursor);Ok(())
+    }
+
+    /// Whether this batch has a verified on-disk journal with work to undo.
+    /// An unbound in-memory ID has no confirmed record. A lost or replaced
+    /// bound file is an error. A failed write can leave disk behind memory.
+    pub fn recorded_rollback_work(&self) -> io::Result<Option<bool>> {
+        let state = self.storage.0.lock().unwrap_or_else(|error| error.into_inner());
+        let Some(cursor) = state.as_ref() else { return Ok(None); };
+        cursor.verify(self)?;
+        if let Some((stamp, available)) = &cursor.snapshot_rollback {
+            let current = handle(&self.path())?;
+            if current.as_file().metadata()?.len() == cursor.physical && Token::of(&current)? == *stamp {
+                return Ok(Some(*available));
+            }
+        }
+        // A failed append can have changed the length while leaving readable
+        // checkpoints. Let the journal reader validate that prefix.
+        let recorded = Self::load(&self.path())?;
+        cursor.verify(self)?;
+        Ok(Some(recorded.has_rollback_work()))
     }
 }
 
@@ -272,7 +298,7 @@ fn read_inner(path:&Path,cancel:&dyn Fn()->bool)->io::Result<Journal>{
     };
     guard.verify()?;
     let needs_cursor=journal.storage.0.lock().unwrap_or_else(|e|e.into_inner()).is_none();
-    if needs_cursor{journal.mark_snapshot()?;}
+    if needs_cursor{journal.mark_snapshot(None)?;}
     if handle(path)?!=*identity {return Err(changed())}
     // Drain a torn tail too: the activation checksum binds the complete physical
     // file observed here, without another retained byte buffer or descriptor.

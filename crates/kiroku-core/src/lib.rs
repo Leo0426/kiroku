@@ -58,3 +58,7 @@ mod durable_fs;
 pub mod import_cache;
 
 pub mod nas_ops;
+
+pub mod portability;
+pub mod package_restore;
+pub mod supplement;

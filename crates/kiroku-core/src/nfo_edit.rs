@@ -131,23 +131,30 @@ fn replace_content(xml: &str, node: &Node, content: &str) -> String {
 }
 /// Merge only Metadata fields that actually changed. Untouched XML is copied byte-for-byte.
 /// Unsupported XML is rejected before any write. Used by manual edits and `revision::prepare`.
-pub fn merge_revision(xml: &str, before: &Metadata, after: &Metadata) -> io::Result<String> { merge(xml,before,after,false,false) }
-pub fn merge_language_export(xml:&str,after:&Metadata)->io::Result<String>{merge(xml,after,after,true,false)}
-pub fn merge_actor_export(xml:&str,after:&Metadata)->io::Result<String>{merge(xml,after,after,false,true)}
-fn merge(xml:&str,before:&Metadata,after:&Metadata,language_export:bool,actor_export:bool)->io::Result<String>{
+pub fn merge_revision(xml: &str, before: &Metadata, after: &Metadata) -> io::Result<String> { merge(xml,before,after,&[]) }
+pub fn merge_language_export(xml:&str,after:&Metadata)->io::Result<String>{merge(xml,after,after,&["title","sorttitle","plot","outline","originaltitle"])}
+pub fn merge_actor_export(xml:&str,after:&Metadata)->io::Result<String>{merge(xml,after,after,&["actor"])}
+pub(crate) fn merge_version_export(xml:&str,after:&Metadata)->io::Result<String>{merge(xml,after,after,&["tag","genre"])}
+fn merge(xml:&str,before:&Metadata,after:&Metadata,explicit:&[&'static str])->io::Result<String>{
     let document = parse(xml)?;
     let generated = super::to_nfo(after);
     let projection = parse(&generated)?;
     let old = serde_json::to_value(crate::localization::project(before,&before.nfo_language).metadata)?;
     let new = serde_json::to_value(crate::localization::project(after,&after.nfo_language).metadata)?;
-    let mut selected = BTreeSet::new();
+    let mut selected: BTreeSet<_> = explicit.iter().copied().collect();
     for field in crate::aggregate::FIELDS {
         if old[*field] != new[*field] {
             selected.extend(tags(field).iter().copied());
         }
     }
-    if language_export || before.nfo_language!=after.nfo_language {selected.extend(["title","sorttitle","plot","outline","originaltitle"]);}
-    if actor_export || before.hosted_actor_images != after.hosted_actor_images { selected.insert("actor"); }
+    // Re-export repairs missing version tags on old NFOs while preserving foreign genres.
+    let version_only = old["tags"] == new["tags"];
+    let versions_changed = super::version_labels(before) != super::version_labels(after);
+    if versions_changed {
+        selected.extend(["tag", "genre"]);
+    }
+    if before.nfo_language!=after.nfo_language {selected.extend(["title","sorttitle","plot","outline","originaltitle"]);}
+    if before.hosted_actor_images != after.hosted_actor_images { selected.insert("actor"); }
     if before.scores != after.scores {
         selected.extend(["rating", "criticrating"]);
     }
@@ -157,8 +164,14 @@ fn merge(xml:&str,before:&Metadata,after:&Metadata,language_export:bool,actor_ex
     let mut edits: Vec<(usize, usize, String)> = vec![];
     let mut additions = String::new();
     for tag in selected {
+        let managed = |text: &str, node: &Node| {
+            !version_only || !matches!(tag, "tag" | "genre") || (!node.empty &&
+                quick_xml::escape::unescape(text[node.open_end..node.close_start].trim()).ok()
+                    .is_some_and(|value| crate::badge::Phase::from_nfo_label(&value).is_some()))
+        };
         let matches = |node: &Node| {
             node.parent == Some(0)
+                && managed(xml, node)
                 && (node.name == tag
                     || (node.name == "thumb"
                         && ((tag == "poster" && node.aspect.as_deref() == Some("poster"))
@@ -173,7 +186,7 @@ fn merge(xml:&str,before:&Metadata,after:&Metadata,language_export:bool,actor_ex
         let replacements: Vec<_> = projection
             .nodes
             .iter()
-            .filter(|n| n.parent == Some(0) && n.name == tag)
+            .filter(|n| n.parent == Some(0) && n.name == tag && managed(&generated, n))
             .collect();
         if matches!(tag, "actor" | "tag" | "genre" | "director") {
             let rendered = replacements

@@ -6,7 +6,8 @@ use crate::{
 };
 use serde::Serialize;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
+    io,
     path::{Component, Path, PathBuf},
 };
 use tokio_util::sync::CancellationToken;
@@ -36,6 +37,14 @@ pub struct ScanSummary {
 }
 
 impl ScanSummary {
+    fn io_error(&mut self, path: &Path, error: &io::Error) {
+        match error.kind() {
+            io::ErrorKind::NotFound => self.error(path, "找不到文件或目录"),
+            io::ErrorKind::PermissionDenied => self.error(path, "没有读取权限"),
+            _ => self.error(path, error),
+        }
+    }
+
     fn error(&mut self, path: &Path, message: impl ToString) {
         self.errors_total += 1;
         if self.errors.len() < ERROR_LIMIT {
@@ -81,16 +90,29 @@ fn walk(
     });
     // Directory identities are represented by canonical paths, preserving input
     // order while pruning overlapping roots/aliases before descending again.
+    let mut resolved = Vec::with_capacity(roots.len());
+    for root in roots {
+        if cancel.is_cancelled() {
+            summary.cancelled = true;
+            return summary;
+        }
+        resolved.push(root.canonicalize());
+    }
+    // Directory traversal already prunes overlapping directories. A video can
+    // repeat only if it is also an explicit root, so track only selected paths.
+    let mut seen_explicit: HashMap<&Path, bool> = resolved.iter()
+        .filter_map(|result| result.as_deref().ok().map(|path| (path, false)))
+        .collect();
     let mut seen_dirs = HashSet::new();
-    'roots: for root in roots {
+    'roots: for (root, result) in roots.iter().zip(&resolved) {
         if cancel.is_cancelled() {
             summary.cancelled = true;
             break;
         }
-        let canonical = match root.canonicalize() {
+        let canonical = match result.as_deref() {
             Ok(path) => path,
             Err(error) => {
-                summary.error(root, error);
+                summary.io_error(root, error);
                 continue;
             }
         };
@@ -99,6 +121,13 @@ fn walk(
             summary.error(root, "扫描来源不是可访问的目录或文件");
             continue;
         }
+        let display_path = |path: &Path| {
+            if path == canonical {
+                root.clone()
+            } else {
+                root.join(path.strip_prefix(&canonical).unwrap_or(path))
+            }
+        };
         let mut entries = WalkDir::new(&canonical).into_iter();
         loop {
             if cancel.is_cancelled() {
@@ -114,7 +143,12 @@ fn walk(
                 Ok(entry) => entry,
                 Err(error) => {
                     summary.visited += 1;
-                    summary.error(error.path().unwrap_or(root), &error);
+                    let display = error.path().map(display_path).unwrap_or_else(|| root.clone());
+                    if let Some(cause) = error.io_error() {
+                        summary.io_error(&display, cause);
+                    } else {
+                        summary.error(&display, error);
+                    }
                     continue;
                 }
             };
@@ -148,17 +182,25 @@ fn walk(
             if !VIDEO_EXT.contains(&ext.as_str()) {
                 continue;
             }
+            // A file root can also be reached through a directory root. Keep the
+            // first display path. Separate hard-link names are distinct inputs.
+            if let Some(seen) = seen_explicit.get_mut(path) {
+                if *seen {
+                    continue;
+                }
+                *seen = true;
+            }
             // 文件根:显示原路径本身,番号按文件名解析
-            let (relative, display) = if path == canonical {
-                (Path::new(entry.file_name()), root.clone())
+            let display = display_path(path);
+            let relative = if path == canonical {
+                Path::new(entry.file_name())
             } else {
-                let relative = path.strip_prefix(&canonical).unwrap_or(path);
-                (relative, root.join(relative))
+                path.strip_prefix(&canonical).unwrap_or(path)
             };
             let size = match std::fs::metadata(path) {
                 Ok(metadata) => metadata.len(),
                 Err(error) => {
-                    summary.error(&display, error);
+                    summary.io_error(&display, &error);
                     continue;
                 }
             };
@@ -300,6 +342,30 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_directory_and_video_roots_visit_each_video_path_once() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        let video = dir.join("ABC-123.mp4");
+        let other = dir.join("ABC-456.mp4");
+        let trailer = dir.join("ABC-123-trailer.mp4");
+        std::fs::write(&video, b"video").unwrap();
+        std::fs::hard_link(&video, &other).unwrap();
+        std::fs::write(&trailer, b"trailer").unwrap();
+        let filter = VideoFilter::new(&crate::video_filter::ScanCfg { min_video_mb: 0, ..Default::default() });
+        for roots in [
+            vec![dir.into(), video.clone(), trailer.clone()],
+            vec![video.clone(), trailer.clone(), dir.into()],
+        ] {
+            let result = scan(&roots, None, &filter, &CancellationToken::new(), &mut |_| {});
+            let mut paths: Vec<_> = result.items.into_iter().map(|i| i.path).collect();
+            paths.sort();
+            assert_eq!(paths, vec![video.clone(), other.clone()]);
+            assert_eq!(result.summary.skipped_total, 1);
+            assert_eq!(result.skipped[0].path, trailer);
+        }
+    }
+
+    #[test]
     fn excluded_library_is_pruned_before_descending() {
         let root = tempfile::tempdir().unwrap();
         let library = root.path().join("library");
@@ -418,7 +484,36 @@ mod tests {
         );
         assert_eq!(result.total, 1);
         assert_eq!(result.errors_total, 1);
+        assert_eq!(result.errors[0].message, "找不到文件或目录");
         assert!(!result.complete);
         assert!(!result.cancelled && !result.truncated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_child_is_reported_under_the_selected_source() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source");
+        let child = source.join("restricted");
+        let alias = temp.path().join("alias");
+        std::fs::create_dir_all(&child).unwrap();
+        symlink(&source, &alias).unwrap();
+        std::fs::write(source.join("ABC-123.mp4"), b"v").unwrap();
+        let permissions = std::fs::metadata(&child).unwrap().permissions();
+        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0)).unwrap();
+        let can_read = std::fs::read_dir(&child).is_ok();
+        let filter = VideoFilter::new(&crate::video_filter::ScanCfg { min_video_mb: 0, ..Default::default() });
+        let result = scan_summary(std::slice::from_ref(&alias), None, &filter, &CancellationToken::new());
+        std::fs::set_permissions(&child, permissions).unwrap();
+        if can_read {
+            return; // A privileged test runner can read a mode-000 directory.
+        }
+        assert_eq!(result.total, 1);
+        assert!(!result.complete);
+        assert_eq!(result.errors_total, 1);
+        assert_eq!(result.errors[0].path, alias.join("restricted"));
+        assert_eq!(result.errors[0].message, "没有读取权限");
     }
 }

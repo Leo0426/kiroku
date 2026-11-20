@@ -1,19 +1,48 @@
-<script lang="ts">
-  import { api } from '../lib/api'
-  import { reduced } from '../lib/motion'
+<script module lang="ts">
   import type { MovieCard } from '../lib/types'
+
+  export interface PosterMenu {
+    card: MovieCard
+    index: number
+    trigger: HTMLButtonElement
+    x: number
+    y: number
+  }
+</script>
+
+<script lang="ts">
+  import { untrack } from 'svelte'
+  import { app } from '../lib/state.svelte'
+  import { posterImage } from '../lib/poster-image.svelte'
+  import { reduced } from '../lib/motion'
   import Icon from './Icon.svelte'
 
   /** delay < 0 表示不播放入场动画(滚动中新出现的卡片不应再动) */
-  let { card, delay = -1, onopen, onmenu, layout = 'posters', index, tabIndex, onfocus }: { card: MovieCard | null; delay?: number; onopen?: (code: string) => void; onmenu?: (card: MovieCard, x: number, y: number) => void; layout?: 'posters' | 'list'; index?: number; tabIndex?: number; onfocus?: () => void } = $props()
+  let { card, delay = -1, onopen, onmenu, layout = 'posters', index = 0, tabIndex, onfocus, retryEpoch, onretryfailed }: {
+    card: MovieCard | null
+    delay?: number
+    onopen?: (code: string, index: number, trigger: HTMLButtonElement) => void
+    onmenu?: (menu: PosterMenu) => void
+    layout?: 'posters' | 'list'
+    index?: number
+    tabIndex?: number
+    onfocus?: () => void
+    retryEpoch?: number
+    onretryfailed?: (code: string) => void
+  } = $props()
 
   // 键盘(Shift+F10 / 菜单键)触发时没有鼠标坐标,改用卡片位置
-  function contextmenu(e: MouseEvent) {
+  function contextmenu(e: MouseEvent | KeyboardEvent) {
     if (!card || !onmenu) return
     e.preventDefault()
-    const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
-    const keyboard = e.clientX === 0 && e.clientY === 0
-    onmenu(card, keyboard ? r.left + r.width / 2 : e.clientX, keyboard ? r.top + r.height / 2 : e.clientY)
+    const trigger = e.currentTarget as HTMLButtonElement
+    const r = trigger.getBoundingClientRect()
+    const pointer = e instanceof MouseEvent && (e.clientX !== 0 || e.clientY !== 0)
+    onmenu({ card, index, trigger, x: pointer ? e.clientX : r.left + r.width / 2, y: pointer ? e.clientY : r.top + r.height / 2 })
+  }
+  function menuKey(e: KeyboardEvent) {
+    if (e.isComposing || e.altKey || e.ctrlKey || e.metaKey || e.repeat) return
+    if (e.key === 'ContextMenu' || (e.key === 'F10' && e.shiftKey)) contextmenu(e)
   }
 
   // 悬停时海报随指针轻微倾斜,高光跟着光标走;只响应鼠标,触屏与减少动态效果时不动
@@ -32,57 +61,72 @@
     for (const k of ['--rx', '--ry', '--gx', '--gy']) poster?.style.removeProperty(k)
   }
 
-  let loaded = $state(false)
-  let failed = $state(false)
-  const src = $derived(card ? api.posterUrl(card.poster, card.posterVersion) : null)
-
-  // 虚拟列表复用组件时,海报变了要重置加载状态
+  const preview = posterImage(() => card, () => app.settings?.library_root, code => onretryfailed?.(code))
+  let lastEpoch = untrack(() => retryEpoch)
+  let cardButton: HTMLButtonElement | undefined = $state()
+  function retryImage() {
+    preview.retry(true)
+    cardButton?.focus({ preventScroll: true })
+  }
   $effect(() => {
-    src
-    loaded = false
-    failed = false
+    const epoch = retryEpoch
+    if (epoch === undefined || epoch === lastEpoch) return
+    lastEpoch = epoch
+    untrack(() => preview.retry())
   })
 </script>
 
 {#if card}
-  <button
-    class="pcard"
-    data-card-index={index}
-    tabindex={tabIndex}
-    {onfocus}
-    class:list={layout === 'list'}
-    class:enter={delay >= 0}
-    style="--delay:{Math.max(delay, 0)}ms"
-    aria-label="{card.code} {card.title ?? ''}"
-    title="查看 {card.code} 的影片详情"
-    onclick={() => onopen?.(card.code)}
-    oncontextmenu={contextmenu}
-    onpointermove={tilt}
-    onpointerleave={untilt}
-  >
-    <div class="poster" bind:this={poster}>
-      {#if src && !failed}
-        {#key src}
-        <img class:ready={loaded} {src} alt="" loading="lazy" decoding="async" draggable="false" onload={() => (loaded = true)} onerror={() => (failed = true)} />
-        {/key}
-      {/if}
-      <div class="ph" class:ready={loaded} class:skeleton-fill={!!src && !failed && !loaded} aria-hidden="true"><Icon name="image" size={26} /><span>{failed ? '海报未能加载' : !src ? '暂无海报' : card.code}</span></div>
-      <div class="shade"></div>
-      <div class="glare" aria-hidden="true"></div>
-      {#if card.score !== null && card.score >= 85}
-        <span class="badge score tnum"><Icon name="star" size={10} />{(card.score / 10).toFixed(1)}</span>
-      {/if}
-      {#if card.parts > 1}<span class="badge parts tnum">{card.parts} 个分片</span>{/if}
-      {#if card.favorite}<span class="badge fav" role="img" aria-label="已收藏" title="已收藏"><Icon name="star" size={11} /></span>{/if}
-      <span class="play" aria-hidden="true"><Icon name="arrow-right" size={20} /></span>
-    </div>
-    <div class="meta">
-      <div class="title">{card.title ?? card.code}</div>
-      <div class="sub"><span class="mono">{card.code}</span>{#if card.year}<span class="faint"> · {card.year}</span>{/if}</div>
-      {#if layout === 'list'}<div class="sub">{card.actors.join(' / ') || '暂无演员资料'}</div>{/if}
-    </div>
-    {#if layout === 'list'}<div class="row-facts"><span>{card.score === null ? '暂无评分' : `${(card.score / 10).toFixed(1)} 分`}</span><span>{card.parts} 个文件{card.favorite ? ' · 已收藏' : ''}</span></div>{/if}
-  </button>
+  <div class="card-frame" class:row={layout === 'list'}>
+    <button
+      bind:this={cardButton}
+      class="pcard"
+      data-card-index={index}
+      tabindex={tabIndex}
+      {onfocus}
+      class:list={layout === 'list'}
+      class:enter={delay >= 0}
+      style="--delay:{Math.max(delay, 0)}ms"
+      aria-label="{card.code} {card.title ?? ''}{preview.cached ? '，缓存海报' : ''}"
+      title={preview.cached ? '缓存海报，原图位置暂时无法读取。点击查看影片详情。' : `查看 ${card.code} 的影片详情`}
+      aria-keyshortcuts="Shift+F10"
+      onclick={e => onopen?.(card.code, index, e.currentTarget)}
+      oncontextmenu={contextmenu}
+      onkeydown={menuKey}
+      onpointermove={tilt}
+      onpointerleave={untilt}
+    >
+      <div class="poster" bind:this={poster}>
+        {#if preview.src}
+          {#key preview.src}
+          <img class:ready={preview.loaded} src={preview.src} alt="" loading="lazy" decoding="async" draggable="false" onload={preview.displayed} onerror={preview.unavailable} />
+          {/key}
+        {/if}
+        <div class="ph" class:ready={preview.loaded} class:skeleton-fill={!!card.poster && !preview.failed && !preview.loaded} aria-hidden="true"><Icon name="image" size={26} /><span>{preview.failed ? '海报无法读取' : !card.poster ? '暂无海报' : card.code}</span></div>
+        {#if preview.cached && layout !== 'list'}<span class="badge cached">缓存海报</span>{/if}
+        <div class="shade"></div>
+        <div class="glare" aria-hidden="true"></div>
+        {#if card.score !== null && card.score >= 85}
+          <span class="badge score tnum"><Icon name="star" size={10} />{(card.score / 10).toFixed(1)}</span>
+        {/if}
+        {#if card.parts > 1}<span class="badge parts tnum">{card.parts} 个分片</span>{/if}
+        {#if card.favorite}<span class="badge fav" role="img" aria-label="已收藏" title="已收藏"><Icon name="star" size={11} /></span>{/if}
+        <span class="play" aria-hidden="true"><Icon name="arrow-right" size={20} /></span>
+      </div>
+      <div class="meta">
+        <div class="title">{card.title ?? card.code}</div>
+        <div class="sub"><span class="mono">{card.code}</span>{#if card.year}<span class="faint"> · {card.year}</span>{/if}</div>
+        {#if layout === 'list'}<div class="sub">{card.actors.join(' / ') || '暂无演员资料'}</div>{/if}
+      </div>
+      {#if layout === 'list'}<div class="row-facts"><span>{card.score === null ? '暂无评分' : `${(card.score / 10).toFixed(1)} 分`}</span><span>{card.parts} 个文件{card.favorite ? ' · 已收藏' : ''}{preview.cached ? ' · 缓存海报' : ''}</span></div>{/if}
+    </button>
+    {#if preview.failed}
+      <button type="button" class="btn sm poster-retry" data-poster-for={index} tabindex={tabIndex} {onfocus} aria-label="重试 {card.code} 的海报"
+        title="重新读取这张海报，请确认媒体盘已连接" onclick={retryImage}>
+        <Icon name="refresh" size={14} /><span>重试海报</span>
+      </button>
+    {/if}
+  </div>
 {:else}
   <div class="pcard skel" class:list={layout === 'list'} aria-hidden="true">
     <div class="poster"></div>
@@ -91,6 +135,10 @@
 {/if}
 
 <style>
+  .card-frame { min-width: 0; position: relative; }
+  .poster-retry { position: absolute; left: 50%; top: calc(50% - (48px * var(--text-scale, 1) + var(--s2)) / 2 + 36px); transform: translateX(-50%); white-space: nowrap; }
+  .row .poster-retry { left: 6px; top: 50%; width: 42px; height: 40px; transform: translateY(-50%); }
+  .row .poster-retry span { display: none; }
   .pcard {
     display: flex; flex-direction: column; gap: var(--s2); width: 100%; min-width: 0;
     padding: 0; border: 0; background: transparent; text-align: left; color: inherit;
@@ -135,6 +183,7 @@
     border-radius: var(--r-pill); font-size: 10.5px; font-weight: 600; color: #fff;
     background: rgb(12 12 16 / 0.62); backdrop-filter: blur(8px);
   }
+  .cached { left: var(--s2); bottom: var(--s2); }
   .score { top: var(--s2); right: var(--s2); color: var(--accent-hover); }
   .parts { left: var(--s2); top: var(--s2); }
   .play {

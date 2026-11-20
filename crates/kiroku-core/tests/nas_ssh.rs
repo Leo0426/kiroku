@@ -21,6 +21,7 @@ fn ssh_move_is_linked_exclusive_recoverable_and_mapping_checked() {
         remote_root: remote.join(temp.path().file_name().unwrap()),
     };
     nas_ops::configure(Some(cfg.clone())).unwrap();
+    assert_eq!(nas_ops::diagnose(&|| false).unwrap().state, "verified");
     let source = temp.path().join("neutral 'quoted' cafe\u{301}.mp4");
     let bytes = vec![17; 9 * 1024 * 1024];
     fs::write(&source, &bytes).unwrap();

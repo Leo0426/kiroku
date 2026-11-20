@@ -1,6 +1,7 @@
 <script lang="ts">
   import Icon from '../components/Icon.svelte'
   import Logo from '../components/Logo.svelte'
+  import LoadingStatus from '../components/LoadingStatus.svelte'
   import { rise } from '../lib/motion'
   import { app } from '../lib/state.svelte'
 
@@ -9,7 +10,9 @@
   async function run(f: () => Promise<boolean>) {
     busy = true
     try {
-      if (await f()) app.toast('ok', '媒体库已就绪')
+      await f()
+    } catch (e) {
+      app.toast('error', String(e), 5000)
     } finally {
       busy = false
     }
@@ -25,8 +28,8 @@
 
   <ol class="steps">
     <li><b>1</b><span><strong>选择媒体库文件夹</strong><em>整理好的影片、NFO 与海报会放在这里,Jellyfin / Emby / Kodi 都能直接读取。</em></span></li>
-    <li><b>2</b><span><strong>导入待整理的文件夹</strong><em>自动识别番号、联网刮削元数据,先预览整理计划再执行。</em></span></li>
-    <li><b>3</b><span><strong>浏览与播放</strong><em>海报墙搜索筛选,一键用系统播放器打开;任何一批整理都可以撤销。</em></span></li>
+    <li><b>2</b><span><strong>导入视频或文件夹</strong><em>自动识别影片编号、获取影片资料，预览整理计划后再执行。</em></span></li>
+    <li><b>3</b><span><strong>浏览与播放</strong><em>在海报墙查找影片，用系统播放器打开。需要撤销时，到历史里查看整理记录。</em></span></li>
   </ol>
 
   {#if app.media?.suggestedLibrary}
@@ -44,7 +47,8 @@
       <Icon name="folder" size={18} />选择媒体库文件夹
     </button>
   {/if}
-  <p class="faint note">默认放在系统的「影片」文件夹里,不存在会自动创建。已经有媒体库?点「选择其他文件夹」选中它,会自动从 NFO 建立索引。</p>
+  {#if busy}<LoadingStatus label="正在准备媒体库…" />{/if}
+  <p class="faint note">已有媒体库可以直接选中。kiroku 会读取目录里的 NFO，把影片加入海报墙。</p>
 </div>
 
 <style>

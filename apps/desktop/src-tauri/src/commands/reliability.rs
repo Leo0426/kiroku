@@ -19,19 +19,21 @@ pub struct AppendEnvelope {
     #[serde(flatten)]
     preview: append::AppendPreview,
 }
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MediaPickerPurpose { Import, Append }
+
 #[tauri::command]
-pub async fn pick_media_files(app: AppHandle) -> CmdResult<Vec<String>> {
+pub async fn pick_media_files(app: AppHandle, purpose: Option<MediaPickerPurpose>) -> CmdResult<Vec<String>> {
     tauri::async_runtime::spawn_blocking(move || {
-        app.dialog()
-            .file()
-            .set_title("选择追加的视频或字幕")
-            .add_filter(
-                "视频和字幕",
-                &[
-                    "mp4", "mkv", "avi", "wmv", "mov", "ts", "m2ts", "flv", "rmvb", "srt", "ass",
-                    "ssa", "vtt", "sub", "idx", "sup",
-                ],
-            )
+        let picker = app.dialog().file();
+        let picker = match purpose.unwrap_or(MediaPickerPurpose::Append) {
+            MediaPickerPurpose::Import => picker.set_title("选择要导入的视频")
+                .add_filter("视频", pipeline::VIDEO_EXT),
+            MediaPickerPurpose::Append => picker.set_title("选择追加的视频或字幕")
+                .add_filter("视频和字幕", &[pipeline::VIDEO_EXT, kiroku_core::subtitle::SUB_EXT].concat()),
+        };
+        picker
             .blocking_pick_files()
             .unwrap_or_default()
             .into_iter()

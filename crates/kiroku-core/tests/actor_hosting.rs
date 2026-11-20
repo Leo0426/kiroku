@@ -35,8 +35,12 @@ async fn preview_publish_rehost_and_rollback_preserve_sources_and_shared_cache()
     assert_eq!(after.fields.actors,meta.fields.actors,"source URL remains intact");
     let hosted=&after.hosted_actor_images[&url];assert!(hosted.url.starts_with("http://nas.home.arpa:8088/actors/"));
     let preview=capture.prepare_after(after.clone()).unwrap().with_actor_cache(plan,warnings).unwrap();
+    let prepared_png = preview.cached_avatar(&url).unwrap();
+    assert!(image::load_from_memory(prepared_png).is_ok());
+    assert!(actor_hosting::cached_avatar(&after,&url,&settings.actor_hosting).unwrap().is_none());
     let mut out=revision::apply(&preview).unwrap();assert!(out.error.is_none());
     assert!(cache.path().join(&hosted.file).exists());let xml=fs::read_to_string(dir.join("movie.nfo")).unwrap();assert!(xml.contains(&hosted.url));assert!(xml.contains("<custom>untouched</custom>"));
+    assert_eq!(actor_hosting::cached_avatar(&after,&url,&settings.actor_hosting).unwrap().as_deref(),Some(prepared_png));
     // Origin server is gone: changing the hostname must reuse the verified local cache.
     settings.actor_hosting.base_url="http://new-nas.home.arpa/images/".into();
     let(rehosted,_,_)=actor_hosting::prepare(&after,&settings,&CancellationToken::new()).await.unwrap();

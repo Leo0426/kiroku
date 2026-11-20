@@ -15,6 +15,9 @@ impl Config {
         }
         self.base().map(|_| ())
     }
+    pub(crate) fn public_url(&self, file: &str) -> io::Result<String> {
+        Ok(self.base().map_err(io::Error::other)?.join(file).map_err(io::Error::other)?.to_string())
+    }
     fn base(&self) -> Result<reqwest::Url, String> {
         let mut u = reqwest::Url::parse(self.base_url.trim()).map_err(|_| "头像 URL 前缀无效")?;
         if !matches!(u.scheme(), "http" | "https") || u.host_str().is_none() || !u.username().is_empty() || u.password().is_some() || u.query().is_some() || u.fragment().is_some() {
@@ -45,6 +48,10 @@ fn existing(dir: &Path, file: &str) -> io::Result<Option<Vec<u8>>> {
     Ok(Some(bytes))
 }
 impl CachePlan {
+    pub(crate) fn image(&self, file: &str) -> Option<&[u8]> {
+        self.files.get(file).map(Vec::as_slice)
+    }
+
     /// Assets are a shared immutable cache: rollback of metadata intentionally retains them.
     pub fn publish(&self) -> io::Result<()> {
         self.guard.verify()?;
@@ -64,6 +71,14 @@ impl CachePlan {
         }
         self.guard.verify()
     }
+}
+
+/// Read the verified shared PNG for a source URL associated with this movie.
+pub fn cached_avatar(meta: &Metadata, source: &str, cfg: &Config) -> io::Result<Option<Vec<u8>>> {
+    if !cfg.enabled { return Ok(None); }
+    cfg.validate().map_err(io::Error::other)?;
+    let Some(image) = meta.hosted_actor_images.get(source) else { return Ok(None); };
+    existing(Path::new(&cfg.directory), &image.file)
 }
 
 /// Download into memory only. The directory must already exist (never recreate a missing NAS mount).
@@ -107,4 +122,29 @@ pub async fn prepare(before: &Metadata, settings: &Settings, cancel: &Cancellati
     after.hosted_actor_images = done;
     warnings.push("确认后写入头像缓存并更新 NFO；撤销只恢复 NFO 和元数据，共享头像缓存保留。保存后请在 Plex 刷新本片元数据。".into());
     Ok((after, plan, warnings))
+}
+
+/// Rebind portable avatar bytes to this installation's immutable cache and URL prefix.
+pub(crate) fn from_package(meta: &mut Metadata, cfg: &Config, images: BTreeMap<String, Vec<u8>>) -> io::Result<CachePlan> {
+    if !cfg.enabled { return Err(io::Error::other("请先配置本机头像托管目录和 URL 前缀")); }
+    cfg.validate().map_err(io::Error::other)?;
+    let directory = PathBuf::from(&cfg.directory);
+    let guard = RootGuard::capture(&directory, false)?;
+    let base = cfg.base().map_err(io::Error::other)?;
+    let mut files = BTreeMap::new();
+    for (source, bytes) in images {
+        if !meta.fields.actors.iter().any(|a| a.thumb.as_deref() == Some(&source)) {
+            return Err(io::Error::other("头像未关联到目标影片演员"));
+        }
+        let (width, height) = crate::artwork::dimensions(&bytes)?;
+        if width > 4096 || height > 4096 || bytes.len() > 8 * 1024 * 1024 || image::guess_format(&bytes).ok() != Some(image::ImageFormat::Png) {
+            return Err(io::Error::other("资料包头像不是受支持的 PNG"));
+        }
+        crate::artwork::PreparedImage::normalize(&bytes)?;
+        let file = format!("{}.png", digest(&bytes));
+        let url = base.join(&file).map_err(io::Error::other)?.to_string();
+        meta.hosted_actor_images.insert(source, HostedImage { file: file.clone(), url });
+        files.insert(file, bytes);
+    }
+    Ok(CachePlan { directory, guard, files })
 }

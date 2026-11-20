@@ -1,3 +1,4 @@
+import {runResume} from './resume'
 import { invoke } from '@tauri-apps/api/core'
 import { listen as nativeListen } from '@tauri-apps/api/event'
 import { api } from '../../src/lib/api'
@@ -64,6 +65,10 @@ async function run() {
 
   const owner = controlled('busy-owner')
   await until(() => acquired.some(event => event.requestId === 'busy-owner'), 'busy owner')
+  const recovery = await api.recoveryInspect()
+  assert(recovery.entries.length === 0, 'Recovery did not read the fixture library')
+  assert((await snapshot()).jobId === acquired.find(event => event.requestId === 'busy-owner')?.jobId,
+    'Recovery interfered with the active task')
   const blocked = cancellableJob(requestId => api.libraryHealth(requestId), error => cancelErrors.push(error))
   await rejected(blocked.promise, '已有任务在运行')
   await blocked.cancel()
@@ -119,6 +124,7 @@ async function run() {
   await runNetworkChecks(passed)
   await runImportUi(passed)
   await runRebuildChecks(passed)
+  await runResume(passed)
   stopAcquired()
   stopAnnounced()
 }

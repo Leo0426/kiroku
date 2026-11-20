@@ -1,4 +1,5 @@
 //! In-place metadata revisions; previews bind disk bytes, library and code. Never touches video.
+mod plex_poster;
 use crate::{
     journal::{
         replacement::{current, digest, read, within},
@@ -37,6 +38,8 @@ pub struct Preview {
     actor_cache: Option<crate::actor_hosting::CachePlan>,
     pub root: PathBuf,
     pub dir: PathBuf,
+    #[serde(rename = "nfoPath")]
+    pub nfo_path: PathBuf,
     pub code: String,
     pub before: Metadata,
     pub after: Metadata,
@@ -127,6 +130,16 @@ pub fn preview(root: &Path, dir: &Path, code: &str, patch: Value) -> io::Result<
         value[field] = v.clone();
     }
     let mut after: Metadata = serde_json::from_value(value)?;
+    if patch.contains_key("actors") {
+        let existing: std::collections::HashSet<_> = before.fields.actors.iter()
+            .filter_map(|actor| actor.thumb.as_deref())
+            .collect();
+        for url in after.fields.actors.iter().filter_map(|actor| actor.thumb.as_deref()) {
+            if !existing.contains(url) {
+                crate::actor_image::validate_url(url)?;
+            }
+        }
+    }
     if patch.contains_key("artwork_phase") {
         let phase = after.artwork_phase.as_ref().ok_or_else(|| io::Error::other("版本标记不能为空"))?;
         if phase.definition.as_deref().is_some_and(|d| !["8K", "4K", "1440p", "1080p", "720p", "480p", "HD", "SD"].contains(&d)) {
@@ -190,12 +203,19 @@ pub fn prepare(root: &Path, dir: &Path, code: &str, after: Metadata) -> io::Resu
         changes.push(Change { field: "favorite".into(), before: before.favorite.into(), after: after.favorite.into() });
     }
     let media_guards=if before.placements!=after.placements {changes.push(Change{field:"placements".into(),before:serde_json::to_value(&before.placements)?,after:serde_json::to_value(&after.placements)?});after.placements.iter().filter(|p|p.mode==crate::placement::OrganizeMode::Symlink).map(|p|(p.source.clone(),p.source_proof.clone())).collect()}else{vec![]};
+    // Drop a formerly serialized optional field when the new value omits it.
+    // Unknown keys belonging to other applications stay in the original JSON object.
+    if let Some(object) = raw.as_object_mut() {
+        for key in serde_json::to_value(&before)?.as_object().expect("metadata object").keys() {
+            if new.get(key).is_none() { object.remove(key); }
+        }
+    }
     for (k, v) in new.as_object().expect("metadata object") {
         raw[k] = v.clone();
     }
     let inputs = vec![
         ReplacementInput {
-            path: nfo,
+            path: nfo.clone(),
             expected: nfo_bytes.as_ref().map(|b| digest(b)),
             bytes: match &nfo_bytes {
                 Some(bytes) => crate::nfo::merge_revision(
@@ -219,6 +239,7 @@ pub fn prepare(root: &Path, dir: &Path, code: &str, after: Metadata) -> io::Resu
         root_guard,dir_guard,
         root,
         dir,
+        nfo_path: nfo,
         code: code.into(),
         before,
         warnings: crate::localization::project(&after,&after.nfo_language).warnings,
@@ -229,6 +250,20 @@ pub fn prepare(root: &Path, dir: &Path, code: &str, after: Metadata) -> io::Resu
     })
 }
 impl Preview {
+    /// Bytes prepared for the current, authorized avatar publication preview.
+    pub fn cached_avatar(&self, source: &str) -> Option<&[u8]> {
+        let image = self.after.hosted_actor_images.get(source)?;
+        self.actor_cache.as_ref()?.image(&image.file)
+    }
+
+    pub(crate) fn for_version_export(mut self) -> io::Result<Self> {
+        let input = self.inputs.first_mut().ok_or_else(|| io::Error::other("缺少 NFO 输入"))?;
+        input.bytes = crate::nfo::merge_version_export(
+            std::str::from_utf8(&input.bytes).map_err(io::Error::other)?, &self.after,
+        )?.into_bytes();
+        Ok(self)
+    }
+
     pub fn with_actor_cache(mut self, cache: crate::actor_hosting::CachePlan, warnings: Vec<String>) -> io::Result<Self> {
         let input = self.inputs.first_mut().ok_or_else(|| io::Error::other("缺少 NFO 输入"))?;
         let bytes = read(&input.path)?;
@@ -316,15 +351,31 @@ impl Preview {
         Ok(self)
     }
 }
+impl Preview {
+    pub fn verify_location(&self) -> io::Result<()> {
+        self.root_guard.verify()?;
+        self.dir_guard.verify()
+    }
+}
+
 pub fn apply(preview: &Preview) -> io::Result<Outcome> {
-    preview.root_guard.verify()?;preview.dir_guard.verify()?;
+    preview.verify_location()?;
     for (source,proof) in &preview.media_guards {if crate::placement::source_proof(source)?!=*proof{return Err(io::Error::other("预览后链接来源已变化，请重新验证"))}}
-    preview.root_guard.verify()?;preview.dir_guard.verify()?;
+    preview.verify_location()?;
     // Reject stale previews before creating a journal. All targets are checked again by transaction.
     for input in &preview.inputs {
         within(&preview.root, &input.path)?;
         if current(&input.path)? != input.expected {
             return Err(io::Error::other("预览后磁盘内容已变化，请重新预览"));
+        }
+    }
+    let actor_dir=preview.dir.join(".actors");
+    if preview.inputs.iter().any(|i|i.path.parent()==Some(&actor_dir)) {
+        within(&preview.root,&actor_dir)?;
+        match fs::create_dir(&actor_dir) {
+            Ok(())=>{},
+            Err(e) if e.kind()==io::ErrorKind::AlreadyExists=>{within(&preview.root,&actor_dir)?;},
+            Err(e)=>return Err(e),
         }
     }
     if let Some(cache) = &preview.actor_cache { cache.publish()?; }
@@ -353,4 +404,42 @@ pub fn snapshot_file(root: &Path, path: &Path) -> io::Result<(Option<String>, Op
     within(&root.canonicalize()?, path)?;
     let bytes = read(path)?;
     Ok((bytes.as_ref().map(|b| digest(b)), bytes))
+}
+
+impl Preview {
+    pub(crate) fn package_paths(&self) -> Vec<String> {
+        self.inputs.iter().filter(|i| i.expected.as_deref()!=Some(digest(&i.bytes).as_str()))
+            .map(|i|i.path.display().to_string()).collect()
+    }
+    pub(crate) fn with_package_art(mut self, path: PathBuf, expected: Option<String>, bytes: Vec<u8>) -> io::Result<Self> {
+        let targets = crate::assets::Paths::for_movie(&self.dir, &self.before)?;
+        let allowed = [targets.poster, targets.fanart].iter().any(|p| p.file_stem() == path.file_stem());
+        if path.parent() != Some(self.dir.as_path()) || !allowed { return Err(io::Error::other("无效影片图片目标")); }
+        within(&self.root, &path)?;
+        self.inputs.push(ReplacementInput { path, expected, bytes });
+        Ok(self)
+    }
+    pub(crate) fn with_package_avatar(mut self, name: &str, bytes: Vec<u8>) -> io::Result<Self> {
+        let base=crate::organize::sanitize(name);
+        if base.is_empty() || base.len()>240 || !self.after.fields.actors.iter().any(|a|a.name==name) { return Err(io::Error::other("演员头像名称无效")); }
+        let path=crate::supplement::local_avatar_path(&self.dir,name)?.unwrap_or_else(||self.dir.join(".actors").join(format!("{base}.png")));
+        within(&self.root,&path)?;
+        if self.inputs.iter().any(|i|i.path==path) {return Err(io::Error::other("演员头像目标重名"));}
+        let expected=current(&path)?;
+        self.inputs.push(ReplacementInput{path,expected,bytes});
+        Ok(self)
+    }
+    /// Bind a batch preview to both the previous and proposed bytes without keeping images in memory.
+    pub(crate) fn package_signature(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut signature = Sha256::new();
+        for input in &self.inputs {
+            let path = input.path.as_os_str().as_encoded_bytes();
+            signature.update((path.len() as u64).to_be_bytes());
+            signature.update(path);
+            signature.update(input.expected.as_deref().unwrap_or("missing"));
+            signature.update(digest(&input.bytes));
+        }
+        format!("{:x}", signature.finalize())
+    }
 }

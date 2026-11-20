@@ -1,3 +1,4 @@
+import { defaultImportRules, projectImportRules, checkImportName } from './import-rules'
 // 导入流程状态:选目录 → 扫描 → 刮削 → 计划 → 执行。
 // 放在模块级单例里,切到别的页面后任务仍在后台跑,回来能看到最新进度。
 
@@ -6,9 +7,8 @@ import { listen } from './events'
 import { app } from './state.svelte'
 import { cancelPendingReads } from './pending'
 import { baseName } from './format'
-import { isVideoPath } from './types'
 import { applyNotice, notifyFinish, scrapeNotice } from './notify'
-import type { ApplyDone, ApplyEvent, ApplyProgress, LogLineEvent, OrganizeMode, PlanItem, Preview, ScanDone, ScanItem, ScrapeDone, ScrapeStatus } from './types'
+import type { ApplyDone, ApplyEvent, ApplyProgress, DroppedPath, ImportRules, LocalImportEntry, LogLineEvent, OrganizeMode, PlanItem, Preview, RollbackResult, ScanDone, ScanItem, ScrapeDone, ScrapeStatus } from './types'
 
 const LOG_MAX = 3000
 /** 生成计划只做计算和少量文件检查,正常远低于这个时间;超时则报错而不是一直卡在「正在检查目标」 */
@@ -24,28 +24,43 @@ function withTimeout<T>(p: Promise<T>, ms: number, message: string): Promise<T> 
 export type Step = 'source' | 'scan' | 'scrape' | 'plan' | 'apply' | 'done'
 type Kind = 'scan' | 'scrape' | 'plan' | 'apply'
 type TaskAttempt = { cancelled: boolean; cancelSent: boolean }
+type ImportSource = { path: string; kind: 'video' | 'dir' }
 
 class ImportFlow {
   step = $state<Step>('source')
-  dirs = $state<string[]>([])
+  // 未编辑时展示设置中的来源；显式清空也是一次有效选择。
+  private sourceDraft = $state<ImportSource[] | null>(null)
+  sources = $derived(this.sourceDraft ?? (app.settings?.source_dirs ?? []).map((path): ImportSource => ({ path, kind: 'dir' })))
+  readingSources = $state(0)
   error = $state<string | null>(null)
 
   items = $state<ScanItem[]>([])
   scanRunning = $state(false)
   scanSummary = $state<ScanDone | null>(null)
+  localImports = $state<LocalImportEntry[]>([])
+  correctingCode = $state(false)
 
   statuses = $state<Record<string, ScrapeStatus>>({})
   /** 已找到的结果摘要,按找到的先后排列 */
   found = $state<{ code: string; preview: Preview }[]>([])
+  foundByCode = $derived(Object.fromEntries(this.found.map(entry => [entry.code, entry.preview])))
   /** 附加提示(如 AI 汉化失败),按番号 */
   notes = $state<Record<string, string>>({})
   scrape = $state({ done: 0, total: 0, running: false })
   scrapeSummary = $state<ScrapeDone | null>(null)
   eta = $state<number | null>(null)
 
+  rules = $state<ImportRules | null>(null)
+  effectiveRules = $derived(this.rules ?? (app.settings ? defaultImportRules(app.settings) : null))
+  renames = $state<Record<number, string>>({})
+  skipped = $state<Record<number, boolean>>({})
+  planToken = $state<string | undefined>()
+  editingRules = $state(false)
+  savingRules = $state(false)
   planning = $state(false)
   plans = $state<PlanItem[]>([])
   picked = $state<Record<number, boolean>>({})
+  private planOrigin: 'scan' | 'scrape' = 'scrape'
 
   apply = $state({ done: 0, total: 0, running: false })
   applyProgress = $state<ApplyProgress | null>(null)
@@ -55,18 +70,27 @@ class ImportFlow {
   /** 整理任务的运行日志(log:line),最多保留 LOG_MAX 行 */
   logLines = $state<LogLineEvent[]>([])
   applyDone = $state<ApplyDone | null>(null)
+  applyRoot = $state<string | null>(null)
+  batchInCurrentLibrary = $derived(!!this.applyDone && !!this.applyRoot && this.applyRoot === app.settings?.library_root)
+  batchRollback = $state<RollbackResult | null>(null)
+  batchUndone = $derived(this.batchRollback?.status === 'rolledBack' && this.batchRollback.failures.length === 0)
+  undoing = $state<{ root: string; id: string } | null>(null)
 
   recognized = $derived(this.items.filter((i) => i.code))
   unrecognized = $derived(this.items.filter((i) => !i.code))
   /** 去重后的番号,保持扫描顺序 */
   uniqueCodes = $derived([...new Set(this.recognized.map((i) => i.code!.id))])
   retryCodes = $derived(this.uniqueCodes.filter((code) => this.statuses[code]?.kind !== 'found'))
+  readyCount = $derived(this.uniqueCodes.length - this.retryCodes.length)
+  localReady = $derived(this.localImports.filter(entry => entry.reusable))
+  localByCode = $derived(Object.fromEntries(this.localImports.map(entry => [entry.code, entry])))
   foundIds = $derived(this.recognized.filter((i) => this.statuses[i.code!.id]?.kind === 'found').map((i) => i.id))
-  selectedCount = $derived(this.plans.filter((p) => this.picked[p.itemId] && !p.conflict).length)
+  selectedCount = $derived(this.plans.filter((p) => this.picked[p.itemId] && !p.conflict && p.actions?.length !== 0).length)
   conflictCount = $derived(this.plans.filter((p) => p.conflict).length)
-  busy = $derived(this.scanRunning || this.scrape.running || this.apply.running || this.planning)
+  private taskBusy = $derived(this.savingRules || this.scanRunning || this.correctingCode || this.scrape.running || this.apply.running || this.planning || !!this.undoing)
+  busy = $derived(this.taskBusy || this.readingSources > 0)
   /** 只在选择来源步骤且没有任务时接收拖入,避免打断进行中的一批 */
-  canAcceptDrop = $derived(!this.busy && this.step === 'source')
+  canAcceptDrop = $derived(!this.taskBusy && this.step === 'source')
 
   private expecting: Kind | null = null
   private jobId: number | null = null
@@ -75,6 +99,7 @@ class ImportFlow {
   private scanAttempt: { cancelled: boolean; dispatched: boolean } | null = null
   private planningAttempt: { requestId: string; cancelled: boolean; jobId: number | null } | null = null
   private taskAttempt: TaskAttempt | null = null
+  private autoPlan = false
   private pendingLogLines: LogLineEvent[] = []
 
   /** 事件可能先于 invoke 的返回值到达,所以第一个事件带来的 jobId 视为当前任务 */
@@ -142,6 +167,7 @@ class ImportFlow {
         this.scanRunning = false
         this.scanSummary = e
         if (e.total === 0 && e.errorsTotal > 0) this.items = []
+        this.setLocalResults(e.localImports ?? [])
         this.finish()
       }))
       unlisten.push(await listen('scrape:event', (e) => {
@@ -162,11 +188,19 @@ class ImportFlow {
       }))
       unlisten.push(await listen('scrape:done', (e) => {
         if (!this.accept('scrape', e.jobId)) return
+        if (e.cancelled) {
+          for (const { code } of this.found) {
+            if (['pending', 'scraping', 'translating', 'cancelled'].includes(this.statuses[code]?.kind)) this.statuses[code] = { kind: 'found' }
+          }
+        }
         this.scrape.running = false
         this.scrapeSummary = e
         this.eta = null
+        const advance = this.autoPlan && !e.cancelled && this.retryCodes.length === 0
+        this.autoPlan = false
         this.finish()
-        notifyFinish(scrapeNotice(e))
+        if (advance) void this.buildPlan('scan')
+        else notifyFinish(scrapeNotice(e))
       }))
       unlisten.push(await listen('plan:started', (e) => {
         const attempt = this.planningAttempt
@@ -200,7 +234,7 @@ class ImportFlow {
         this.applyDone = e
         this.step = 'done'
         this.finish()
-        notifyFinish(applyNotice(e))
+        notifyFinish(applyNotice(e, this.applyLog.filter(item => item.warnings.length).length))
         app.libraryVersion++
       }))
       this.started = true
@@ -210,14 +244,21 @@ class ImportFlow {
     }
   }
 
-  reset() {
+  reset(reason: 'newBatch' | 'reselectSources' = 'newBatch') {
     if (this.busy) return
     this.step = 'source'
+    if (reason === 'newBatch') {
+      this.sourceDraft = null
+      this.rules = null
+      this.cachedSourcesOnly = false
+    }
+    this.renames = {}
+    this.skipped = {}
+    this.planToken = undefined
     this.items = []
+    this.codeErrors = {}
     this.scanSummary = null
-    this.statuses = {}
-    this.found = []
-    this.notes = {}
+    this.setLocalResults([])
     this.scrape = { done: 0, total: 0, running: false }
     this.scrapeSummary = null
     this.eta = null
@@ -228,54 +269,70 @@ class ImportFlow {
     this.applyProgress = null
     this.logLines = []
     this.applyDone = null
+    this.applyRoot = null
+    this.batchRollback = null
     this.error = null
   }
 
   /**
-   * 把文件夹并入待整理列表,末尾分隔符归一后去重。
+   * 把文件夹或视频并入待整理列表，末尾分隔符归一后去重。
    * 待整理目录不能在媒体库里面:库内的文件扫描时会被跳过,选了只会得到空结果。
    */
-  private addDirs(dirs: string[]): { inLibrary: string[] } {
+  private addSources(entries: ImportSource[]): { inLibrary: string[] } {
     const lib = app.settings?.library_root
     const norm = (p: string) => p.replace(/(?<=[^:\\/])[\\/]+$/, '')
     const inLibrary: string[] = []
-    for (const raw of dirs) {
-      const dir = norm(raw)
-      if (lib && (dir === norm(lib) || dir.startsWith(norm(lib) + '/') || dir.startsWith(norm(lib) + '\\'))) inLibrary.push(dir)
-      else if (!this.dirs.includes(dir)) this.dirs.push(dir)
+    const next = new Map(this.sources.map(source => [source.path, source]))
+    for (const entry of entries) {
+      const path = norm(entry.path)
+      if (lib && (path === norm(lib) || path.startsWith(norm(lib) + '/') || path.startsWith(norm(lib) + '\\'))) inLibrary.push(path)
+      else next.set(path, { path, kind: entry.kind })
     }
+    if (entries.length > inLibrary.length) this.sourceDraft = [...next.values()]
     return { inLibrary }
   }
 
-  removeDir(dir: string) {
-    this.dirs = this.dirs.filter((d) => d !== dir)
+  removeSource(path: string) {
+    this.sourceDraft = this.sources.filter(source => source.path !== path)
   }
 
-  /** 选择来源步骤的列表为空时,先放入已记住的待整理文件夹 */
-  seedDirs() {
-    if (this.dirs.length === 0 && this.step === 'source') this.dirs = [...(app.settings?.source_dirs ?? [])]
-  }
-
-  /** 拖入窗口的路径:文件夹和单个视频文件并入待整理列表 */
-  async dropPaths(paths: string[]) {
-    const classified = await api.classifyPaths(paths)
+  async addSourcePaths(paths: string[], videosOnly = false) {
+    if (!this.canAcceptDrop) return
+    let classified
+    this.readingSources++
+    try {
+      classified = await api.classifyPaths(paths)
+    } catch (e) {
+      app.toast('error', `无法读取所选路径：${e}`, 5000)
+      return
+    } finally {
+      this.readingSources--
+    }
     // 归类期间可能已开始扫描,此时不再改动列表
     if (!this.canAcceptDrop) return
-    this.seedDirs()
-    const accepted = (k: string) => k === 'dir' || k === 'video'
-    const { inLibrary } = this.addDirs(classified.filter((p) => accepted(p.kind)).map((p) => p.path))
-    const rejected = classified.filter((p) => !accepted(p.kind)).map((p) => baseName(p.path))
+    const accepted = (p: DroppedPath): p is ImportSource => p.kind === 'video' || (!videosOnly && p.kind === 'dir')
+    const { inLibrary } = this.addSources(classified.filter(accepted))
+    const rejected = classified.filter(p => !accepted(p)).map(p => baseName(p.path))
     const reasons = [
-      rejected.length ? `${listNames(rejected)} 不是文件夹或视频，请拖入文件夹或视频文件` : '',
+      rejected.length ? `${listNames(rejected)} ${videosOnly ? '不是可读取的视频文件' : '不是文件夹或视频'}` : '',
       inLibrary.length ? `${listNames(inLibrary.map(baseName))} 在媒体库里面，库内的影片已经整理过了` : '',
     ].filter(Boolean)
     if (reasons.length) app.toast('error', `未添加：${reasons.join('；')}。`, 6000)
   }
 
-  async pickDir() {
-    const d = await api.pickDirectory('选择待整理的文件夹', app.media?.downloads)
-    if (d && this.addDirs([d]).inLibrary.length) {
-      app.toast('error', '这个文件夹在媒体库里面。请选择媒体库之外的文件夹(库内的影片已经整理过了)。', 5000)
+  async pickSources(kind: 'folder' | 'video') {
+    try {
+      if (kind === 'video') {
+        const paths = await api.pickMediaFiles('import')
+        if (paths.length && this.canAcceptDrop) await this.addSourcePaths(paths, true)
+      } else {
+        const dir = await api.pickDirectory('选择待整理的文件夹', app.media?.downloads)
+        if (dir && this.canAcceptDrop && this.addSources([{ path: dir, kind: 'dir' }]).inLibrary.length) {
+          app.toast('error', '这个文件夹在媒体库里面，请选择库外的文件夹。', 5000)
+        }
+      }
+    } catch (e) {
+      app.toast('error', `无法选择待整理来源：${e}`, 5000)
     }
   }
 
@@ -283,38 +340,42 @@ class ImportFlow {
   async startFromSources() {
     if (this.busy) return
     this.reset()
-    this.dirs = [...(app.settings?.source_dirs ?? [])]
-    if (this.dirs.length) await this.startScan()
+    if (this.sources.length) await this.startScan()
   }
 
   async startFromFiles(paths: string[]) {
     if (this.busy || !paths.length) return
     this.reset()
-    this.dirs = [...new Set(paths)]
-    await this.startScan(false)
+    this.sourceDraft = [...new Set(paths)].map(path => ({ path, kind: 'video' }))
+    await this.startScan()
   }
 
-  async startScan(rememberSources = true) {
+  async startScan() {
+    if (this.busy || !this.sources.length) return
     const attempt = { cancelled: false, dispatched: false }
     this.scanAttempt = attempt
     this.error = null
     this.items = []
     this.scanSummary = null
-    this.statuses = {}
+    this.setLocalResults([])
     this.plans = []
+    this.picked = {}
     this.step = 'scan'
     this.scanRunning = true
     this.expecting = 'scan'
     this.jobId = null
     try {
-      const dirs = $state.snapshot(this.dirs)
+      const sources = $state.snapshot(this.sources)
+      this.sourceDraft = sources
+      const roots = sources.map(source => source.path)
+      const folders = sources.filter(source => source.kind === 'dir').map(source => source.path)
       await cancelPendingReads()
       if (attempt.cancelled || this.scanAttempt !== attempt) return
       attempt.dispatched = true
-      const id = await api.scanStart(dirs, rememberSources)
+      const id = await api.scanStart(roots, folders.length > 0)
       if (attempt.cancelled) await api.jobCancel(id)
       // scanStart 会记住来源,同步门面状态供「待整理」再次开始时使用。
-      if (rememberSources && app.settings) app.settings = { ...app.settings, source_dirs: dirs.filter((d) => !isVideoPath(d)) }
+      if (folders.length && app.settings) app.settings = { ...app.settings, source_dirs: folders }
       if (this.expecting === 'scan' && this.scanAttempt === attempt && this.jobId === null) this.jobId = id
     } catch (e) {
       if (this.scanAttempt !== attempt) return
@@ -331,56 +392,125 @@ class ImportFlow {
   codeErrors = $state<Record<number, string>>({})
 
   async setCode(itemId: number, text: string): Promise<boolean> {
+    if (this.busy) return false
+    this.correctingCode = true
     try {
-      const updated = await api.setItemCode(itemId, text)
+      const { localImports, ...updated } = await api.setItemCode(itemId, text)
       const i = this.items.findIndex((x) => x.id === itemId)
       if (i >= 0) this.items[i] = updated
+      this.setLocalResults(localImports ?? [])
+      this.picked = {}
       delete this.codeErrors[itemId]
       return true
     } catch (e) {
       this.codeErrors[itemId] = String(e)
       return false
+    } finally {
+      this.correctingCode = false
     }
   }
 
-  async startScrape(retry = false) {
+  private setLocalResults(entries: LocalImportEntry[]) {
+    this.localImports = entries
+    this.found = entries.filter(entry => entry.reusable).map(({ code, preview }) => ({ code, preview }))
+    this.statuses = Object.fromEntries(this.found.map(({ code }) => [code, { kind: 'found' as const }]))
+    this.notes = {}
+    this.scrapeSummary = null
+  }
+
+  cachedSourcesOnly = $state(false)
+
+  async prepareImport() {
     if (this.busy) return
-    retry ||= Object.keys(this.statuses).length > 0
+    if (!this.retryCodes.length) return this.buildPlan('scan')
+    return this.startScrape(this.localReady.length > 0)
+  }
+
+  async startScrape(advance = false) {
+    if (this.busy) return
+    const origin = this.step
     this.error = null
-    const codes = retry ? this.retryCodes : this.uniqueCodes
+    const codes = this.retryCodes
     const ids = this.recognized.filter((i) => codes.includes(i.code!.id)).map((i) => i.id)
-    if (!ids.length) { this.step = 'scrape'; return }
-    if (!retry) { this.statuses = {}; this.found = []; this.notes = {} }
+    if (!ids.length) return
     for (const code of codes) { this.statuses[code] = { kind: 'pending' }; delete this.notes[code] }
     this.scrape = { done: 0, total: codes.length, running: true }
     this.scrapeSummary = null
     this.eta = null
+    this.autoPlan = advance
     this.step = 'scrape'
-    await this.startTask('scrape', () => api.scrapeStart(ids), () => {
+    await this.startTask('scrape', () => api.scrapeStart(ids, this.cachedSourcesOnly), () => {
       this.scrape.running = false
-      this.step = retry ? 'scrape' : 'scan'
+      this.autoPlan = false
+      this.step = origin
     })
   }
 
   /** 用某站详情页重刮一部影片(搜索没找到或找错时);结果走同样的刮削事件 */
   async scrapeUrl(code: string, url: string) {
-    if (this.busy || !url.trim()) return
-    const ids = this.recognized.filter((i) => i.code!.id === code).map((i) => i.id)
+    if (!url.trim()) return
+    await this.refreshFilms([code], ids => api.scrapeUrlStart(ids, url.trim()))
+  }
+
+  async rescrape(code?: string) {
+    await this.refreshFilms(code ? [code] : this.localReady.map(entry => entry.code), ids => api.scrapeStart(ids, false, true), this.step === 'scan')
+  }
+
+  private async refreshFilms(codes: string[], start: (ids: number[]) => Promise<number>, stayAtScan = false) {
+    if (this.busy) return
+    const wanted = new Set(codes)
+    const ids = this.recognized.filter((i) => wanted.has(i.code!.id)).map((i) => i.id)
     if (!ids.length) return
+    const previous = codes.map(code => ({ code, status: this.statuses[code], note: this.notes[code] }))
     this.error = null
-    this.statuses[code] = { kind: 'pending' }
-    delete this.notes[code]
-    this.scrape = { done: 0, total: 1, running: true }
+    for (const code of codes) { this.statuses[code] = { kind: 'pending' }; delete this.notes[code] }
+    this.scrape = { done: 0, total: codes.length, running: true }
     this.scrapeSummary = null
     this.eta = null
-    this.step = 'scrape'
-    await this.startTask('scrape', () => api.scrapeUrlStart(ids, url.trim()), () => {
+    this.autoPlan = false
+    if (!stayAtScan) this.step = 'scrape'
+    await this.startTask('scrape', () => start(ids), () => {
       this.scrape.running = false
+      for (const { code, status, note } of previous) {
+        if (status) this.statuses[code] = status
+        else delete this.statuses[code]
+        if (note) this.notes[code] = note
+      }
     })
   }
 
-  async buildPlan() {
+  async updateRules(rules: ImportRules, saveDefault: boolean) {
+    if (!app.settings || this.busy) return false
+    this.error = null
+    try {
+      projectImportRules(app.settings, rules)
+      if (saveDefault) {
+        this.savingRules = true
+        await api.saveImportDefaults(rules)
+        await app.refreshSettings()
+        app.toast('ok', '已保存为下次导入的默认规则')
+      }
+      this.rules = { ...rules }
+    } catch (error) {
+      this.error = String(error)
+      return false
+    } finally { this.savingRules = false }
+    if (this.step === 'plan') await this.buildPlan()
+    return !this.error
+  }
+
+  async renameItem(itemId: number, suffix: string) {
     if (this.busy) return
+    try { checkImportName(suffix) } catch (error) { this.error = String(error); return }
+    this.renames[itemId] = suffix
+    this.skipped[itemId] = false
+    await this.buildPlan()
+  }
+
+  async buildPlan(origin: 'scan' | 'scrape' = this.step === 'plan' ? this.planOrigin : this.step === 'scan' ? 'scan' : 'scrape') {
+    if (this.busy || !this.foundIds.length) return
+    this.planToken = undefined
+    this.planOrigin = origin
     this.planning = true
     this.error = null
     const attempt = { requestId: crypto.randomUUID(), cancelled: false, jobId: null as number | null }
@@ -396,12 +526,18 @@ class ImportFlow {
       this.finish()
     }
     try {
-      request = api.planBuild([...this.foundIds], attempt.requestId)
+      request = api.planBuild([...this.foundIds], attempt.requestId, this.rules ? $state.snapshot(this.rules) : undefined, $state.snapshot(this.renames))
       void request.then(() => { settled = true }, () => { settled = true })
       const plans = await withTimeout(request, PLAN_TIMEOUT_MS, '生成整理计划超时,请重试;多次出现请打开「设置 → 日志」查看原因')
       if (attempt.cancelled) throw '计划已取消'
+      this.planToken = attempt.requestId
+      const reviewedVersions=new Map(this.plans.filter(p=>p.newVersion).map(p=>[p.itemId,p.to]))
+      this.picked=Object.fromEntries(plans.map(p=>{
+        const needsVersionReview=p.newVersion && reviewedVersions.get(p.itemId)!==p.to
+        const selectable=!p.conflict && p.actions?.length!==0 && !needsVersionReview
+        return [p.itemId, selectable && (this.picked[p.itemId]??p.selected)]
+      }))
       this.plans = plans
-      this.picked = Object.fromEntries(this.plans.map((p) => [p.itemId, !p.conflict && (this.picked[p.itemId] ?? p.selected)]))
       this.step = 'plan'
     } catch (e) {
       this.error = String(e)
@@ -414,24 +550,57 @@ class ImportFlow {
     }
   }
 
+  backFromPlan() { this.step = this.planOrigin }
+
   setAll(on: boolean) {
-    for (const p of this.plans) if (!p.conflict) this.picked[p.itemId] = on
+    for (const p of this.plans) if (!p.conflict && p.actions?.length !== 0) this.picked[p.itemId] = on
   }
 
   async startApply() {
     this.error = null
-    this.applyMode = app.settings?.organize_mode ?? 'move'
-    const ids = this.plans.filter((p) => this.picked[p.itemId] && !p.conflict).map((p) => p.itemId)
+    if (this.busy || !this.planToken) return
+    this.applyMode = this.effectiveRules?.mode ?? 'move'
+    this.applyRoot = app.settings?.library_root ?? null
+    this.batchRollback = null
+    const ids = this.plans.filter((p) => this.picked[p.itemId] && !p.conflict && p.actions?.length !== 0).map((p) => p.itemId)
     this.applyLog = []
     this.applyProgress = null
     this.logLines = []
     this.applyDone = null
     this.apply = { done: 0, total: ids.length, running: true }
     this.step = 'apply'
-    await this.startTask('apply', () => api.applyStart(ids), () => {
+    await this.startTask('apply', () => api.applyStart(ids, this.planToken), () => {
       this.apply.running = false
       this.step = 'plan'
     })
+  }
+
+  async undoJournal(root: string | null, id: string) {
+    if (!root || root !== app.settings?.library_root || this.undoing) return
+    const isBatch = this.applyRoot === root && this.applyDone?.journalId === id
+    if (isBatch && this.batchUndone) return
+    this.undoing = { root, id }
+    const version = app.libraryVersion
+    try {
+      const result = await api.rollback(id, root)
+      const complete = result.status === 'rolledBack' && !result.failures.length
+      if (isBatch) this.batchRollback = result
+      if (root !== app.settings?.library_root) return
+      const issues = result.failures.length > 1
+        ? [`共 ${result.failures.length} 项未撤销。首项：${result.failures[0]}`]
+        : result.failures.slice(0, 1)
+      if (!complete && !issues.length) issues.push('尚有操作未撤销，可检查日志后重试')
+      if (result.indexError) issues.push('索引更新失败：' + result.indexError)
+      const detail = issues.join('；')
+      if (issues.length) app.toast('error', (complete ? '文件已撤销。' : '撤销未完成。') + (detail.length > 180 ? detail.slice(0, 179) + '…' : detail), 6000)
+      else app.toast('ok', '已撤销，文件已按操作日志恢复', 5000)
+      if (app.libraryVersion === version) app.libraryVersion++
+      void app.recovery.refresh()
+    } catch (error) {
+      if (root === app.settings?.library_root) app.toast('error', String(error), 5000)
+    } finally {
+      this.undoing = null
+    }
   }
 
   async cancel() {

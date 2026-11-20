@@ -11,6 +11,7 @@
   import InfoTip from '../components/InfoTip.svelte'
   import StatusPill from '../components/StatusPill.svelte'
   import { api } from '../lib/api'
+  import { flow } from '../lib/importflow.svelte'
   import { fmtDateTime } from '../lib/format'
   import { dur, rise } from '../lib/motion'
   import { app } from '../lib/state.svelte'
@@ -23,7 +24,7 @@
   }
   function storeRemoved(ids:string[]):boolean {
     try { localStorage.setItem(removedKey(shownRoot??''),JSON.stringify(ids));removedIds=ids;return true }
-    catch { app.toast('error','无法保存历史显示偏好，记录尚未移除');return false }
+    catch { app.toast('error','无法保存历史显示偏好，请重试');return false }
   }
   let search = $state('')
   let status = $state<JournalStatus | ''>('')
@@ -36,7 +37,6 @@
   let maintenanceOpen = $state(false)
   let list = $state<JournalSummary[] | null>(null)
   let confirming = $state<string | null>(null)
-  let busyId = $state<string | null>(null)
   let loadError = $state('')
   let loading = $state(false)
   let loadingMore = $state(false)
@@ -45,7 +45,7 @@
   const PAGE = 50
   let generation = 0
   let requestId:string|null=null
-  let shownRoot:string|null=null
+  let shownRoot = $state<string | null>(null)
 
   async function load() {
     if (invalidDates) {
@@ -124,32 +124,22 @@
   }
 
   async function undo(j: JournalSummary) {
-    busyId = j.id
-    try {
-      const r = await api.rollback(j.id)
-      if (r.indexError) app.toast('error', `文件撤销结果已记录，但索引更新失败：${r.indexError}`, 6000)
-      app.toast(r.failures.length ? 'error' : 'ok', r.failures.length ? `部分回滚失败:${r.failures[0]}` : '已撤销，文件已按操作日志恢复', 5000)
-      await load()
-      await app.recovery.refresh()
-    } catch (e) {
-      app.toast('error', String(e), 5000)
-    } finally {
-      busyId = null
-      confirming = null
-    }
+    await flow.undoJournal(shownRoot, j.id)
+    confirming = null
   }
 
   async function revealLog(id: string) {
     try { await api.revealJournal(id) } catch (e) { app.toast('error', String(e), 5000) }
   }
 
-  async function deleteRecord(j: JournalSummary) {
-    const root=shownRoot
-    const ok=await app.confirm({title:'从历史列表删除记录？',body:`移除 ${fmtDateTime(j.ts)} 的显示记录。
+  function hideRecord(record: JournalSummary) {
+    if (removedIds.includes(record.id) || !storeRemoved([...removedIds, record.id])) return
+    if (detail === record.id) detail = null
+    confirming = null
+  }
 
-不会删除影片，也不会修改操作日志或恢复数据。可通过“恢复已移除记录”重新显示。此设置仅保存在当前设备。`,confirmLabel:'删除记录'})
-    if(!ok||root!==shownRoot)return
-    if(storeRemoved([...new Set([...removedIds,j.id])])){if(detail===j.id)detail=null;confirming=null;app.toast('ok','已从历史列表移除')}
+  function showLastHidden() {
+    storeRemoved(removedIds.slice(0, -1))
   }
 
 </script>
@@ -168,7 +158,13 @@
     <label>结束日期<input class="input" type="date" aria-label="历史结束日期" bind:value={until} /></label>
     {#if filtering}<button class="btn ghost" onclick={() => { search='';status='';from='';until='' }}>清除历史筛选</button>{/if}
   </div>
-  {#if removedIds.length}<div class="removed-notice"><span>已移除 {removedIds.length} 条记录</span><button class="btn sm ghost" onclick={()=>storeRemoved([])}>恢复已移除记录</button></div>{/if}
+  {#if removedIds.length}
+    <div class="removed-notice">
+      <span>已隐藏 {removedIds.length} 条记录</span>
+      {#if removedIds.length > 1}<button class="btn sm ghost" onclick={showLastHidden}>恢复上一条</button>{/if}
+      <button class="btn sm" onclick={() => storeRemoved([])}>显示已隐藏记录</button>
+    </div>
+  {/if}
   {#if invalidDates}<p role="alert">结束日期不能早于开始日期。</p>{/if}
   {#if !loading && list}<p class="muted" role="status">{total} 条{filtering ? '匹配记录' : '记录'}</p>{/if}
   {#if loading}<button class="btn" onclick={stopRead}>停止读取</button>{/if}
@@ -184,6 +180,8 @@
     <p class="muted">请确认媒体库可访问，再重试。</p>
   {:else if list.length === 0 && filtering}
     <Empty icon="search" title="没有匹配的历史记录" description="试试其他编号、状态或日期。" />
+  {:else if list.length === 0 && removedIds.length}
+    <Empty icon="history" title="当前没有可见记录" description="上方可以恢复本机隐藏的记录，再查看详情或撤销操作。" />
   {:else if list.length === 0}
     <Empty icon="history" title="还没有操作记录" description="整理影片或保存信息修订后，可以在这里查看记录并撤销。">
       <button class="btn primary" onclick={() => app.navigate('import')}><Icon name="download" size={15} />去导入</button>
@@ -206,13 +204,15 @@
           <div class="act">
           <button class="btn sm" aria-expanded={detail === j.id} onclick={() => detail = detail === j.id ? null : j.id}>{detail === j.id ? '收起详情' : '操作详情'}</button>
           <button class="btn sm" onclick={() => revealLog(j.id)}>查看日志</button>
-          <button class="btn ghost sm" disabled={busyId !== null} onclick={() => deleteRecord(j)}><Icon name="trash" size={13}/>删除记录</button>
+          <button class="btn ghost sm" disabled={!!flow.undoing} title="仅在本机历史列表中隐藏" onclick={() => hideRecord(j)}>隐藏记录</button>
           {#if j.status !== 'rolledBack' && !j.error}
-              {#if confirming === j.id}
-                <button class="btn danger sm" disabled={busyId === j.id} onclick={() => undo(j)}>{busyId === j.id ? '撤销中…' : '确认撤销'}</button>
+              {#if flow.undoing?.id === j.id && flow.undoing.root === shownRoot}
+                <button class="btn sm" disabled>撤销中…</button>
+              {:else if confirming === j.id}
+                <button class="btn danger sm" disabled={!!flow.undoing} onclick={() => undo(j)}>确认撤销</button>
                 <button class="btn ghost sm" onclick={() => (confirming = null)}>取消</button>
               {:else}
-                <button class="btn sm" onclick={() => (confirming = j.id)}><Icon name="undo" size={13} />撤销</button>
+                <button class="btn sm" disabled={!!flow.undoing} onclick={() => (confirming = j.id)}><Icon name="undo" size={13} />撤销</button>
               {/if}
           {/if}
           </div>

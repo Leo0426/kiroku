@@ -1,5 +1,11 @@
+import { restoreReview, takeRestore } from './package-restore'
+import { mockPackageExport } from './package-export'
+import { previewSupplement, applySupplement, undoSupplement, hasSupplement } from './supplement'
+import { checkImportName, projectImportRules } from '../import-rules'
 import { normalizeAi, selectedAiProvider, validateAi, validateAiProvider } from '../ai'
 import { assetUrl } from '../asset-url'
+import { baseName } from '../format'
+import { csvLabels, standardColumns } from '../csv-columns'
 import { csvCell } from '../library-browser'
 // 浏览器预览用的后端模拟:实现与 Tauri 相同的 Api 接口,并通过同一条事件总线发事件。
 // 目的是不启动桌面壳也能走通完整闭环(扫描 → 刮削 → 计划 → 执行 → 浏览 → 回滚)。
@@ -125,7 +131,7 @@ const movies: MockMovie[] = (() => {
   return list.filter((m, i, a) => a.findIndex((x) => x.code === m.code) === i)
 })()
 
-interface HistoryRec extends JournalSummary { appended?:{code:string;before:number;after:number}; added: string[]; revision?: { root: string; code: string; before: Metadata; after: Metadata; movie: MockMovie; imageBefore?:string; imageAfter?:string }; repaired?: { code: string; poster: boolean; fanart: boolean } }
+interface HistoryRec extends JournalSummary { operations?: string[]; supplemented?: string[]; restoredAssets?: {key:string; before?:string; after:string}[]; appended?:{code:string;before:number;after:number}; added: string[]; revision?: { root: string; code: string; before: Metadata; after: Metadata; movie: MockMovie; imageBefore?:string; imageAfter?:string }; repaired?: { code: string; poster: boolean; fanart: boolean } }
 const historyReads=new Map<string,{cancelled:boolean}>();const stoppedHistory=new Set<string>();let historyGeneration=0;
 function stopHistory(id:string){if(!id||id.length>100)return false;const active=historyReads.get(id);if(active){active.cancelled=true;return true}stoppedHistory.add(id);if(stoppedHistory.size>128)stoppedHistory.delete(stoppedHistory.values().next().value!);return false;}
 function invalidateHistory(nextRoot:Settings['library_root']){historyGeneration++;for(const r of historyReads.values())r.cancelled=true;historiesByRoot.set(settings.library_root,history.splice(0));history.push(...(historiesByRoot.get(nextRoot)??[]));}
@@ -136,8 +142,14 @@ const originalDirs = new Map<string, string>()
 let catalogPending: import('../types').CatalogPreview | null = null
 let catalogSettings=''
 const foundMetadata=new Map<string,Metadata>()
+const importCacheKey='kiroku-mock-import-cache-v1'
+let importSnapshots:Record<string,Awaited<ReturnType<typeof sourceSnapshot>>>=(()=>{try{const value=JSON.parse(localStorage.getItem(importCacheKey)??'{}');return value&&typeof value==='object'&&!Array.isArray(value)?value:{}}catch{return {}}})()
+const snapshotKey=(code:string,type:string,site:string)=>JSON.stringify([code,type,site])
+const saveImportSnapshots=()=>{try{localStorage.setItem(importCacheKey,JSON.stringify(importSnapshots))}catch{/* disposable mock cache */}}
+
 let revision: RevisionPreview | null = null
 let revisionSettings: Settings | null = null
+const restoredAssets = new Map<string,string>()
 const artworkImages=new Map<string,string>()
 const artworkOriginals=new Map<string,number[]>()
 let openedArtwork: {token:string;root:string;code:string;before:Metadata;settings:Settings;image:number[]}|null=null
@@ -185,7 +197,8 @@ const info = (number: string | null, over: Partial<FileInfo> = {}): FileInfo => 
 })
 
 const GB = 1024 ** 3
-const SCAN_FILES: { name: string; size: number; number: string | null; over?: Partial<FileInfo> }[] = [
+type ScanFixture = { name: string; size: number; number: string | null; over?: Partial<FileInfo> }
+const SCAN_FILES: ScanFixture[] = [
   { name: 'SMPL-421.mp4', size: 2.1 * GB, number: 'SMPL-421' },
   { name: 'SMPL-421 (1).mp4', size: 1.9 * GB, number: 'SMPL-421' }, // 与上一个同码 → 批内重名
   { name: 'MOVX-679-C.mp4', size: 3.4 * GB, number: 'MOVX-679', over: { has_subtitle: true } },
@@ -225,17 +238,33 @@ function skipReason(name: string, size: number): SkipReason | null {
   return null
 }
 
+// Outside the fixtures, simulate a regular-sized video with a common code or let
+// the user assign one. The browser preview never reads the selected media.
+function videoFixture(name: string): ScanFixture {
+  const sample = SCAN_FILES.find(file => file.name === name)
+  if (sample) return sample
+  const fc2 = /(?:^|[^a-z\d])FC2[-_ ]*(?:PPV[-_ ]*)?(\d{5,})(?!\d)/i.exec(name)
+  if (fc2) return { name, size: GB, number: 'FC2-' + fc2[1], over: { content_type: 'fc2', mosaic: null } }
+  const code = /(?:^|[^a-z\d])([a-z]{2,6})[-_](\d{2,5})(?!\d)/i.exec(name)
+  return { name, size: GB, number: code ? code[1].toUpperCase() + '-' + code[2] : null }
+}
+
+const scanPathKey = (path: string) => path.replaceAll('\\', '/').replace(/\/+$/, '')
+
 /** 按当前设置拆分:正片(id 为其在列表中的序号)与跳过的文件 */
-function splitScan(root: string): { kept: ScanItem[]; skipped: SkippedFile[] } {
+function splitScan(roots: string[]): { kept: ScanItem[]; skipped: SkippedFile[] } {
   const kept: ScanItem[] = []
   const skipped: SkippedFile[] = []
-  for (const f of SCAN_FILES) {
-    const path = `${root}/${f.name}`
+  const seen = new Set<string>()
+  function add(path: string, f: ScanFixture) {
+    const key = scanPathKey(path)
+    if (seen.has(key)) return
+    seen.add(key)
     const size = Math.round(f.size)
     const reason = skipReason(f.name, size)
     if (reason) {
       skipped.push({ path, size, reason })
-      continue
+      return
     }
     const fi = info(f.number, f.over)
     kept.push({
@@ -247,6 +276,14 @@ function splitScan(root: string): { kept: ScanItem[]; skipped: SkippedFile[] } {
         ? { kind: f.number.startsWith('FC2') ? 'Fc2' : 'Standard', id: f.number, content_type: fi.content_type, part: fi.cd, subtitled: fi.has_subtitle, mosaic: fi.mosaic, definition: fi.definition }
         : null,
     })
+  }
+  for (const root of roots) {
+    if (isVideoPath(root)) {
+      add(root, videoFixture(baseName(root)))
+    } else {
+      const prefix = root.replace(/[\\/]+$/, '') + (root.includes('\\') ? '\\' : '/')
+      for (const file of SCAN_FILES) add(prefix + file.name, file)
+    }
   }
   return { kept, skipped }
 }
@@ -279,8 +316,43 @@ const OUTCOME: Record<string, ScrapeStatus> = {
 }
 
 let scan: ScanItem[] = []
+let scanRoots: string[] = []
+
+function hasLocalCompanions(item: ScanItem): boolean {
+  if (item.path.includes('/companion-import/')) return true
+  return item.path.includes('/companion-mixed/') &&
+    item.code?.id === scan.find(entry => entry.code && entry.path.includes('/companion-mixed/'))?.code?.id
+}
+
+function localCompanionResults(): import('../types').LocalImportEntry[] {
+  const entries: import('../types').LocalImportEntry[] = []
+  const seen = new Set<string>()
+  for (const item of scan) {
+    const code = item.code
+    if (!code || seen.has(code.id) || !hasLocalCompanions(item)) continue
+    seen.add(code.id)
+    const movie = newMovie(code.id, code.content_type, 1)
+    movie.title = `本地示例 ${code.id}`
+    const meta = movieMetadata(movie)
+    meta.provenance = { title: 'local_nfo' }
+    found.set(code.id, movie)
+    foundMetadata.set(code.id, meta)
+    entries.push({
+      code: code.id, reusable: true,
+      preview: {
+        title: movie.title, originalTitle: null, cover: null, coverIsLandscape: false,
+        releaseDate: null, runtimeMin: null, studio: null, actors: [], score: null,
+        sources: ['local_nfo'], localAssets: '本地配套：NFO、海报、背景图', localCover: true,
+      },
+    })
+  }
+  return entries
+}
+
 const found = new Map<string, MockMovie>()
 const sourceText=new Map<string,import('../types').TextVersions>()
+let plannedMode: Settings['organize_mode'] = 'move'
+let planToken: string | undefined
 let plans: (PlanItem & { _movie?: MockMovie })[] = []
 
 // ---- Api 实现 -------------------------------------------------------------------------------
@@ -360,7 +432,7 @@ async function readPending(preview: boolean, requestId: string = crypto.randomUU
   try {
     await sleep(20)
     const dirs = [...settings.source_dirs]
-    const { kept, skipped } = dirs.length ? splitScan(dirs[0].replace(/\/$/, '')) : { kept: [], skipped: [] }
+    const { kept, skipped } = splitScan(dirs)
     const cancelled = !!job?.cancelled
     const summary: PendingSummary = { dirs, total: cancelled ? 0 : kept.length, skippedTotal: skipped.length,
       visited: cancelled ? 0 : kept.length + skipped.length, errors: [], errorsTotal: 0, cancelled, truncated: false,
@@ -390,7 +462,30 @@ function matchingMovies(q: Query) {
 }
 
 export const mockApi: Api = {
-  async recoveryInspect(){const id=begin();try{if(!settings.library_root)throw '媒体库未设置';const list=history.map(({added:_a,...h})=>({...h}));return {root:settings.library_root,entries:list.filter(j=>j.error||j.status==='partial'||j.pendingOperations).map(j=>({id:j.id,kind:j.error?'corrupt' as const:j.pendingOperations?'pending' as const:'partial' as const,codes:j.codes,pendingOperations:j.pendingOperations,message:j.error?`日志无法安全读取：${j.error}`:j.pendingOperations?'有中断操作待核对':'上次操作部分完成',canUndo:!j.error&&/^\d+$/.test(j.id)}))}}finally{end()}},
+  ...mockPackageExport({ getMovie: code => mockApi.libraryGet(code), root: () => settings.library_root, begin, end, cancelled: () => !!job?.cancelled }),
+  async nasStatus(){return {state:'disabled',message:'未配置 NAS SSH，使用普通文件操作',localRoot:null,remoteRoot:null}},
+  async nasDiagnose(requestId){const id=begin();if(requestId)emitMock('job:started',{jobId:id,requestId});try{return await mockApi.nasStatus()}finally{end()}},
+  async recoveryPreserve(root,journalId,requestId){
+    const id=begin();if(requestId)emitMock('job:started',{jobId:id,requestId})
+    try{
+      if(root!==settings.library_root)throw '媒体库已变化，请重新核对'
+      const entry=history.find(j=>j.id===journalId)
+      if(!entry||entry.error||entry.status!=='partial')throw '此日志不支持保留成果后继续'
+      emitMock('recovery:progress',{jobId:id,root,stage:'recover',done:0,total:entry.itemCount,elapsedMs:0})
+      entry.pendingOperations=0
+      await sleep(20)
+      const cancelled=!!job?.cancelled
+      const completed=cancelled?0:entry.itemCount
+      emitMock('recovery:progress',{jobId:id,root,stage:'index',done:completed,total:entry.itemCount,elapsedMs:20})
+      emitMock('library:changed',{jobId:id,root})
+      return {root,journalId,recordedOperations:entry.opCount,recoveryError:null,indexErrors:[],indexTotal:entry.itemCount,indexCompleted:completed,indexPending:entry.itemCount-completed,cancelled}
+    }finally{end()}
+  },
+  async recoveryInspect(){
+    const root = settings.library_root
+    if (!root) throw '媒体库未设置'
+    return {root, entries: history.filter(j=>j.error||j.status==='partial'||j.pendingOperations).map(j=>({id:j.id,kind:j.error?'corrupt' as const:j.pendingOperations?'pending' as const:'partial' as const,codes:[...j.codes],pendingOperations:j.pendingOperations,message:j.error?`日志无法安全读取：${j.error}`:j.pendingOperations?'有中断操作待核对':'上次操作部分完成',canUndo:!j.error&&/^\d+$/.test(j.id),canPreserve:!j.error&&j.status==='partial'}))}
+  },
 
   async catalogInventory(requestId){const id=begin();try{if(requestId!==undefined)emitMock('job:started',{jobId:id,requestId});emitMock('library:catalog',{jobId:id,phase:'inventory',done:0,total:0,code:''});if(!settings.library_root)throw '请先设置媒体库';const names:Record<string,Record<string,number>>={},list:import('../types').CatalogMovie[]=[];for(const m of movies){if(job?.cancelled)break;const d=await mockApi.libraryGet(m.code);if(!d)continue;const fields={actors:d.meta.actors.map(a=>a.name),tags:d.meta.tags,studio:d.meta.studio?[d.meta.studio]:[],publisher:d.meta.publisher?[d.meta.publisher]:[],series:d.meta.series?[d.meta.series]:[]};list.push({code:m.code,dir:d.dir,names:fields});for(const f of NAME_FIELDS)for(const name of new Set(fields[f])){names[f]??={};names[f][name]=(names[f][name]??0)+1}}return {movies:list,names,errors:[],cancelled:!!job?.cancelled}}finally{end()}},
   async catalogPreview(dirs,requestId){const id=begin();try{if(requestId!==undefined)emitMock('job:started',{jobId:id,requestId});catalogPending=null;emitMock('library:catalog',{jobId:id,phase:'preview',done:0,total:dirs.length,code:''});const items:import('../types').CatalogPreview['items']=[],warnings:string[]=[];for(const dir of new Set(dirs)){if(job?.cancelled)throw '预览已取消';const m=movies.find(m=>(originalDirs.get(m.code)??`${settings.library_root}/${m.actors[0]}/${m.code}`)===dir);if(!m)throw '影片目录不存在';const d=(await mockApi.libraryGet(m.code))!;if(job?.cancelled)throw '预览已取消';const p=projectNames(d.meta,settings.name_rules);warnings.push(...p.warnings);const changes=[...NAME_FIELDS,'title' as const].filter(f=>JSON.stringify(d.meta[f])!==JSON.stringify(p.metadata[f])).map(f=>({field:f,before:clone(d.meta[f]),after:clone(p.metadata[f])}));items.push({root:settings.library_root??'',dir,code:m.code,before:d.meta,after:p.metadata,changes})}catalogSettings=JSON.stringify(settings);catalogPending={token:String(id),root:settings.library_root??'',fingerprint:JSON.stringify(settings.name_rules),items,warnings};return clone(catalogPending)}finally{end()}},
@@ -414,7 +509,14 @@ export const mockApi: Api = {
       })
     } finally { end() }
   },
-  async pickMediaFiles(){const input=window.prompt('追加文件路径（浏览器模拟）');return input?[input]:[]},
+  async pickMediaFiles(purpose = 'append') {
+    if (purpose === 'import') {
+      const paths = window.prompt('输入视频路径（浏览器模拟，多项用 | 分隔）', '/mock/待整理/SMPL-421.mp4')
+      return paths?.split('|').map(path => path.trim()).filter(Boolean) ?? []
+    }
+    const path = window.prompt('追加文件路径（浏览器模拟）')
+    return path ? [path] : []
+  },
   async appendTargetVideos(code,target,requestId){
     begin(requestId)
     try{const d=await mockApi.libraryGet(code);if(job?.cancelled)throw '已取消';if(!d||d.dir!==target)throw '目标目录不匹配';return d.files.map(f=>f.path)}finally{end()}
@@ -530,7 +632,8 @@ export const mockApi: Api = {
   },
 
   async clearTranslationCache() {},
-  async clearImportCache() {},
+  async clearImportCache() {const id=begin();try{importSnapshots={};localStorage.removeItem(importCacheKey)}finally{end()}},
+  async importCacheUsage(){return {sources:{files:Object.keys(importSnapshots).length,bytes:new TextEncoder().encode(JSON.stringify(importSnapshots)).length},images:{files:0,bytes:0}}},
   async nameTranslation(rules, field, source) {
     const id=begin()
     try {
@@ -577,21 +680,14 @@ export const mockApi: Api = {
 
   async scanStart(dirs, rememberSources = true) {
     const lib = settings.library_root
-    const bad = lib && dirs.find((d) => d.startsWith(lib))
+    const bad = lib && dirs.find(d => scanPathKey(d) === scanPathKey(lib) || scanPathKey(d).startsWith(scanPathKey(lib) + '/'))
     if (bad) throw `「${bad}」在媒体库目录里面。请选择媒体库之外的文件夹(库内的影片已经整理过了)。`
     const id = begin()
     // 单个视频文件只用于本次导入,不记为待整理文件夹
     if (rememberSources) settings = { ...settings, source_dirs: dirs.filter((d) => !isVideoPath(d)) }
     localStorage.setItem(KEY, JSON.stringify(settings))
-    const folder = dirs.find((d) => !isVideoPath(d))
-    const split = folder ? splitScan(folder.replace(/\/$/, '')) : { kept: [] as ScanItem[], skipped: [] as SkippedFile[] }
-    // 文件根:只扫这一个文件(按文件名匹配样例文件)
-    for (const file of dirs.filter(isVideoPath)) {
-      const name = file.split('/').pop()!
-      const sample = splitScan(file.slice(0, -name.length - 1)).kept.find((k) => k.path.endsWith('/' + name))
-      if (sample) split.kept.push({ ...sample, id: split.kept.length, path: file })
-    }
-    const { kept, skipped } = split
+    scanRoots = [...dirs]
+    const { kept, skipped } = splitScan(scanRoots)
     ;(async () => {
       scan = []
       for (let i = 0; i < kept.length; i += 4) {
@@ -602,7 +698,9 @@ export const mockApi: Api = {
         emitMock('scan:items', { jobId: id, items: batch })
       }
       found.clear()
+      foundMetadata.clear()
       plans = []
+      const localImports = localCompanionResults()
       const codes = new Set(scan.filter((s) => s.code).map((s) => s.code!.id))
       const cancelled = !!job?.cancelled
       end()
@@ -614,7 +712,7 @@ export const mockApi: Api = {
         skipped,
         skippedTotal: skipped.length,
         errors: [], errorsTotal: 0, complete: !cancelled,
-        cancelled,
+        cancelled, localImports,
       })
     })()
     return id
@@ -637,21 +735,40 @@ export const mockApi: Api = {
       code: { kind: fc2 ? 'Fc2' : 'Standard', id, content_type: ct, part: it.info.cd, subtitled: it.info.has_subtitle, mosaic: it.info.mosaic === 'cracked' || it.info.mosaic === 'leaked' ? it.info.mosaic : fc2 ? null : short ? 'uncensored' : 'censored', definition: it.info.definition },
     }
     found.clear()
+    foundMetadata.clear()
     plans = []
-    return scan[itemId]
+    return { ...scan[itemId], localImports: localCompanionResults() }
   },
 
-  async scrapeStart(itemIds) {
+  async scrapeStart(itemIds, cachedSourcesOnly = false, refresh = false) {
     const id = begin()
-    const codes = [...new Map(itemIds.map((i) => scan[i]).filter((s) => s?.code && !found.has(s.code!.id)).map((s) => [s.code!.id, s.code!])).values()]
+    const items = itemIds.map(i => scan[i]).filter(s => s?.code)
+    // Synthetic source folder for browser-only previews and integration tests.
+    const local = new Set(items.filter(hasLocalCompanions).map(s => s.code!.id))
+    const codes = [...new Map(items.filter(s => refresh || !found.has(s.code!.id)).map(s => [s.code!.id, s.code!])).values()]
     ;(async () => {
       let nFound = 0, nMissing = 0, nFailed = 0
+      const cache={reused:0,missing:0,invalidated:0,corrupt:0,unreadable:0,skippedMovies:0}
       const t0 = Date.now()
       for (let i = 0; i < codes.length; i++) {
         const c = codes[i]
         const route = sourceRoute(c.id,c.content_type)
+        const hasLocal = local.has(c.id)
+        const localAssets = hasLocal ? '本地配套：NFO、海报、背景图' : undefined
         const ev = (status: ScrapeStatus, done: number) =>
           emitMock('scrape:event', { jobId: id, code: c.id, status, done, total: codes.length, preview: null, note: null })
+        const reused:typeof importSnapshots={}
+        for(const cfg of settings.sources.filter(s=>route.includes(s.id))){
+          if (refresh) continue
+          const snapshot=importSnapshots[snapshotKey(c.id,c.content_type,cfg.id)]
+          if(!snapshot){cache.missing++;continue}
+          if(!snapshot.fields||typeof snapshot.cache_identity!=='string'){cache.corrupt++;continue}
+          if(snapshot.cache_identity!==await identity(cfg.base,cfg.cookie,settings.proxy,effectiveApi(cfg))){cache.invalidated++;continue}
+          reused[cfg.id]=snapshot;cache.reused++
+        }
+        if(cachedSourcesOnly && route.length && !Object.keys(reused).length){
+          cache.skippedMovies++;nMissing++;emitMock('scrape:event',{jobId:id,code:c.id,status:{kind:'notFound'},done:i+1,total:codes.length,preview:null,note:'没有可复用的来源缓存，请关闭仅缓存模式补刮'});continue
+        }
         // 与后端一致:同一部影片的路线站点并发查询
         ev({ kind: 'scraping', site: route.join(',') || '无可用来源' }, i)
         await sleep(520)
@@ -660,17 +777,19 @@ export const mockApi: Api = {
         if (job?.cancelled) { ev({ kind: 'cancelled' }, i); break }
         // 与后端一致:JavDB 的 FC2 详情页要求登录,未填 Cookie 时失败并提示
         const needLogin = c.id.startsWith('FC2-') && route.length===1 && route[0]==='javdb' && !settings.sources.find((x) => x.id === 'javdb')?.cookie
-        const outcome: ScrapeStatus = !route.length
+        let outcome: ScrapeStatus = !route.length
           ? { kind: 'failed', message: '该内容类型没有可用的数据源' }
           : needLogin
           ? { kind: 'failed', message: 'javdb: 该影片需要登录 JavDB 才能查看,请在 设置 → 数据源 填写 JavDB Cookie' }
-          : pinnedUrl.has(c.id) ? { kind: 'found' as const }
+          : Object.keys(reused).length||pinnedUrl.has(c.id) ? { kind: 'found' as const }
           : OUTCOME[c.id] ?? { kind: 'found' as const }
         let preview = null
+        let fallback = false
         if (outcome.kind === 'found') {
           nFound++
           const m = newMovie(c.id, c.content_type, 1)
-          const rawMeta=movieMetadata(m)
+          const rawMeta={...movieMetadata(m),...Object.values(reused)[0]?.fields}
+          m.title=rawMeta.title??m.title;m.plot=rawMeta.plot??m.plot
           const texts:import('../types').TextVersions={original:{title:m.originalTitle??m.title,plot:m.plot,provenance:{title:route[0],plot:route[0]}},localized:{}}
           sourceText.set(c.id,texts)
           if (settings.ai.enabled && selectedAiProvider(settings.ai)?.api_key) {
@@ -684,18 +803,28 @@ export const mockApi: Api = {
           const metadata=movieMetadata(m)
           metadata.text_versions=clone(texts);metadata.nfo_language=settings.nfo_language
           metadata.raw_sources={}
-          for(const cfg of settings.sources.filter(s=>route.includes(s.id)))metadata.raw_sources[cfg.id]=await sourceSnapshot(c.id,c.content_type,cfg,settings.proxy,rawMeta)
+          for(const cfg of settings.sources.filter(s=>route.includes(s.id))){
+            if(cachedSourcesOnly&&!reused[cfg.id])continue
+            const snapshot=reused[cfg.id]??await sourceSnapshot(c.id,c.content_type,cfg,settings.proxy,rawMeta)
+            metadata.raw_sources[cfg.id]=snapshot
+            if(!pinnedUrl.has(c.id))importSnapshots[snapshotKey(c.id,c.content_type,cfg.id)]=snapshot
+          }
+          saveImportSnapshots()
           const projected=projectNames(metadata,settings.name_rules).metadata
           foundMetadata.set(c.id,projected);m.actors=projected.actors.map(a=>a.name);m.tags=projected.tags;m.studio=projected.studio??'';m.publisher=projected.publisher??'';m.series=projected.series
           found.set(c.id, m)
           preview = {
             title: m.title, originalTitle: m.originalTitle, cover: posterSvg(m.code, m.hue), coverIsLandscape: false,
-            releaseDate: m.releaseDate, runtimeMin: m.runtime, studio: m.studio, actors: m.actors, score: m.score, sources: route,
+            releaseDate: m.releaseDate, runtimeMin: m.runtime, studio: m.studio, actors: m.actors, score: m.score, sources: route, localAssets,
           }
+        } else if (hasLocal && found.has(c.id)) {
+          const m = found.get(c.id)!
+          outcome = { kind: 'found' }; nFound++; fallback = true
+          preview = { title: m.title, originalTitle: m.originalTitle, cover: null, coverIsLandscape: false, releaseDate: m.releaseDate, runtimeMin: m.runtime, studio: m.studio, actors: m.actors, score: m.score, sources: ['local_nfo'], localAssets, localCover: true }
         } else if (outcome.kind === 'notFound') nMissing++
         else nFailed++
         const url = pinnedUrl.get(c.id); pinnedUrl.delete(c.id)
-        const note = url !== undefined && !url.toLowerCase().replace(/[-_]/g, '').includes(c.id.toLowerCase().replace(/[-_]/g, '')) ? `详情页里没有找到番号 ${c.id},请确认是同一部影片` : null
+        const note = fallback ? '站点未返回可用资料，沿用现有资料' : url !== undefined && !url.toLowerCase().replace(/[-_]/g, '').includes(c.id.toLowerCase().replace(/[-_]/g, '')) ? `详情页里没有找到番号 ${c.id},请确认是同一部影片` : null
         emitMock('scrape:event', { jobId: id, code: c.id, status: outcome, done: i + 1, total: codes.length, preview, note })
         const per = (Date.now() - t0) / (i + 1) / 1000
         if (i + 1 < codes.length) emitMock('job:eta', { jobId: id, remainingSecs: Math.round(per * (codes.length - i - 1)) })
@@ -703,7 +832,7 @@ export const mockApi: Api = {
       plans = []
       const cancelled = !!job?.cancelled
       end()
-      emitMock('scrape:done', { jobId: id, found: nFound, notFound: nMissing, failed: nFailed, cancelled })
+      emitMock('scrape:done', { jobId: id, found: nFound, notFound: nMissing, failed: nFailed, cancelled, cache })
     })()
     return id
   },
@@ -724,17 +853,22 @@ export const mockApi: Api = {
     return mockApi.scrapeStart(itemIds)
   },
 
-  async planBuild(itemIds, requestId) {
+  async saveImportDefaults(rules) {
+    await mockApi.saveSettings(projectImportRules(settings, rules))
+  },
+  async planBuild(itemIds, requestId, rules, renames = {}) {
     const id = begin()
-    const config = clone(settings)
+    const before = clone(settings)
     emitMock('plan:started', { jobId: id, requestId: requestId ?? null })
     try {
+    const config = rules ? projectImportRules(before, rules) : before
+    Object.values(renames).forEach(checkImportName)
     const root = config.library_root
     if (!root) throw '请先设置媒体库目录'
     const {previewTemplate}=await import('../template-preview')
     await sleep(0)
     if (job?.cancelled) throw '计划已取消'
-    if (JSON.stringify(settings) !== JSON.stringify(config)) throw '设置或媒体库已变化，请重新生成整理计划'
+    if (JSON.stringify(settings) !== JSON.stringify(before)) throw '设置或媒体库已变化，请重新生成整理计划'
     const taken = new Set<string>()
     const metaDone = new Set<string>()
     const lib = new Set(movies.map((m) => m.code))
@@ -746,7 +880,8 @@ export const mockApi: Api = {
       const c=it.code!,ext=it.path.split('.').pop()??'mp4',names=[...new Set(m.actors)]
       const context:Record<string,string>={code:m.code,number:m.code,title:m.title,original_title:m.originalTitle??'',actor:m.actors[0]??'',actress:m.actors[0]??'',actors:names.join('、'),actresses:names.join('、'),year:m.releaseDate.slice(0,4),release:m.releaseDate,runtime:String(m.runtime),score:String(m.score),studio:m.studio,publisher:m.publisher,series:m.series??'',directors:'',prefix:m.code.split('-').slice(0,-1).join('-'),suffix:m.code.split('-').pop()??'',ext,content_type:c.content_type,raw_name:it.path.split('/').pop()!.replace(/\.[^.]+$/,''),raw_dir:it.path.split('/').slice(-2,-1)[0]??'',cd:part?String(part):'',sub:c.subtitled?'C':'',mosaic:c.mosaic??'',def:c.definition??''}
       const fileTpl=config.plex.naming?'{code}[-{mosaic?|cracked=U,leaked=LEAK,censored=,uncensored=}{sub?}][ {title}][ - cd{cd?}]':config.file_template
-      const preview=previewTemplate(config.dir_template,fileTpl,context)
+      const preview=previewTemplate(config.dir_template,renames[it.id] ? fileTpl + ' - ' + renames[it.id] : fileTpl,context)
+      if (!preview.error && renames[it.id] && !preview.file.endsWith(' - '+renames[it.id]+'.'+ext)) preview.error='文件名太长，无法保留另存后缀。请缩短文件名模板或后缀'
       const to = `${root}/${preview.directory}/${preview.file}`
       const carrier = !metaDone.has(m.code)
       metaDone.add(m.code)
@@ -762,7 +897,7 @@ export const mockApi: Api = {
       }
       // ADR-0008:库里已有该番号、文件带中字/清晰度/破解标记 → 作为新版本并存,默认不选
       const label=[c.definition,c.subtitled?'中字':null,c.mosaic==='cracked'?'破解':c.mosaic==='leaked'?'流出':null].filter(Boolean).join(' ')
-      if(lib.has(m.code)&&label&&!preview.error){const dir=originalDirs.get(m.code)??`${root}/${m.actors[0]}/${m.code}`;const target=`${dir}/${m.code} - ${label}.${ext}`;return {itemId:it.id,code:m.code,title:m.title,from:it.path,to:target,extras:[],conflict:null,conflicts:[],selected:false,newVersion:true,notices:[`库中已有该分片的其他版本，将作为新版本并存：${m.code} - ${label}.${ext}；确认后请手动勾选`,'追加到已有影片，保留元数据和海报'],_movie:m} as PlanItem & { _movie: MockMovie }}
+      if(lib.has(m.code)&&(label||renames[it.id])&&!preview.error){const dir=originalDirs.get(m.code)??`${root}/${m.actors[0]}/${m.code}`;const target=`${dir}/${m.code} - ${renames[it.id]||label}.${ext}`;return {itemId:it.id,code:m.code,title:m.title,from:it.path,to:target,extras:[],conflict:null,conflicts:[],selected:false,newVersion:true,notices:[`库中已有该分片的其他版本，将作为新版本并存：${m.code} - ${renames[it.id]||label}.${ext}；确认后请手动勾选`,'追加到已有影片，保留元数据和海报'],_movie:m} as PlanItem & { _movie: MockMovie }}
       const conflict = conflicts[0]?.kind ?? null
       return {
         itemId: it.id,
@@ -784,17 +919,27 @@ export const mockApi: Api = {
         if (!c.path.match(/\.(mp4|mkv|mov)$/i) && !p.conflicts.some((x) => x.path === c.path)) p.conflicts.push({ ...c })
       }
       p.conflict = p.conflicts[0]?.kind ?? null
-      p.selected = !p.conflict
+      p.selected = !p.conflict && !p.newVersion
     }
     if (job?.cancelled) throw '计划已取消'
-    if (JSON.stringify(settings) !== JSON.stringify(config)) throw '设置或媒体库已变化，请重新生成整理计划'
+    if (JSON.stringify(settings) !== JSON.stringify(before)) throw '设置或媒体库已变化，请重新生成整理计划'
+    for (const p of builtPlans) {
+      p.existingMovie = lib.has(p.code)
+      p.actions = [`${config.organize_mode === 'move' ? '移动' : config.organize_mode === 'copy' ? '复制' : config.organize_mode === 'hardlink' ? '硬链接' : '软链接'} ${p.from} → ${p.to}`,
+        ...p.extras.map(file => `写入 ${p.to.slice(0,p.to.lastIndexOf('/')+1)}${file}`)]
+    }
+    planToken = requestId
+    plannedMode = config.organize_mode
     plans = builtPlans
     return plans.map(({ _movie, ...p }) => p)
     } finally { end() }
   },
 
-  async applyStart(itemIds) {
-    const chosen = plans.filter((p) => itemIds.includes(p.itemId) && !p.conflict).map((p) => ({ ...p }))
+  async applyStart(itemIds, token) {
+    if (token && token !== planToken) throw '整理预览已更新，请重新预览'
+    const mode = plannedMode
+    const chosen = plans.filter((p) => itemIds.includes(p.itemId) && !p.conflict && p.actions?.length !== 0).map((p) => ({ ...p }))
+    const skipped = plans.length - chosen.length
     if (!chosen.length) throw '没有可执行的项目,请重新生成整理计划'
     const carriers = new Set(chosen.filter((p) => p.extras.length).map((p) => p.code))
     for (const p of chosen) {
@@ -833,7 +978,7 @@ export const mockApi: Api = {
         await sleep(380)
         if (job?.cancelled) { cancelled = true; log('info', '  已取消'); break }
         log('info', `[${done + 1}/${chosen.length}] ${p.code}`)
-        log('info', `  移动 ${p.from} → ${p.to}`)
+        log('info', p.actions?.[0] ?? `处理 ${p.from} → ${p.to}`)
         const dir = p.to.slice(0, p.to.lastIndexOf('/'))
         for (const x of p.extras) log('info', x.endsWith('.jpg') ? `  保存 ${dir}/${x}${x.endsWith('-poster.jpg') ? '(裁剪海报)' : ''}` : `  写入 ${dir}/${x}`)
         log('debug', `GET https://c0.jdbstatic.com/covers/mock/${p.code}.jpg → 200 (183 KB, 412 ms)`, 'net')
@@ -852,31 +997,36 @@ export const mockApi: Api = {
           imported.text_versions=clone(sourceText.get(m.code)??imported.text_versions??{original:{},localized:{}});imported.nfo_language=settings.nfo_language
           edited.set(m.code,imported);originalDirs.set(m.code,dir)
         }
-        const ev: ApplyEvent = { jobId: id, code: p.code, itemId: p.itemId, done, total: chosen.length, ok: true, error: null, warnings: [] }
+        const ev: ApplyEvent = { jobId: id, code: p.code, itemId: p.itemId, done, total: chosen.length, ok: true, error: null, warnings: p.notices ?? [] }
         emitMock('apply:event', ev)
         emitMock('library:changed', {jobId:job?.id??0})
       }
-      const journalId = String(Date.now())
-      if (done > 0) {
-        history.unshift({
-          id: journalId, ts: Date.now(), status: cancelled ? 'partial' : 'applied',
-          itemCount: done, opCount: done * 4, trashed: 0, pendingOperations: 0, error: null, codes: [...new Set(chosen.slice(0, done).map((c) => c.code))].slice(0, 6), added,
-        })
-      }
+      const completed = chosen.slice(0, done)
+      const operations = completed.flatMap(p => [
+        p.actions?.[0] ?? `处理 ${p.from} → ${p.to}`,
+        ...p.extras.map(file => `写入 ${p.to.slice(0, p.to.lastIndexOf('/') + 1)}${file}`),
+      ])
+      const codes = [...new Set(completed.map(p => p.code))]
       // 只清理真正整理过的子目录；根目录、剩余正片及因体积跳过的视频均保留。
-      const sourceRoots=settings.source_dirs.length?settings.source_dirs:['/Volumes/Downloads/新片']
-      const moved=new Set(chosen.slice(0,done).map(p=>p.from))
+      const sourceRoots=scanRoots.filter(root=>!isVideoPath(root))
+      const moved=new Set(completed.map(p=>p.from))
       const candidates=[...new Set([...moved].map(path=>path.slice(0,path.lastIndexOf('/'))))]
-      const retained=[...scan.filter(item=>!moved.has(item.path)),...sourceRoots.flatMap(root=>splitScan(root).skipped).filter(item=>settings.scan.min_video_mb>0&&item.size<settings.scan.min_video_mb*1024*1024)]
-      const cleaned = settings.cleanup_source && settings.organize_mode === 'move' && !cancelled
+      const retained=[...scan.filter(item=>!moved.has(item.path)),...splitScan(scanRoots).skipped.filter(item=>settings.scan.min_video_mb>0&&item.size<settings.scan.min_video_mb*1024*1024)]
+      const cleaned = settings.cleanup_source && mode === 'move' && !cancelled
         ? candidates.filter(dir=>sourceRoots.some(root=>dir.startsWith(root+'/'))&&!retained.some(item=>item.path.startsWith(dir+'/'))) : []
-      if (history[0]?.id === journalId) history[0].trashed = cleaned.length
+      const record: HistoryRec = {
+        id: String(Date.now()), ts: Date.now(), status: cancelled ? 'partial' : 'applied',
+        itemCount: codes.length, opCount: operations.length, operations, codes, added,
+        trashed: cleaned.length, pendingOperations: 0, error: null,
+      }
+      history.unshift(record)
       for (const d of cleaned) log('info', `原文件夹已移到废纸篓: ${d}`)
       log('info', `整理结束:成功 ${done} 项,失败 0 项${cancelled ? ',已取消' : ''}`)
       emitMock('apply:progress', { jobId: id, phase: 'index', done: 0, total: done, failed: 0, code: null })
       log('info', `媒体库索引已更新(${done} 个目录)`)
       end()
-      emitMock('apply:done', { indexError: null, jobId: id, applied: done, failed: [], cancelled, journalId, cleaned })
+      emitMock('apply:done', { skipped, imageFailures: 0, indexError: null, jobId: id, applied: done, failed: [], cancelled,
+        journalId: record.id, canRollback: record.opCount > 0 || record.pendingOperations > 0, cleaned })
     })()
     return id
   },
@@ -902,7 +1052,8 @@ export const mockApi: Api = {
       return {items,total:rows.length,next:after.length>items.length&&items.length?items[items.length-1].id:null}
     } finally {historyReads.delete(requestId)}
   },
-  async historyDetail(requestId,journalId,offset=0) {
+  async historyDetail(requestId,journalId,offset=0,expectedRoot) {
+    if (expectedRoot !== undefined && expectedRoot !== settings.library_root) throw '媒体库已变化，请切回本批所在的媒体库'
     if(!requestId||requestId.length>100||historyReads.has(requestId)||historyReads.size>=16)throw '无效的读取请求'
     const read={cancelled:stoppedHistory.delete(requestId)};historyReads.set(requestId,read);const root=settings.library_root,generation=historyGeneration
     try {
@@ -911,17 +1062,20 @@ export const mockApi: Api = {
       if(root!==settings.library_root||generation!==historyGeneration)throw '媒体库已变化，请重新读取'
       const h=history.find(h=>h.id===journalId);if(!h)throw '日志不存在';if(h.error)throw h.error
       const total=h.opCount+(h.pendingOperations??0)+h.trashed
-      const operations=Array.from({length:Math.max(0,Math.min(100,total-offset))},(_,i)=>({index:offset+i,description:`示例操作 ${offset+i+1} · ${h.codes[(offset+i)%Math.max(1,h.codes.length)]??journalId}`,state:h.status==='rolledBack'?'undone' as const:offset+i<h.opCount?'recorded' as const:offset+i<h.opCount+(h.pendingOperations??0)?'pending' as const:'trashed' as const}))
+      const operations=Array.from({length:Math.max(0,Math.min(100,total-offset))},(_,i)=>({index:offset+i,description:h.operations?.[offset+i] ?? `示例操作 ${offset+i+1} · ${h.codes[(offset+i)%Math.max(1,h.codes.length)]??journalId}`,state:h.status==='rolledBack'?'undone' as const:offset+i<h.opCount?'recorded' as const:offset+i<h.opCount+(h.pendingOperations??0)?'pending' as const:'trashed' as const}))
       return {id:journalId,status:h.status,operations,total,next:offset+operations.length<total?offset+operations.length:null}
     }finally{historyReads.delete(requestId)}
   },
   async historyCancel(requestId){return stopHistory(requestId)},
   async revealJournal(id) { console.info('[mock] reveal journal', id) },
-  async rollback(journalId) {
+  async rollback(journalId, expectedRoot) {
+    if (expectedRoot !== undefined && expectedRoot !== settings.library_root) throw '媒体库已变化，请重新核对操作记录'
     const h = history.find((x) => x.id === journalId)
     if (!h) throw '日志不存在'
     if (job) throw '已有任务在运行'
     if (h.status === 'rolledBack') return { indexError: null, failures: [], status: 'rolledBack' }
+    if(h.restoredAssets?.some(a=>restoredAssets.get(a.key)!==a.after))return {indexError:null,failures:['图片已发生变化，请先检查'],status:'partial'}
+    if(h.supplemented) undoSupplement(h.supplemented)
     if(h.appended){const m=movies.find(m=>m.code===h.appended!.code);if(!m||m.parts!==h.appended.after)return {indexError:null,failures:['影片已变化，拒绝撤销'],status:'partial'};m.parts=h.appended.before}
     if (h.revision) {
       const r = h.revision
@@ -931,6 +1085,10 @@ export const mockApi: Api = {
       if(!r.before.artwork)artworkOriginals.delete(r.code)
       edited.set(r.code, clone(r.before))
       const movie = movies.find(m => m.code === r.code); if (movie) Object.assign(movie, clone(r.movie))
+    }
+    for(const asset of h.restoredAssets??[]) {
+      if(asset.before!==undefined) restoredAssets.set(asset.key,asset.before)
+      else restoredAssets.delete(asset.key)
     }
     for (const code of h.added) {
       const i = movies.findIndex((m) => m.code === code)
@@ -981,34 +1139,48 @@ export const mockApi: Api = {
     return { total: list.length, items: await Promise.all(selected.map(toCard)) }
   },
 
-  async libraryExportCsv(query, requestId) {
+  async libraryExportCsv(query, requestId, options) {
     const jobId = begin(requestId)
     try {
-      // Capture before yielding so later mock mutations cannot mix snapshots.
-      const pending = mockApi.libraryList({ ...query, offset: 0, limit: Math.max(1, movies.length) })
-      const page = await pending
-      const chunks = ['\ufeff编号,标题,年份,演员,评分,分片数,收藏\r\n']
-      for (let i = 0; i < page.items.length; i++) {
-        if (i % 500 === 0) {
-          emitMock('library:export', { jobId, root: settings.library_root ?? '', done: i, total: page.total })
-          await sleep(0)
-        }
-        if (job?.cancelled) throw '导出已停止'
-        const m = page.items[i]
-        chunks.push([m.code, m.title ?? '', String(m.year ?? ''), m.actors.join(' / '), m.score === null ? '' : (m.score / 10).toFixed(1), String(m.parts), m.favorite ? '是' : '否'].map(csvCell).join(',') + '\r\n')
+      const root = settings.library_root ?? ''
+      const columns = options?.columns ?? standardColumns
+      if (!columns.length || new Set(columns).size !== columns.length || columns.some(k=>!(k in csvLabels))) throw '请选择不重复的 CSV 列'
+      const selected = options?.codes ? new Set(options.codes) : null
+      const snapshot = new Map(movies.map(m => {
+        const dir = originalDirs.get(m.code) ?? `${settings.library_root ?? '/Library'}/${m.actors[0]}/${m.code}`
+        return [m.code, { tags: [...m.tags].sort().join(' / '), paths: Array.from({length:m.parts}, (_,i) =>
+          `${dir}/${m.code}${m.parts>1?`-CD${i+1}`:''}.mp4`).join('\n') }]
+      }))
+      const page = await mockApi.libraryList({ ...query, offset: 0, limit: Math.max(1, movies.length) })
+      const chunks = ['\ufeff'+columns.map(c=>csvLabels[c]).join(',')+'\r\n']
+      let count=0
+      for (let i=0;i<page.items.length;i++) {
+        if(i%500===0) {emitMock('library:export',{jobId,root,done:i,total:page.total});await sleep(0)}
+        if(job?.cancelled)throw '导出已停止'
+        const m=page.items[i]
+        if(selected && !selected.has(m.code))continue
+        const values={...snapshot.get(m.code)!, code:m.code,title:m.title??'',year:String(m.year??''),actors:m.actors.join(' / '),
+          score:m.score===null?'':(m.score/10).toFixed(1),parts:String(m.parts),favorite:m.favorite?'是':'否'}
+        chunks.push(columns.map(c=>csvCell(values[c])).join(',')+'\r\n')
+        count++
       }
-      if (job?.cancelled) throw '导出已停止'
-      emitMock('library:export', { jobId, root: settings.library_root ?? '', done: page.total, total: page.total })
-      const url = URL.createObjectURL(new Blob(chunks, { type: 'text/csv;charset=utf-8' }))
-      const a = document.createElement('a'); a.href = url; a.download = 'kiroku-library.csv'; a.click()
-      setTimeout(() => URL.revokeObjectURL(url), 1000)
-      return page.total
+      if(job?.cancelled)throw '导出已停止'
+      if(selected && count!==selected.size)throw '选中的影片已变化，请重新选择'
+      emitMock('library:export',{jobId,root,done:page.total,total:page.total})
+      const url=URL.createObjectURL(new Blob(chunks,{type:'text/csv;charset=utf-8'}))
+      const a=document.createElement('a');a.href=url;a.download='kiroku-library.csv';a.click()
+      setTimeout(()=>URL.revokeObjectURL(url),1000)
+      return count
     } finally { end() }
   },
 
-  async actorImage(code, url) {
+  async actorImage(code, url, revisionToken, actorName) {
     const detail = await mockApi.libraryGet(code)
-    if (!detail?.meta.actors.some(a => a.thumb === url)) throw '影片中没有此头像地址'
+    const previewHasThumb = revision && revision.token === revisionToken && revision.code === code
+      && revision.root === settings.library_root && JSON.stringify(revisionSettings) === JSON.stringify(settings)
+      && revision.after.actors.some(actor => actor.thumb === url)
+    const local=!!actorName && detail?.localActorNames?.includes(actorName) && detail.meta.actors.some(a=>a.name===actorName && (a.thumb??'')===url)
+    if (!detail || (!local && !detail.meta.actors.some(actor => actor.thumb === url) && !previewHasThumb)) throw '影片中没有此头像地址'
     // Browser preview stays offline and simulates the native PNG response.
     return {bytes: Array.from(Uint8Array.from(atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII='), c => c.charCodeAt(0))), mime: 'image/png'}
   },
@@ -1016,8 +1188,10 @@ export const mockApi: Api = {
     const m = movies.find((x) => x.code === code)
     if (!m) return null
     const dir = originalDirs.get(code) ?? `${settings.library_root ?? '/Library'}/${m.actors[0]}/${m.code}`
+    const fanart=restoredAssets.get(dir+'/fanart') ?? (m.missingFanart ? null : posterSvg(m.code, (m.hue + 20) % 360))
+    const localActorNames=(edited.get(code)?.actors.map(a=>a.name)??m.actors).filter(name=>restoredAssets.has(dir+'/.actors/'+name)||hasSupplement(dir+'/.actors/'+name+'.png'))
     return {
-      ...await toCard(m),
+      ...await toCard(m), localActorNames,
       meta: edited.has(code) ? clone(edited.get(code)!) : {
         code: m.code, title: m.title, original_title: m.originalTitle, plot: m.plot, release_date: m.releaseDate,
         runtime_min: m.runtime, studio: m.studio, publisher: m.publisher, series: m.series,
@@ -1028,8 +1202,7 @@ export const mockApi: Api = {
       files: Array.from({ length: m.parts }, (_, i) => ({
         path: `${dir}/${m.code}${m.parts > 1 ? `-CD${i + 1}` : ''}.mp4`, part: m.parts > 1 ? i + 1 : null, size: Math.round((1.6 + i * 0.4) * GB),
       })),
-      fanart: m.missingFanart ? null : posterSvg(m.code, (m.hue + 20) % 360),
-      fanartVersion: await imageVersion(m.missingFanart ? null : posterSvg(m.code, (m.hue + 20) % 360)),
+      fanart, fanartVersion: await imageVersion(fanart),
     }
   },
 
@@ -1082,6 +1255,16 @@ export const mockApi: Api = {
         if (!EDITABLE_FIELDS.some(f => f.key === field)) throw '不可人工编辑字段'
         if (['actors', 'tags', 'directors'].includes(field)) {
           if (!Array.isArray(value) || value.some(v => field === 'actors' ? !v || typeof v.name !== 'string' || !['female','male','unknown'].includes(v.gender ?? 'unknown') : typeof v !== 'string')) throw '列表字段格式无效'
+          if (field === 'actors') {
+            const existing = new Set(after.actors.map(actor => actor.thumb))
+            for (const { thumb } of value) {
+              if (thumb == null || existing.has(thumb)) continue
+              try {
+                if (typeof thumb === 'string' && ['http:', 'https:'].includes(new URL(thumb).protocol)) continue
+              } catch { /* Report malformed addresses consistently with other unsupported URLs. */ }
+              throw '演员头像网址必须是有效的 HTTP 或 HTTPS 地址'
+            }
+          }
         } else if (field === 'runtime_min') { if (value !== null && (typeof value !== 'number' || !Number.isInteger(value) || value < 0 || value > 4294967295)) throw '片长格式无效' }
         else if (value !== null && typeof value !== 'string') throw '文本字段格式无效'
         const old = after[field as keyof Metadata]
@@ -1093,7 +1276,7 @@ export const mockApi: Api = {
         after.provenance = { ...after.provenance, [field]: 'manual' }
       }
       revisionSettings = clone(settings)
-      revision = { token: String(id), root: settings.library_root ?? '/Library', dir: detail.dir, code, before: clone(detail.meta), after, changes, warnings: changes.some(c=>c.field==='artwork_phase') ? ['浏览器预览仅模拟版本标记保存；原生应用从保留原图更新海报。'] : [] }
+      revision = { token: String(id), root: settings.library_root ?? '/Library', dir: detail.dir, code, before: clone(detail.meta), after, changes, warnings: 'artwork_phase' in patch ? ['原生应用从保留原图更新海报，并将版本标记写入 NFO。'] : [] }
       return clone(revision)
     } finally { end() }
   },
@@ -1111,7 +1294,7 @@ export const mockApi: Api = {
           const before=projectText(detail.meta).meta[field as keyof Metadata],value=projectText(after).meta[field as keyof Metadata]
           if(JSON.stringify(before)!==JSON.stringify(value))changes.push({field,before:clone(before),after:clone(value)})
         }
-        items.push({token,root,dir:detail.dir,code,before:clone(detail.meta),after,changes,warnings:projectText(after).warnings})
+        items.push({token,root,dir:detail.dir,nfoPath:detail.dir+'/'+code+'.nfo',code,before:clone(detail.meta),after,changes,warnings:projectText(after).warnings})
       }
       if(job?.cancelled)throw '已取消'
       if(JSON.stringify(settings)!==JSON.stringify(captured))throw '设置已变化，请重新预览'
@@ -1307,7 +1490,7 @@ export const mockApi: Api = {
       if (job?.cancelled) throw '已取消'
       if (JSON.stringify(settings)!==JSON.stringify(capturedSettings)) throw '媒体库或设置已变化，请重新预览'
       revisionSettings=clone(capturedSettings)
-      revision={token:String(id),root:settings.library_root??'/Library',dir:detail.dir,code,before:clone(detail.meta),after,changes,warnings:projectText(after).warnings}
+      revision={token:String(id),root:settings.library_root??'/Library',dir:detail.dir,nfoPath:detail.dir+'/'+code+'.nfo',code,before:clone(detail.meta),after,changes,warnings:projectText(after).warnings}
       return clone(revision)
     } finally {end()}
   },
@@ -1334,6 +1517,72 @@ export const mockApi: Api = {
     window.open(url, '_blank', 'noopener,noreferrer')
   },
 
+  async packageRestorePreview(directory,rules,requestId) {
+    const id=begin(requestId)
+    try {
+      const root=settings.library_root
+      if(!root)throw '请先设置媒体库'
+      return await restoreReview(root,historyGeneration,JSON.stringify(settings),String(id),directory,rules,code=>mockApi.libraryGet(code),()=>!!job?.cancelled)
+    } finally {end()}
+  },
+  async packageRestoreApply(token,codes,requestId){
+    const jobId=begin(requestId)
+    try {
+      const root=settings.library_root??''
+      const pending=takeRestore(root,historyGeneration,JSON.stringify(settings),token,codes)
+      const results:import('../types').RevisionResult[]=[], failed:string[]=[]
+      for(const candidate of pending){
+        if(job?.cancelled)break
+        const {before,after,assets}=candidate, code=before.code
+        const current=await mockApi.libraryGet(code), m=movies.find(m=>m.code===code)
+        if(!current || !m || JSON.stringify(current)!==JSON.stringify(before)){failed.push(code+'：目标或资料已变化，请重新预览');continue}
+        const journalId='restore-'+jobId+'-'+results.length
+        const poster=assets.find(a=>a.kind==='poster')
+        const extra=assets.filter(a=>a.kind!=='poster').map(a=>{
+          const key=a.kind==='avatar'?before.dir+'/.actors/'+a.name:before.dir+'/fanart'
+          return {key,before:restoredAssets.get(key),after:a.data}
+        })
+        history.unshift({id:journalId,ts:Date.now(),status:'applied',itemCount:1,opCount:2+assets.length,codes:[code],trashed:0,pendingOperations:0,error:null,added:[],restoredAssets:extra,
+          revision:{root,code,before:clone(before.meta),after:clone(after),movie:clone(m),imageBefore:artworkImages.get(code),imageAfter:poster?.data}})
+        originalDirs.set(code,before.dir)
+        edited.set(code,clone(after))
+        Object.assign(m,{title:after.title??'',plot:after.plot??'',actors:after.actors.map(a=>a.name),tags:[...after.tags],studio:after.studio??'',publisher:after.publisher??'',series:after.series,releaseDate:after.release_date??'',runtime:after.runtime_min??0,favorite:after.favorite??before.favorite})
+        if(poster){artworkImages.set(code,poster.data);m.missingPoster=false}
+        if(assets.some(a=>a.kind==='fanart'))m.missingFanart=false
+        for(const a of extra)restoredAssets.set(a.key,a.after)
+        results.push({jobId,root,code,journalId,error:null,indexError:null})
+        emitMock('package:progress',{jobId,done:results.length+failed.length,total:pending.length})
+      }
+      if(results.length)emitMock('library:changed',{jobId})
+      return {jobId,results,failed,cancelled:!!job?.cancelled}
+    } finally {end()}
+  },
+  async supplementPreview(code,itemId,requestId) {
+    const id=begin(requestId)
+    try {
+      if(itemId!==undefined && !scan.some(s=>s.id===itemId&&s.code?.id===code)) throw '导入列表已变化，请重新预览'
+      const movie=await mockApi.libraryGet(code)
+      if(!movie) throw '媒体库中没有匹配编号的影片。请先整理入库，或核对影片编号。'
+      return previewSupplement(movie,settings.library_root??'',historyGeneration,String(id))
+    } finally {end()}
+  },
+  async supplementApply(token,kinds,requestId) {
+    const id=begin(requestId)
+    try {
+      const {code,added}=applySupplement(token,kinds,settings.library_root??'',historyGeneration)
+      const movie=movies.find(m=>m.code===code)!
+      const written=added.map(e=>e.path!)
+      const journalId=written.length?'supplement-'+id:null
+      if (journalId) {
+        const poster=added.some(e=>e.kind==='poster'),fanart=added.some(e=>e.kind==='fanart')
+        history.unshift({id:journalId,ts:Date.now(),status:'applied',itemCount:1,opCount:written.length,codes:[code],trashed:0,pendingOperations:0,error:null,added:[],supplemented:written,repaired:{code,poster,fanart}})
+        if(poster)movie.missingPoster=false
+        if(fanart)movie.missingFanart=false
+        emitMock('library:changed',{jobId:id})
+      }
+      return {written,journalId,skipped:[],cancelled:false}
+    } finally {end()}
+  },
   async repairImagesStart(code) {
     const id = begin()
     const root = settings.library_root ?? '/Library'
@@ -1344,11 +1593,18 @@ export const mockApi: Api = {
       const poster = !!m?.missingPoster, fanart = !!m?.missingFanart
       const written = cancelled ? 0 : Number(poster) + Number(fanart)
       let journalId: string | null = null
-      if (m && written) {
-        m.missingPoster = false; m.missingFanart = false
+      if (m && (poster || fanart)) {
+        const operations: string[] = []
+        if (written) {
+          if (poster) operations.push(`写入海报 · ${code}`)
+          if (fanart) operations.push(`写入背景图 · ${code}`)
+          m.missingPoster = false; m.missingFanart = false
+          emitMock('library:changed', { jobId: id })
+        }
         journalId = `repair-${Date.now()}-${id}`
-        history.unshift({ id: journalId, ts:Date.now(), status: 'applied', itemCount: 1, opCount: written, codes: [code], trashed: 0, pendingOperations: 0, error: null, added: [], repaired: { code, poster, fanart } })
-        emitMock('library:changed', {jobId:job?.id??0})
+        history.unshift({ id: journalId, ts: Date.now(), status: cancelled ? 'partial' : 'applied',
+          itemCount: written ? 1 : 0, opCount: operations.length, operations, codes: written ? [code] : [],
+          trashed: 0, pendingOperations: 0, error: null, added: [], repaired: written ? { code, poster, fanart } : undefined })
       }
       end()
       emitMock('repair:done', { jobId: id, root, code, written, failed: m ? [] : [[code, '影片不在媒体库中']], cancelled, journalId, indexError: null, warnings: m && !written && !cancelled ? ['没有可补的缺失图片'] : [] })
@@ -1377,14 +1633,14 @@ export const mockApi: Api = {
     }
   },
 
-  async libraryPruneMissing(root, automatic, requestId) {
+  async libraryPruneMissing(root, automatic, requestId, _removeMissing) {
     if (root !== settings.library_root) throw '媒体库已变化，请重新刷新'
     if (job && automatic) return { root, removed: 0, skipped: true }
     begin(requestId)
     try {
       // Preview has no filesystem; all synthetic movie files remain present.
       if (job?.cancelled) throw '刷新已取消'
-      return { root, removed: 0, skipped: false }
+      return { root, removed: 0, relocated: 0, refreshed: 0, ambiguous: 0, missingCodes: [], skipped: false }
     } finally { end() }
   },
 
@@ -1429,5 +1685,6 @@ export const mockApi: Api = {
     await openMedia('reveal',code,part,requestId)
   },
 
+  cachedPoster: async () => null,
   posterUrl: (path, revision) => assetUrl(path, revision),
 }

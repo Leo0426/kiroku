@@ -2,8 +2,8 @@
 //! 按文件相位在海报四角贴 PNG 角标——中字 / 无码 / 破解 / 流出 / 清晰度。
 //!
 //! - 角标图:内置 `assets/watermarks/*.png`(取自 amane,GPL-3.0,裁掉透明边并缩小);
-//!   用户可在 `<设置目录>/watermarks/{stem}.png` 放同名文件覆盖,清晰度还可补 `1080p.png` 等内置没有的档。
-//!   用户文件损坏则回退内置;都没有则跳过该枚,不回退文字。
+//!   用户可在 `<设置目录>/watermarks/{stem}.png` 放同名文件覆盖。
+//!   用户文件损坏则回退内置;都没有则跳过该枚。
 //! - 尺寸:角标高 = 图高 × scale(海报与横版封面同高时一样大),最小 16px。
 //! - 位置:每类各选一角;同角按「中字 → 无码 → 破解 → 流出 → 清晰度」向内叠(上角往下、下角往上),右角右对齐。
 //!   `None` 表示该类不画(kiroku 补充,amane 只有四角)。
@@ -28,6 +28,12 @@ const BUILTIN: &[(&str, &[u8])] = &[
     ("leaked", include_bytes!("../assets/watermarks/leaked.png")),
     ("4k", include_bytes!("../assets/watermarks/4k.png")),
     ("8k", include_bytes!("../assets/watermarks/8k.png")),
+    ("1440p", include_bytes!("../assets/watermarks/1440p.png")),
+    ("1080p", include_bytes!("../assets/watermarks/1080p.png")),
+    ("720p", include_bytes!("../assets/watermarks/720p.png")),
+    ("480p", include_bytes!("../assets/watermarks/480p.png")),
+    ("hd", include_bytes!("../assets/watermarks/hd.png")),
+    ("sd", include_bytes!("../assets/watermarks/sd.png")),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,12 +121,36 @@ pub struct Phase {
 
 /// 清晰度从高到低,与 `code::detect_definition` 的取值一致。
 const DEFINITIONS: &[&str] = &["8K", "4K", "1440p", "1080p", "720p", "480p", "HD", "SD"];
+const VERSION_PREFIX: &str = "版本：";
 
 fn definition_rank(d: &str) -> usize {
     DEFINITIONS.iter().position(|x| *x == d).unwrap_or(DEFINITIONS.len())
 }
 
 impl Phase {
+    pub(crate) fn nfo_labels(&self) -> Vec<String> {
+        [
+            self.subtitle.then_some("中文字幕"),
+            self.uncensored.then_some("无码"),
+            self.cracked.then_some("破解"),
+            self.leaked.then_some("流出"),
+            self.definition.as_deref().filter(|d| DEFINITIONS.contains(d)),
+        ].into_iter().flatten().map(|label| format!("{VERSION_PREFIX}{label}")).collect()
+    }
+
+    pub(crate) fn from_nfo_label(label: &str) -> Option<Self> {
+        let mut phase = Self::default();
+        match label.strip_prefix(VERSION_PREFIX)? {
+            "中文字幕" => phase.subtitle = true,
+            "无码" => phase.uncensored = true,
+            "破解" => phase.cracked = true,
+            "流出" => phase.leaked = true,
+            d if DEFINITIONS.contains(&d) => phase.definition = Some(d.into()),
+            _ => return None,
+        }
+        Some(phase)
+    }
+
     pub fn of(code: &Code) -> Self {
         Self {
             subtitle: code.subtitled,
@@ -318,7 +348,9 @@ mod tests {
         for (s, _) in BUILTIN {
             assert!(load_stamp(s, None).is_some(), "{s}");
         }
-        assert!(load_stamp("1080p", None).is_none());
+        for definition in DEFINITIONS {
+            assert!(load_stamp(&definition.to_lowercase(), None).is_some(), "{definition}");
+        }
         for bad in ["", "../subtitle", "subtitle.png", "SUBTITLE", "4K"] {
             assert!(!is_stem(bad));
         }
@@ -327,7 +359,7 @@ mod tests {
         RgbaImage::from_pixel(8, 8, Rgba([0, 0, 255, 255])).save(d.path().join("1080p.png")).unwrap();
         std::fs::write(d.path().join("cracked.png"), b"garbage").unwrap();
         assert_eq!(load_stamp("subtitle", Some(d.path())).unwrap().get_pixel(0, 0).0, [0, 255, 0, 255], "用户文件优先");
-        assert!(load_stamp("1080p", Some(d.path())).is_some(), "用户可补内置没有的清晰度");
+        assert_eq!(load_stamp("1080p", Some(d.path())).unwrap().get_pixel(0, 0).0, [0, 0, 255, 255]);
         assert!(load_stamp("cracked", Some(d.path())).unwrap().width() > 8, "损坏回退内置");
     }
 

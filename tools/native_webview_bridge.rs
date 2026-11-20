@@ -11,6 +11,9 @@ mod network;
 #[path = "native_rebuild_bridge.rs"]
 mod rebuild;
 
+#[path = "native_resume_bridge.rs"]
+mod resume;
+
 struct Probe {
     root: PathBuf,
     config_path: PathBuf,
@@ -203,7 +206,7 @@ async fn bridge_verify(probe: State<'_, Arc<Probe>>, journals: usize, exported: 
 #[tauri::command]
 async fn bridge_finish(app: AppHandle, probe: State<'_, Arc<Probe>>, passed: Vec<String>, error: Option<String>) -> Result<(), String> {
     let probe = probe.inner().clone();
-    let mut ok = error.is_none() && passed.len() == 11 && !app.state::<AppState>().job_running();
+    let mut ok = error.is_none() && passed.len() == 13 && !app.state::<AppState>().job_running();
     if let Some(error) = error { eprintln!("BRIDGE FAILED: {error}"); }
     // Failure cleanup releases only our gates/current synthetic or fixture task.
     if let Some(gate) = probe.announce.lock().unwrap().take() { gate.cancel(); }
@@ -240,7 +243,7 @@ impl Assets<tauri::Wry> for StaticAssets {
         Box::new(std::iter::empty())
     }
 }
-fn load_assets(root: &Path, dir: &Path, files: &mut BTreeMap<String,Vec<u8>>) {
+fn load_assets(root: &std::path::Path, dir: &std::path::Path, files: &mut BTreeMap<String,Vec<u8>>) {
     for entry in fs::read_dir(dir).unwrap() {
         let entry = entry.unwrap();
         let path = entry.path();
@@ -251,7 +254,7 @@ fn load_assets(root: &Path, dir: &Path, files: &mut BTreeMap<String,Vec<u8>>) {
 }
 
 fn control_handler() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync + 'static {
-    tauri::generate_handler![bridge_task,bridge_release,bridge_foreign,bridge_snapshot,
+    tauri::generate_handler![resume::bridge_resume_prepare,resume::bridge_resume_verify,bridge_task,bridge_release,bridge_foreign,bridge_snapshot,
         bridge_lock_writer,bridge_unlock_writer,bridge_verify,bridge_finish,
         bridge_network_prepare,bridge_network_snapshot,bridge_network_release,bridge_network_hold,bridge_import_verify,
         rebuild::bridge_rebuild_prepare,rebuild::bridge_rebuild_release,rebuild::bridge_rebuild_verify,rebuild::bridge_rebuild_restore]

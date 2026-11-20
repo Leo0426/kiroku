@@ -6,6 +6,7 @@
   import {cancellableJob,type CancellableJob} from '../lib/cancellable-job'
   import { repairFlow } from '../lib/repairflow.svelte'
   import { api } from '../lib/api'
+  import { posterImage } from '../lib/poster-image.svelte'
   import { baseName, fmtBytes } from '../lib/format'
   import { dur, slideIn } from '../lib/motion'
   import { app } from '../lib/state.svelte'
@@ -16,13 +17,15 @@
   import FieldSources from './FieldSources.svelte'
   import MetadataEditor from './MetadataEditor.svelte'
   import ArtworkEditor from './ArtworkEditor.svelte'
+  import SupplementFiles from './SupplementFiles.svelte'
+  import PackageExport from './PackageExport.svelte'
   import AppendFiles from './AppendFiles.svelte'
   import MetadataUpdater from './MetadataUpdater.svelte'
   import MovieTranslation from './MovieTranslation.svelte'
   import LanguageExport from './LanguageExport.svelte'
   import LoadingStatus from './LoadingStatus.svelte'
 
-  let { code, onclose, navigation }: { code: string; onclose: () => void; navigation?: { position: number; total: number; busy: boolean; stale: boolean; move: (step: number) => void } } = $props()
+  let { code, onclose, navigation, retryEpoch = 0 }: { code: string; retryEpoch?: number; onclose: () => void; navigation?: { position: number; total: number; busy: boolean; stale: boolean; move: (step: number) => void } } = $props()
 
   /** 海报裁剪弹窗;换影片时收起 */
   let cropping = $state(false)
@@ -64,9 +67,11 @@
     observer.observe(container)
     return () => observer.disconnect()
   })
-  const panelWidth = $derived(narrow ? viewportWidth : Math.min(maxWidth, Math.max(360, preferredWidth)))
+  const panelWidth = $derived(narrow ? viewportWidth : Math.min(maxWidth, preferredWidth))
   let drag = $state<{ id: number; x: number; width: number } | null>(null)
-  function rememberWidth() { try { localStorage.setItem(WIDTH_KEY, String(preferredWidth)) } catch { /* Storage may be unavailable. */ } }
+  function rememberWidth() {
+    try { localStorage.setItem(WIDTH_KEY, String(preferredWidth)) } catch { /* Storage may be unavailable. */ }
+  }
   function resizeStart(e: PointerEvent) {
     if (e.button !== 0) return
     e.preventDefault()
@@ -82,7 +87,10 @@
     if (!drag || drag.id !== e.pointerId) return
     drag = null; rememberWidth()
   }
-  function resetWidth() { preferredWidth = 540; rememberWidth() }
+  function resetWidth() {
+    preferredWidth = 540
+    rememberWidth()
+  }
   function resizeKey(e: KeyboardEvent) {
     if (!['ArrowLeft','ArrowRight','Home','End'].includes(e.key)) return
     e.preventDefault(); e.stopPropagation()
@@ -125,9 +133,21 @@
   $effect(() => {
     panel?.focus()
   })
+  $effect(() => {
+    code
+    panel?.scrollTo({ top: 0 })
+  })
 
-  const poster = $derived(detail ? api.posterUrl(detail.poster, detail.posterVersion) : null)
-  const fanart = $derived(detail ? api.posterUrl(detail.fanart ?? detail.poster, detail.fanart ? detail.fanartVersion : detail.posterVersion) : null)
+  const poster = posterImage(() => detail, () => app.settings?.library_root)
+  const fanart = $derived(detail?.fanart && detail.fanart !== detail.poster ? api.posterUrl(detail.fanart, detail.fanartVersion) : null)
+  let failedFanart = $state<string | null>(null)
+  $effect.pre(() => { fanart; code; app.settings?.library_root; retryEpoch; failedFanart = null })
+  let seenRetry = untrack(() => retryEpoch)
+  $effect(() => {
+    if (retryEpoch === seenRetry) return
+    seenRetry = retryEpoch
+    untrack(() => poster.retry())
+  })
   const meta = $derived(detail?.meta)
 
   let mediaBusy=$state(false),mediaDone=$state(0),mediaTotal=$state(0)
@@ -179,9 +199,14 @@
     onclose()
   }
 
+  const browsingBlocked = $derived(!navigation || navigation.stale || navigation.busy || cropping || mediaBusy || toolActive || favoriteBusy)
   function onkey(e: KeyboardEvent) {
-    // 裁剪弹窗开着时 Esc 只关弹窗
-    if (e.key === 'Escape' && !cropping) closeDetails()
+    if (e.isComposing || e.defaultPrevented || cropping || document.querySelector('dialog[open]')) return
+    if (e.key === 'Escape') { closeDetails(); return }
+    if (browsingBlocked || !navigation || !panel?.contains(document.activeElement) || e.altKey || e.metaKey || e.ctrlKey || e.shiftKey) return
+    if ((e.target as HTMLElement)?.closest('input, textarea, select, [contenteditable="true"]')) return
+    if (e.key === 'ArrowLeft' && navigation.position > 0) { e.preventDefault(); navigation.move(-1) }
+    if (e.key === 'ArrowRight' && navigation.position < navigation.total - 1) { e.preventDefault(); navigation.move(1) }
   }
 </script>
 
@@ -198,9 +223,21 @@
   <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
   <div class="resize-handle" class:dragging={!!drag} role="separator" tabindex="0" aria-label="调整详情宽度" aria-controls="movie-detail-panel" aria-orientation="vertical" aria-valuemin={360} aria-valuemax={maxWidth} aria-valuenow={Math.round(panelWidth)} title="拖动调整宽度，双击恢复默认；方向键微调" style:right={`${panelWidth - 6}px`} onpointerdown={resizeStart} onpointermove={resizeMove} onpointerup={resizeEnd} onpointercancel={resizeEnd} onlostpointercapture={resizeEnd} onkeydown={resizeKey} ondblclick={resetWidth}></div>
 {/if}
-<aside id="movie-detail-panel" class="panel" style:width={`${panelWidth}px`} class:armed bind:this={panel} tabindex="-1" aria-label="影片详情" aria-busy={loading} transition:slideIn onintroend={() => (armed = true)}>
-  {#if navigation}<div class="sequence" aria-label="连续浏览" title={navigation.stale ? '列表已更新，请返回列表重新选择影片' : toolActive ? '请先结束当前编辑或工具操作' : '按当前筛选顺序浏览'}><button class="btn sm" aria-label="上一部影片" disabled={navigation.stale || navigation.busy || navigation.position <= 0 || cropping || mediaBusy || toolActive || favoriteBusy} onclick={() => navigation?.move(-1)}>← 上一部</button><span aria-live="polite">{#if navigation.stale}列表已更新，请重新选择{:else}{navigation.position + 1} / {navigation.total}{/if}</span><button class="btn sm" aria-label="下一部影片" disabled={navigation.stale || navigation.busy || navigation.position >= navigation.total - 1 || cropping || mediaBusy || toolActive || favoriteBusy} onclick={() => navigation?.move(1)}>下一部 →</button></div>{/if}
-  <button class="close btn icon ghost" aria-label="关闭详情" onclick={closeDetails}><Icon name="x" size={18} /></button>
+<div id="movie-detail-panel" class="panel" style:--detail-width={`${panelWidth}px`} class:armed bind:this={panel} tabindex="-1" role="complementary" aria-label="影片详情" aria-busy={loading} transition:slideIn onintroend={() => (armed = true)}>
+  <div class="detail-header">
+    {#if navigation}
+      <div class="sequence" aria-label="连续浏览" title={toolActive ? '收起编辑或工具后可切换影片' : '按当前筛选顺序浏览'}>
+        <button class="btn sm" aria-label="上一部影片" aria-keyshortcuts="ArrowLeft" title="上一部影片（←）" disabled={browsingBlocked || navigation.position <= 0} onclick={() => navigation?.move(-1)}>← 上一部</button>
+        {#if navigation.stale}
+          <button class="back-to-list" onclick={closeDetails} aria-label="返回列表重新选择影片">列表已更新，请重新选择</button>
+        {:else}
+          <span class="tnum" aria-live="polite">{navigation.position + 1} / {navigation.total}</span>
+        {/if}
+        <button class="btn sm" aria-label="下一部影片" aria-keyshortcuts="ArrowRight" title="下一部影片（→）" disabled={browsingBlocked || navigation.position >= navigation.total - 1} onclick={() => navigation?.move(1)}>下一部 →</button>
+      </div>
+    {/if}
+    <button class="close btn icon ghost" aria-label="关闭详情" aria-keyshortcuts="Escape" title="关闭详情（Esc）" onclick={closeDetails}><Icon name="x" size={18} /></button>
+  </div>
 
   {#if loading}
     <div class="skeleton"><div class="hero-sk" aria-hidden="true"></div><div class="body"><LoadingStatus label="正在读取影片详情…" /><div aria-hidden="true"><div class="l w60"></div><div class="l"></div><div class="l w80"></div></div></div></div>
@@ -210,47 +247,53 @@
     <div class="gone"><p class="muted">这部影片已不在媒体库中。</p></div>
   {:else}
     <div class="hero">
-      <div class="hero-img" style:background-image={fanart ? `url("${fanart}")` : 'none'}></div>
+      {#if fanart && failedFanart !== fanart}
+        {#key fanart}<img class="hero-img" src={fanart} alt="" onerror={e => failedFanart = e.currentTarget.getAttribute('src')} />{/key}
+      {:else if poster.loaded && poster.src}
+        <img class="hero-img" src={poster.src} alt="" />
+      {/if}
       <div class="hero-fade"></div>
     </div>
 
     <div class="content stagger">
-      <div class="top">
-        <button class="poster" title="重新裁剪海报" aria-label="重新裁剪海报" onclick={() => (cropping = true)}>{#if poster}<img src={poster} alt="" />{/if}<span class="crop-hint" aria-hidden="true"><Icon name="pencil" size={14} />裁剪</span></button>
-        <div class="head">
-          <span class="code mono">{detail.code}</span>
-          <h2>{meta.title ?? detail.code}</h2>
-          {#if meta.original_title && meta.original_title !== meta.title}<p class="orig">{meta.original_title}</p>{/if}
-          <div class="facts">
-            {#if detail.year}<span>{meta.release_date ?? detail.year}</span>{/if}
-            {#if meta.runtime_min}<span>{meta.runtime_min} 分钟</span>{/if}
-            {#if detail.contentType}<span>{CONTENT_TYPE_LABEL[detail.contentType] ?? detail.contentType}</span>{/if}
-            {#if meta.scores.length}
-              <span class="score tnum"><Icon name="star" size={11} />{(meta.scores.reduce((a, s) => a + s.score, 0) / meta.scores.length / 10).toFixed(1)}</span>
-            {/if}
+      <div class="film-summary">
+        <div class="top">
+          <button class="poster" title="重新裁剪海报" aria-label="重新裁剪海报" onclick={() => (cropping = true)}>{#if poster.src}{#key poster.src}<img src={poster.src} alt="" onload={poster.displayed} onerror={poster.unavailable} />{/key}{/if}{#if poster.cached}<span class="cached-label" title="原图位置暂时无法读取">缓存海报</span>{/if}<span class="crop-hint" aria-hidden="true"><Icon name="pencil" size={14} />裁剪</span></button>
+          <div class="head">
+            <span class="code mono">{detail.code}</span>
+            <h2>{meta.title ?? detail.code}</h2>
+            {#if meta.original_title && meta.original_title !== meta.title}<p class="orig">{meta.original_title}</p>{/if}
+            <div class="facts">
+              {#if detail.year}<span>{meta.release_date ?? detail.year}</span>{/if}
+              {#if meta.runtime_min}<span>{meta.runtime_min} 分钟</span>{/if}
+              {#if detail.contentType}<span>{CONTENT_TYPE_LABEL[detail.contentType] ?? detail.contentType}</span>{/if}
+              {#if meta.scores.length}
+                <span class="score tnum"><Icon name="star" size={11} />{(meta.scores.reduce((a, s) => a + s.score, 0) / meta.scores.length / 10).toFixed(1)}</span>
+              {/if}
+            </div>
           </div>
         </div>
-      </div>
 
-      <div class="cta">
-        <button class="btn primary" onclick={() => act('play', detail!.files.length > 1 ? 1 : undefined)} disabled={!detail.files.length||mediaBusy}><Icon name="play" size={14} />播放</button>
-        <button class="btn" disabled={mediaBusy} onclick={() => act('reveal')}><Icon name="folder" size={15} />在文件夹中显示</button>
-        <button class="btn" onclick={repair} disabled={repairFlow.running}>{repairRunning ? '正在补图…' : '补缺图'}</button>
-        <button class="btn" class:on={detail.favorite} aria-pressed={detail.favorite} disabled={favoriteBusy} onclick={toggleFavorite}><Icon name="star" size={14} />{detail.favorite ? '取消收藏' : '收藏'}</button>
-        {#if repairRunning}<button class="btn" onclick={() => repairFlow.cancel()}>停止补图</button>{/if}
-      </div>
-      {#key `${app.settings?.library_root}|${meta.code}`}<MovieTranslation {meta} onsaved={() => attempt++} />{/key}
-      {#if mediaBusy}<div role="status" aria-label="媒体校验进度"><p>正在校验媒体来源…{mediaTotal?` ${Math.min(100,Math.round(mediaDone/mediaTotal*100))}%`:''}</p><button class="btn" onclick={()=>mediaTask?.cancel()}>取消媒体校验</button></div>{/if}
-      {#if repairError||undoError}<p role="alert">补图失败：{repairError||undoError}</p>{/if}
-      {#if repairResult}
-        <div role="status" aria-label="补图结果">
-          <p>{repairResult.cancelled ? '补图已停止' : repairResult.failed.length ? '补图失败' : '补图完成'}：写入 {repairResult.written} 张图片。</p>
-          {#each repairResult.failed as failure}<p>{failure[0]}：{failure[1]}</p>{/each}
-          {#each repairResult.warnings as warning}<p class="muted">{warning}</p>{/each}
-          {#if repairResult.indexError}<p>图片已落盘，索引更新失败：{repairResult.indexError}</p>{/if}
-          {#if repairResult.journalId && repairResult.written}<button class="btn" onclick={undoRepair}>撤销本次补图</button>{/if}
+        <div class="cta">
+          <button class="btn primary" onclick={() => act('play', detail!.files.length > 1 ? 1 : undefined)} disabled={!detail.files.length||mediaBusy}><Icon name="play" size={14} />播放</button>
+          <button class="btn" disabled={mediaBusy} onclick={() => act('reveal')}><Icon name="folder" size={15} />在文件夹中显示</button>
+          <button class="btn" onclick={repair} disabled={repairFlow.running}>{repairRunning ? '正在补图…' : '补缺图'}</button>
+          <button class="btn" class:on={detail.favorite} aria-pressed={detail.favorite} disabled={favoriteBusy} onclick={toggleFavorite}><Icon name="star" size={14} />{detail.favorite ? '取消收藏' : '收藏'}</button>
+          {#if repairRunning}<button class="btn" onclick={() => repairFlow.cancel()}>停止补图</button>{/if}
         </div>
-      {/if}
+        {#key `${app.settings?.library_root}|${meta.code}`}<MovieTranslation {meta} onsaved={() => attempt++} />{/key}
+        {#if mediaBusy}<div role="status" aria-label="媒体校验进度"><p>正在校验媒体来源…{mediaTotal?` ${Math.min(100,Math.round(mediaDone/mediaTotal*100))}%`:''}</p><button class="btn" onclick={()=>mediaTask?.cancel()}>取消媒体校验</button></div>{/if}
+        {#if repairError||undoError}<p role="alert">补图失败：{repairError||undoError}</p>{/if}
+        {#if repairResult}
+          <div role="status" aria-label="补图结果">
+            <p>{repairResult.cancelled ? '补图已停止' : repairResult.failed.length ? '补图失败' : '补图完成'}：写入 {repairResult.written} 张图片。</p>
+            {#each repairResult.failed as failure}<p>{failure[0]}：{failure[1]}</p>{/each}
+            {#each repairResult.warnings as warning}<p class="muted">{warning}</p>{/each}
+            {#if repairResult.indexError}<p>图片已落盘，索引更新失败：{repairResult.indexError}</p>{/if}
+            {#if repairResult.journalId && repairResult.written}<button class="btn" onclick={undoRepair}>撤销本次补图</button>{/if}
+          </div>
+        {/if}
+      </div>
 
       <div class="toolbox" role="region" aria-label="影片工具">
         <h3>影片工具</h3>
@@ -262,84 +305,92 @@
             <AppendFiles onactive={active => activeTools.AppendFiles = active} {code} onsaved={() => attempt++} />
             <ActorHosting onactive={active => activeTools.ActorHosting = active} {meta} onsaved={() => attempt++} />
             <LanguageExport onactive={active => activeTools.LanguageExport = active} {meta} onsaved={() => attempt++} />
+            <SupplementFiles {code} onactive={active => activeTools.SupplementFiles = active} onsaved={() => attempt++} />
+            <PackageExport {code} onactive={active => activeTools.PackageExport = active} />
           {/key}
         </div>
       </div>
 
-      {#if meta.plot}
-        <section><h3>简介</h3><p class="plot">{meta.plot}</p></section>
-      {/if}
+      <div class="film-details">
+        {#if meta.plot}
+          <section><h3>简介</h3><p class="plot">{meta.plot}</p></section>
+        {/if}
 
-      {#if meta.actors.length}
+        {#if meta.actors.length}
+          <section>
+            <h3>演员</h3>
+            <div class="chips">{#each meta.actors as a, i}<span class="chip" style:--n={Math.min(i, 12)} class:male={a.gender === 'male'}>{#if a.thumb || detail.localActorNames?.includes(a.name)}<ActorAvatar {code} url={a.thumb} localName={detail.localActorNames?.includes(a.name) ? a.name : undefined} cachedFile={a.thumb ? meta.hosted_actor_images?.[a.thumb]?.file : undefined} libraryRoot={app.settings?.library_root} />{/if}{a.name}</span>{/each}</div>
+          </section>
+        {/if}
+
+        {#if meta.tags.length}
+          <section>
+            <h3>类别</h3>
+            <div class="chips">{#each meta.tags as t, i}<span class="chip subtle" style:--n={Math.min(i, 12)}>{t}</span>{/each}</div>
+          </section>
+        {/if}
+
         <section>
-          <h3>演员</h3>
-          <div class="chips">{#each meta.actors as a, i}<span class="chip" style:--n={Math.min(i, 12)} class:male={a.gender === 'male'}>{#if a.thumb}<ActorAvatar {code} url={a.thumb} libraryRoot={app.settings?.library_root} />{/if}{a.name}</span>{/each}</div>
+          <h3>信息</h3>
+          <dl>
+            {#if meta.studio}<dt>片商</dt><dd>{meta.studio}</dd>{/if}
+            {#if meta.publisher && meta.publisher !== meta.studio}<dt>发行商</dt><dd>{meta.publisher}</dd>{/if}
+            {#if meta.series}<dt>系列</dt><dd>{meta.series}</dd>{/if}
+            {#if meta.directors.length}<dt>导演</dt><dd>{meta.directors.join('、')}</dd>{/if}
+            {#each meta.scores as s (s.site)}<dt>{SOURCE_NAMES[s.site] ?? s.site} 评分</dt><dd class="tnum">{(s.score / 10).toFixed(1)} / 10</dd>{/each}
+          </dl>
         </section>
-      {/if}
 
-      {#if meta.tags.length}
         <section>
-          <h3>类别</h3>
-          <div class="chips">{#each meta.tags as t, i}<span class="chip subtle" style:--n={Math.min(i, 12)}>{t}</span>{/each}</div>
+          <h3>文件</h3>
+          <ul class="files">
+            {#each detail.files as f (f.path)}
+              <li>
+                <span class="fname" title={f.path}>{baseName(f.path)}</span>
+                <span class="faint tnum">{fmtBytes(f.size)}</span>
+                {#if detail.files.length > 1}<button class="btn sm ghost" onclick={() => act('play', f.part ?? undefined)}><Icon name="play" size={11} />播放</button>{/if}
+              </li>
+            {/each}
+          </ul>
+          <p class="faint dir mono" title={detail.dir}>{detail.dir}</p>
         </section>
-      {/if}
-
-      <section>
-        <h3>信息</h3>
-        <dl>
-          {#if meta.studio}<dt>片商</dt><dd>{meta.studio}</dd>{/if}
-          {#if meta.publisher && meta.publisher !== meta.studio}<dt>发行商</dt><dd>{meta.publisher}</dd>{/if}
-          {#if meta.series}<dt>系列</dt><dd>{meta.series}</dd>{/if}
-          {#if meta.directors.length}<dt>导演</dt><dd>{meta.directors.join('、')}</dd>{/if}
-          {#each meta.scores as s (s.site)}<dt>{SOURCE_NAMES[s.site] ?? s.site} 评分</dt><dd class="tnum">{(s.score / 10).toFixed(1)} / 10</dd>{/each}
-        </dl>
-      </section>
-
-      <section>
-        <h3>文件</h3>
-        <ul class="files">
-          {#each detail.files as f (f.path)}
-            <li>
-              <span class="fname" title={f.path}>{baseName(f.path)}</span>
-              <span class="faint tnum">{fmtBytes(f.size)}</span>
-              {#if detail.files.length > 1}<button class="btn sm ghost" onclick={() => act('play', f.part ?? undefined)}><Icon name="play" size={11} />播放</button>{/if}
-            </li>
-          {/each}
-        </ul>
-        <p class="faint dir mono" title={detail.dir}>{detail.dir}</p>
-      </section>
-      <FieldSources {meta} />
+        <FieldSources {meta} />
+      </div>
     </div>
   {/if}
-</aside>
+</div>
 
 <style>
   .scrim { position: fixed; inset: 0; z-index: 40; background: var(--scrim); backdrop-filter: blur(3px); }
   /* 滑入完成前按钮不接收点击(见 armed) */
   .panel:not(.armed) :global(button) { pointer-events: none; }
   .panel {
-    position: fixed; z-index: 41; top: 0; right: 0; bottom: 0; max-width: 100%; container-type: inline-size;
+    position: fixed; z-index: 41; top: 0; right: 0; bottom: 0; width: var(--detail-width); max-width: 100%; container: detail-panel / inline-size;
     background: var(--surface-1); box-shadow: var(--shadow-3);
-    overflow-y: auto; outline: none;
+    overflow-y: auto; scrollbar-gutter: stable; outline: none;
   }
   .resize-handle { position:fixed; z-index:42; top:0; bottom:0; width:12px; cursor:ew-resize; touch-action:none; user-select:none; outline:none; }
   .resize-handle::after { content:''; position:absolute; top:0; bottom:0; left:5px; width:2px; background:transparent; transition:background var(--d-fast); }
   .resize-handle:hover::after, .resize-handle:focus-visible::after, .resize-handle.dragging::after { background:var(--accent); }
-  .close:hover :global(svg) { transform: rotate(90deg); }
-  .close { position: absolute; z-index: 3; top: var(--s3); right: var(--s3); background: rgb(12 12 16 / 0.5); backdrop-filter: blur(10px); color: #fff; }
-  .sequence { position:relative; z-index:3; display:flex; flex-wrap:wrap; align-items:center; gap:8px; padding:12px 56px 12px 16px; background:var(--surface-1); font-size:var(--fs-xs); }
+  .detail-header { position: sticky; top: 0; z-index: 4; display: flex; align-items: center; gap: var(--s2); padding: var(--s2) var(--s3); border-bottom: 1px solid var(--line); background: var(--surface-1); }
+  .close { flex-shrink: 0; margin-inline-start: auto; }
+  .sequence { display: flex; flex-wrap: wrap; align-items: center; gap: var(--s2); color: var(--text-2); font-size: var(--fs-xs); }
+  .back-to-list { padding: var(--s1); border: 0; background: none; color: var(--accent); font: inherit; cursor: pointer; text-decoration: underline; text-underline-offset: 2px; }
+  .sequence > .btn { min-inline-size: 76px; }
   /* 背景图慢慢推近落定(Ken Burns),溢出部分由 .hero 裁掉 */
   .hero { height: 220px; position: relative; overflow: hidden; filter: saturate(1.1); }
-  .hero-img { position: absolute; inset: 0; background-size: cover; background-position: center 30%; animation: heroIn 1400ms var(--ease-out) both; }
+  .hero-img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; object-position: center 30%; animation: heroIn 1400ms var(--ease-out) both; }
   @keyframes heroIn { from { opacity: 0; transform: scale(1.14); } }
   .hero::after { content: ''; position: absolute; inset: 0; backdrop-filter: blur(22px) brightness(0.7); }
   .hero-fade { position: absolute; inset: 0; z-index: 1; background: linear-gradient(to bottom, transparent 30%, var(--surface-1)); }
   .content { position: relative; z-index: 2; margin-top: -92px; padding: 0 clamp(20px, 4cqi, 32px) var(--s7); display: flex; flex-direction: column; gap: 24px; }
+  .film-summary, .film-details { display: flex; flex-direction: column; gap: 24px; min-width: 0; }
   .top { display: flex; gap: var(--s4); align-items: flex-end; }
   .poster { flex-shrink: 0; width: 132px; aspect-ratio: var(--poster-ratio); border-radius: var(--r-md); overflow: hidden; background: var(--surface-3); box-shadow: var(--shadow-3); transition: transform var(--d-slow) var(--ease-back); }
   .poster:hover { transform: translateY(-4px) rotate(-1.5deg) scale(1.03); }
   .poster { animation: posterIn 620ms 80ms var(--ease-back) both; }
   @keyframes posterIn { from { opacity: 0; transform: translateY(18px) rotate(-4deg) scale(0.9); } }
+  .cached-label { position: absolute; left: 6px; top: 6px; background: rgb(12 12 16 / .72); color: white; padding: 2px 6px; border-radius: var(--r-pill); font-size: var(--fs-xs); }
   .poster img { width: 100%; height: 100%; object-fit: cover; display: block; }
   .poster { position: relative; padding: 0; border: 0; cursor: pointer; }
   .crop-hint { position: absolute; left: 50%; bottom: var(--s2); transform: translateX(-50%); display: inline-flex; align-items: center; gap: 4px; padding: 3px 9px; border-radius: var(--r-pill); font-size: var(--fs-xs); color: #fff; background: rgb(12 12 16 / 0.62); backdrop-filter: blur(8px); opacity: 0; transition: opacity var(--d-base) var(--ease-out); }
@@ -351,26 +402,45 @@
   .facts { display: flex; flex-wrap: wrap; gap: var(--s1) var(--s3); margin-top: var(--s2); color: var(--text-2); font-size: var(--fs-sm); }
   .facts span + span::before { content: '·'; margin-right: var(--s3); color: var(--text-3); }
   .score { color: var(--accent); display: inline-flex; align-items: center; gap: 3px; }
-  .toolbox { padding: 16px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
-  .tool-grid { display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: flex-start; }
+  .toolbox { container: detail-tools / inline-size; padding: 16px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+  .tool-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--s1) var(--s2); }
+  @container detail-tools (min-width: 480px) { .tool-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
   .tool-grid > :global(section) { display: contents; }
-  .tool-grid :global(.tool-content) { order: 1; flex: 1 0 100%; min-width: 0; padding: 16px; margin-top: 8px; border-radius: var(--r-sm); background: var(--surface-2); }
-  .tool-grid > :global(section > button:first-child) { min-height: 36px; margin: 0; padding: 6px 8px; gap: 7px; background: transparent; box-shadow: none; color: var(--text-2); font-size: var(--fs-sm); font-weight: 500; text-align: left; justify-content: flex-start; }
+  .tool-grid :global(.tool-content) {
+    order: 1; grid-column: 1 / -1; min-width: 0; container: tool-form / inline-size;
+    padding: clamp(12px, 3cqi, 24px); margin-top: var(--s2);
+    border: 1px solid var(--line); border-radius: var(--r-md); background: var(--surface-2);
+  }
+  .tool-grid > :global(section > button:first-child) {
+    width: 100%; min-width: 0; min-height: max(44px, calc(2.4em + 12px)); height: auto; margin: 0; padding: 6px 8px; gap: 6px;
+    background: transparent; box-shadow: none; color: var(--text-2);
+    font-size: var(--fs-sm); font-weight: 500; line-height: 1.2; text-align: left; justify-content: flex-start;
+  }
   .tool-grid > :global(section > button:first-child:hover) { color: var(--accent); background: var(--accent-soft); transform: none; }
-  .tool-grid > :global(section > button:first-child[aria-expanded=true]) { color: var(--accent); }
-  .tool-grid > :global(section > button:first-child > .i-chevron-down) { opacity: .75; transition: transform var(--d-fast); }
+  .tool-grid > :global(section > button:first-child[aria-expanded=true]) { color: var(--accent); background: var(--accent-soft); }
+  .tool-grid > :global(section > button:first-child > .i-chevron-down) { margin-inline-start: auto; opacity: .75; transition: transform var(--d-fast); }
   .tool-grid > :global(section > button:first-child[aria-expanded=true] > .i-chevron-down) { transform: rotate(180deg); }
   .tool-grid > :global(section > button:first-child > svg) { flex-shrink: 0; }
   .tool-grid :global(input:not([type=checkbox])), .tool-grid :global(textarea), .tool-grid :global(select) { max-width: 100%; min-width: 0; }
   .tool-grid :global(p), .tool-grid :global(ins), .tool-grid :global(del) { overflow-wrap: anywhere; }
   .tool-grid :global(button) { max-width: 100%; white-space: normal; }
   .cta { display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:12px; }
-  .cta > .btn { min-width:0; min-height:44px; padding:10px 12px; white-space:normal; }
+  .cta > .btn { min-width:0; min-height:44px; height:auto; padding:10px 12px; white-space:normal; }
   .toolbox > h3 { margin-bottom:8px; }
   .tool-grid :global(.tool-content > p) { margin:12px 0; line-height:1.6; }
-  .tool-grid :global(.tool-content .btn) { min-height:40px; margin:6px 8px 6px 0; }
-  .tool-grid :global(.tool-content > .btn.ghost:last-of-type) { margin-top:16px; }
-  @container (min-width: 700px) { .cta { grid-template-columns:repeat(4, minmax(0, 1fr)); } }
+  .tool-grid :global(.tool-fields) { display:grid; grid-template-columns:minmax(0, 1fr); gap:var(--s3); }
+  .tool-grid :global(.tool-fields > .wide) { grid-column:1 / -1; }
+  @container tool-form (min-width: 420px) {
+    .tool-grid :global(.tool-fields) { grid-template-columns:repeat(2, minmax(0, 1fr)); }
+  }
+  .tool-grid :global(.tool-field) { display:grid; align-content:start; gap:var(--s1); min-width:0; }
+  .tool-grid :global(.tool-field > .input) { width:100%; background:var(--surface-1); border:1px solid var(--line); }
+  .tool-grid :global(.tool-field > textarea.input) { height:auto; min-height:34px; padding-block:6px; resize:vertical; }
+  .tool-grid :global(.tool-content .btn) { min-height:40px; height:auto; }
+  .tool-grid :global(.tool-actions) { display:flex; flex-wrap:wrap; justify-content:flex-end; gap:var(--s2); margin-block-start:var(--s3); }
+  .tool-grid :global(.tool-actions.start) { justify-content:flex-start; }
+  .tool-grid :global(.tool-actions > .btn) { flex:0 1 112px; height:auto; min-width:0; margin:0; padding:var(--s2); line-height:1.25; }
+  @container detail-panel (min-width: 700px) { .cta { grid-template-columns:repeat(4, minmax(0, 1fr)); } }
   /* 收藏:星标转一圈弹出 */
   .cta .on { color: var(--warn); }
   .cta .on :global(svg) { animation: starPop 560ms var(--ease-back); }
@@ -398,12 +468,11 @@
   .l { height: 14px; border-radius: 7px; background: var(--surface-3); animation: pulse 1.4s ease-in-out infinite; }
   .w60 { width: 60%; } .w80 { width: 80%; }
   .gone { padding: var(--s7) var(--s5); text-align: center; }
-  @container (max-width: 430px) {
+  @container detail-panel (max-width: 430px) {
     .top { flex-direction:column; align-items:flex-start; }
     .poster { width:112px; }
-    .tool-grid :global(.tool-content) { padding:12px; }
-    .tool-grid { gap:4px; }
-    .tool-grid :global(.actor-row) { flex-wrap:wrap; }
   }
-  @media (max-width: 720px) { .panel { bottom: calc(64px + env(safe-area-inset-bottom)); } }
+  @media (max-width: 720px) {
+    .panel { bottom: calc(64px + env(safe-area-inset-bottom)); }
+  }
 </style>

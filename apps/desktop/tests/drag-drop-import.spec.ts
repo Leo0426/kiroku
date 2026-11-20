@@ -10,7 +10,28 @@ async function drag(page: Page, type: 'enter' | 'over' | 'leave' | 'drop', paths
   }, [type, paths] as const)
 }
 
-const sourceList = (page: Page) => page.getByRole('region', { name: '待整理的文件夹' })
+const sourceList = (page: Page) => page.getByRole('region', { name: '待整理来源' })
+
+test('picking videos scans just the selected files and keeps a cancelled selection intact', async ({ page }) => {
+  await page.goto('/')
+  await page.getByRole('button', { name: '导入整理', exact: true }).click()
+  const choose = page.getByRole('button', { name: '添加视频文件', exact: true })
+  await expect(choose).toBeVisible()
+  page.once('dialog', dialog => dialog.accept('/mock/dl/SMPL-421.mp4 | /mock/dl/MOVX-679-C.mp4 | /mock/dl/SMPL-421.mp4'))
+  await choose.focus()
+  await page.keyboard.press('Enter')
+  await expect(sourceList(page).getByRole('button', { name: /^移除 / })).toHaveCount(2)
+  page.once('dialog', dialog => dialog.dismiss())
+  await choose.click()
+  await page.getByRole('button', { name: '开始扫描', exact: true }).click()
+  await expect(page.getByRole('button', { name: /查找影片信息（2 部）/ })).toBeEnabled()
+  await page.getByText('查看已识别文件 · 2 个').click()
+  const scanned = page.getByRole('region', { name: '扫描结果' })
+  await expect(scanned).toContainText('SMPL-421.mp4')
+  await expect(scanned).toContainText('MOVX-679-C.mp4')
+  const saved = await page.evaluate(() => JSON.parse(localStorage.getItem('kiroku-mock-settings-v2')!))
+  expect(saved.source_dirs).toEqual([])
+})
 
 test('dropping folders on any page opens import with them added to the source list', async ({ page }) => {
   await page.goto('/')
@@ -19,6 +40,45 @@ test('dropping folders on any page opens import with them added to the source li
   await drag(page, 'drop', ['/mock/dropped-a', '/mock/dropped-b'])
   await expect(sourceList(page)).toContainText('/mock/dropped-a')
   await expect(sourceList(page)).toContainText('/mock/dropped-b')
+})
+
+test('scan waits for a slow video selection to join the source list', async ({ page }) => {
+  await overrideApi(page, `
+    const settings = await api.getSettings();
+    await api.saveSettings({ ...settings, source_dirs: ['/mock/source'] });
+    const classify = api.classifyPaths;
+    api.classifyPaths = paths => new Promise(resolve => {
+      window.finishReadingSources = () => resolve(classify(paths));
+    });
+  `)
+  await page.goto('/')
+  await page.getByRole('button', { name: '导入整理', exact: true }).click()
+  const scan = page.getByRole('button', { name: '开始扫描', exact: true })
+  await expect(scan).toBeEnabled()
+  page.once('dialog', dialog => dialog.accept('/mock/other/SMPL-421.mp4'))
+  await page.getByRole('button', { name: '添加视频文件', exact: true }).click()
+  await expect(scan).toBeDisabled()
+  await page.evaluate(() => (window as unknown as { finishReadingSources(): void }).finishReadingSources())
+  await expect(sourceList(page)).toContainText('/mock/other/SMPL-421.mp4')
+  await expect(scan).toBeEnabled()
+})
+
+test('adding a video keeps an explicitly removed source out of this scan', async ({ page }) => {
+  await overrideApi(page, `
+    const settings = await api.getSettings();
+    await api.saveSettings({ ...settings, source_dirs: ['/mock/remembered'] });
+  `)
+  await page.goto('/')
+  await page.getByRole('button', { name: '导入整理', exact: true }).click()
+  await page.getByRole('button', { name: '移除 /mock/remembered', exact: true }).click()
+  await page.getByRole('button', { name: '媒体库', exact: true }).click()
+  await drag(page, 'drop', ['/mock/dl/SMPL-421.mp4'])
+  await expect(sourceList(page)).toContainText('SMPL-421.mp4')
+  await expect(sourceList(page)).not.toContainText('/mock/remembered')
+  await page.getByRole('button', { name: '开始扫描' }).click()
+  await expect(page.getByRole('button', { name: /查找影片信息（1 部）/ })).toBeEnabled()
+  const saved = await page.evaluate(() => JSON.parse(localStorage.getItem('kiroku-mock-settings-v2')!))
+  expect(saved.source_dirs).toEqual(['/mock/remembered'])
 })
 
 test('only folders outside the library are added and the rest are explained', async ({ page }) => {
@@ -43,9 +103,9 @@ test('dragging shows a drop hint, and an import in progress is left untouched', 
   await page.goto('/')
   await expect(page.getByRole('button', { name: '媒体库', exact: true })).toBeVisible()
   await drag(page, 'enter', ['/mock/new-a'])
-  await expect(page.getByText('松开以添加待整理文件夹')).toBeVisible()
+  await expect(page.getByText('松开以添加待整理来源')).toBeVisible()
   await drag(page, 'leave')
-  await expect(page.getByText('松开以添加待整理文件夹')).toHaveCount(0)
+  await expect(page.getByText('松开以添加待整理来源')).toHaveCount(0)
 
   await page.getByRole('button', { name: '导入整理', exact: true }).click()
   await page.getByRole('button', { name: '开始扫描', exact: true }).click()

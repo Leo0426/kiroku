@@ -844,7 +844,7 @@ fn manual_version_marks_rebuild_from_original_and_undo_atomically() {
     let side = fs::read(root.join("kiroku.json")).unwrap();
     let poster = fs::read(root.join("poster.jpg")).unwrap();
     let nfo = fs::read(root.join("movie.nfo")).unwrap();
-    let phase = Phase {cracked:true,subtitle:true,..Default::default()};
+    let phase = Phase {cracked:true,subtitle:true,definition:Some("1080p".into()),..Default::default()};
     let patch = serde_json::json!({"artwork_phase":phase,"tags":["sample"]});
     let mut settings = Settings::default();
     settings.badges.enabled = true;
@@ -861,6 +861,13 @@ fn manual_version_marks_rebuild_from_original_and_undo_atomically() {
     assert_eq!(saved.provenance["artwork_phase"],"manual");
     assert!(!saved.locked_fields.contains("artwork_phase"));
     assert_eq!(saved.fields.tags,vec!["sample"]);
+    let nfo_after = fs::read_to_string(root.join("movie.nfo")).unwrap();
+    assert!(nfo_after.contains("<tag>版本：破解</tag>"));
+    assert!(nfo_after.contains("<genre>版本：中文字幕</genre>"));
+    assert!(nfo_after.contains("<tag>版本：1080p</tag>"));
+    let restored_from_nfo = kiroku_core::nfo_read::parse_nfo(&nfo_after, &m.code).unwrap();
+    assert_eq!(restored_from_nfo.artwork_phase, Some(phase.clone()));
+    assert_eq!(restored_from_nfo.fields.tags, ["sample"]);
     assert_ne!(fs::read(root.join("poster.jpg")).unwrap(),poster);
     assert_eq!(artwork::dimensions(&fs::read(root.join("poster.jpg")).unwrap()).unwrap(),(300,500));
     assert!(outcome.journal.rollback().is_empty());
@@ -868,6 +875,23 @@ fn manual_version_marks_rebuild_from_original_and_undo_atomically() {
     assert_eq!(fs::read(root.join("poster.jpg")).unwrap(),poster);
     assert_eq!(fs::read(root.join("movie.nfo")).unwrap(),nfo);
     assert_eq!(fs::read(root.join("movie.mp4")).unwrap(),b"video");
+}
+
+#[test]
+fn explicitly_reexporting_an_existing_version_preserves_foreign_nfo_genres() {
+    let folder = tempfile::tempdir().unwrap();
+    let dir = folder.path();
+    let phase = kiroku_core::badge::Phase { subtitle: true, ..Default::default() };
+    let metadata = Metadata { code: "ABC-123".into(), artwork_phase: Some(phase.clone()), ..Default::default() };
+    fs::write(dir.join("kiroku.json"), serde_json::to_vec(&metadata).unwrap()).unwrap();
+    let foreign = "<genre classification=\"custom\">Sample category</genre>";
+    fs::write(dir.join("movie.nfo"), format!("<movie><title>Sample</title>{foreign}</movie>")).unwrap();
+    let preview = revision::preview(dir, dir, &metadata.code, serde_json::json!({"artwork_phase":phase})).unwrap();
+    let preview = artwork::revise_phase(preview, &Default::default()).unwrap();
+    assert!(revision::apply(&preview).unwrap().error.is_none());
+    let xml = fs::read_to_string(dir.join("movie.nfo")).unwrap();
+    assert!(xml.contains(foreign));
+    assert_eq!(xml.matches("<genre>版本：中文字幕</genre>").count(), 1);
 }
 
 #[test]
@@ -887,4 +911,48 @@ fn version_marks_without_original_warn_and_survive_without_changing_poster() {
     assert_eq!(fs::read(root.join("poster.jpg")).unwrap(),b"existing poster");
     assert!(revision::preview(root,root,&m.code,serde_json::json!({"artwork_phase":null})).is_err());
     assert!(revision::preview(root,root,&m.code,serde_json::json!({"artwork_phase":{"cracked":"true"}})).is_err());
+}
+
+#[test]
+fn named_plex_crop_verifies_alias_ownership_and_rolls_back_both_posters() {
+    for ext in ["jpg", "png"] {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let dir = root.join("film");
+        fs::create_dir(&dir).unwrap();
+        let meta = Metadata { code: "ABC-123".into(), asset_stem: Some("example".into()), ..Default::default() };
+        fs::write(dir.join("kiroku.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+        fs::write(dir.join("ABC-123.mp4"), b"video").unwrap();
+        let named = dir.join("example-poster.jpg");
+        let alias = dir.join(format!("poster.{ext}"));
+        let previous = png(50, 40);
+        fs::write(&named, &previous).unwrap();
+        if ext == "png" { fs::write(&alias, &previous).unwrap(); }
+        let original = artwork::Original::from_bytes(revision::capture(&root,&dir,&meta.code).unwrap(), previous.clone(), None, Default::default()).unwrap();
+        let crop = CropBox { x: 4, y: 1, width: 17, height: 30 };
+        let (preview, jpeg) = original.preview(crop,None).unwrap();
+        let prepare = || preview.clone().with_plex_poster().unwrap();
+        let mut first = revision::apply(&prepare()).unwrap().journal;
+        assert_eq!(fs::read(&named).unwrap(), jpeg);
+        let alias_bytes = fs::read(&alias).unwrap();
+        let alias_format = if ext == "jpg" { image::ImageFormat::Jpeg } else { image::ImageFormat::Png };
+        assert_eq!(image::guess_format(&alias_bytes).unwrap(), alias_format);
+        assert_eq!(image::load_from_memory(&jpeg).unwrap().to_rgba8(),image::load_from_memory(&alias_bytes).unwrap().to_rgba8());
+        let saved = artwork::Original::load(revision::capture(&root,&dir,&meta.code).unwrap()).unwrap().unwrap();
+        let (next, second_jpeg) = saved.preview(CropBox { x: 2, y: 2, width: 20, height: 32 }, None).unwrap();
+        let mut second = revision::apply(&next.with_plex_poster().unwrap()).unwrap().journal;
+        assert_eq!(image::load_from_memory(&fs::read(&alias).unwrap()).unwrap().to_rgba8(),image::load_from_memory(&second_jpeg).unwrap().to_rgba8());
+        assert!(second.rollback().is_empty());
+        assert!(first.rollback().is_empty());
+        assert_eq!(fs::read(&named).unwrap(), previous);
+        if ext == "jpg" { assert!(!alias.exists()); } else { assert_eq!(fs::read(&alias).unwrap(), previous); }
+        // An independent Plex poster is user-owned.
+        let custom = png(7, 12);
+        fs::write(&alias, &custom).unwrap();
+        let custom_preview = prepare();
+        assert!(custom_preview.warnings.iter().any(|w| w.contains("另一张 Plex 封面")));
+        let mut journal = revision::apply(&custom_preview).unwrap().journal;
+        assert_eq!(fs::read(alias).unwrap(), custom);
+        assert!(journal.rollback().is_empty());
+    }
 }

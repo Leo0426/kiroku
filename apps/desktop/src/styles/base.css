@@ -114,6 +114,13 @@ select.input { padding-right: var(--s2); cursor: pointer; }
 
 .card { background: var(--surface-1); border-radius: var(--r-md); box-shadow: var(--inset-edge); }
 
+.app-dialog {
+  width: min(var(--dialog-width, 440px), calc(100vw - 32px)); max-height: calc(100dvh - 32px);
+  margin: auto; padding: 0; overflow: auto; border: 1px solid var(--line-strong);
+  border-radius: var(--r-lg); background: var(--surface-1); color: var(--text-1); box-shadow: var(--shadow-3);
+}
+.app-dialog::backdrop { background: var(--scrim); backdrop-filter: blur(3px); }
+
 /* 表格行:悬停时底色淡入并轻推,新行入场时从上方滑入 */
 .trow { transition: background var(--d-fast) var(--ease-out), transform var(--d-base) var(--ease-out); animation: rowIn 320ms var(--ease-out) both; }
 .trow:hover { background: var(--surface-2); transform: translateX(2px); }

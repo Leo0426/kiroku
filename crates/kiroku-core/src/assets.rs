@@ -20,6 +20,33 @@ impl Paths {
     }
 }
 
+pub(crate) fn existing_art(path: &Path) -> io::Result<Option<PathBuf>> {
+    for ext in ["jpg", "jpeg", "png", "webp"] {
+        let candidate = path.with_extension(ext);
+        match fs::symlink_metadata(&candidate) {
+            Ok(_) => return Ok(Some(candidate)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(None)
+}
+
+/// Search read-only local companions. The output paths used for new artwork
+/// continue to come from Paths::for_movie.
+pub(crate) fn local_image<'a>(
+    files: &'a std::collections::BTreeMap<(String, String), PathBuf>,
+    prefixes: &[String], generic: bool, roles: &[&str], bare: &[String],
+) -> Option<&'a Path> {
+    let image = |wanted: &str| {
+        ["jpg", "jpeg", "png", "webp"].iter()
+            .find_map(|ext| files.get(&(wanted.to_owned(), (*ext).to_owned())).map(PathBuf::as_path))
+    };
+    prefixes.iter().find_map(|prefix| roles.iter().find_map(|role| image(&format!("{prefix}-{role}"))))
+        .or_else(|| generic.then(|| roles.iter().find_map(|role| image(role))).flatten())
+        .or_else(|| bare.iter().find_map(|stem| image(stem)))
+}
+
 pub fn is_poster(path: &Path) -> bool { image_role(path, "poster") }
 pub fn is_fanart(path: &Path) -> bool { image_role(path, "fanart") }
 fn image_role(path: &Path, role: &str) -> bool {

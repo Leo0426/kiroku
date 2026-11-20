@@ -369,8 +369,12 @@ impl Http {
     }
 
     pub(crate) async fn get_image_bytes(&self, url: &str, limit: usize) -> std::io::Result<(u16, Vec<u8>)> {
+        self.image_bytes(url, limit, true).await
+    }
+
+    pub(crate) async fn image_bytes(&self, url: &str, limit: usize, reuse: bool) -> std::io::Result<(u16, Vec<u8>)> {
         let cache=self.image_cache.clone().map(|(cache,scope)|(cache,format!("{scope}:{url}")));
-        if let Some((cache,key))=cache.clone(){
+        if let Some((cache,key))=cache.clone().filter(|_| reuse){
             if let Ok(Some(bytes))=tokio::task::spawn_blocking(move||cache.read("images",&key,limit)).await {
                 log::debug!(target:"kiroku::images","复用已下载图片缓存");return Ok((200,bytes));
             }

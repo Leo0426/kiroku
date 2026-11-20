@@ -133,6 +133,7 @@ export const CONTENT_TYPES: { key: ContentType; label: string; hint: string }[] 
 export const CONTENT_TYPE_LABEL: Record<string, string> = Object.fromEntries(CONTENT_TYPES.map((c) => [c.key, c.label]))
 
 export const SOURCE_NAMES: Record<string, string> = {
+  local_nfo: '本地 NFO',
   javdb: 'JavDB',
   javbus: 'JavBus',
   jav321: 'Jav321',
@@ -196,6 +197,9 @@ export interface ScanItem {
   code: Code | null
 }
 
+export interface LocalImportEntry { code: string; reusable: boolean; preview: Preview }
+export type ScanCodeUpdate = ScanItem & { localImports?: LocalImportEntry[] }
+
 export type ScrapeStatus =
   | { kind: 'pending' }
   | { kind: 'scraping'; site: string }
@@ -208,7 +212,16 @@ export type ScrapeStatus =
 
 export type Conflict = 'invalidTemplate' | 'targetExists' | 'duplicateInBatch' | 'invalidLibrary'
 
+export interface ImportRules {
+  mode: OrganizeMode
+  subdirectory: string
+  directoryTemplate: string
+  fileTemplate: string
+  plexNaming: boolean
+}
 export interface PlanItem {
+  actions?: string[]
+  existingMovie?: boolean
   itemId: number
   code: string
   title: string | null
@@ -231,6 +244,7 @@ export interface ScanDone {
   /** 不算正片而跳过的视频(最多 500 条),skippedTotal 为实际总数 */
   skipped: SkippedFile[]; skippedTotal: number
   errors: ScanIssue[]; errorsTotal: number; complete: boolean
+  localImports?: LocalImportEntry[]
 }
 /** 刮削结果摘要:找到时随事件一起到,界面边刮边展示 */
 export interface Preview {
@@ -244,9 +258,11 @@ export interface Preview {
   actors: string[]
   score: number | null
   sources: string[]
+  localAssets?: string
+  localCover?: boolean
 }
 export interface ScrapeEvent { jobId: number; code: string; status: ScrapeStatus; done: number; total: number; preview: Preview | null; note: string | null }
-export interface ScrapeDone { jobId: number; found: number; notFound: number; failed: number; cancelled: boolean }
+export interface ScrapeDone { cache?:CacheSummary; jobId: number; found: number; notFound: number; failed: number; cancelled: boolean }
 export interface EtaEvent { jobId: number; remainingSecs: number }
 export interface ApplyEvent {
   jobId: number
@@ -259,11 +275,15 @@ export interface ApplyEvent {
   warnings: string[]
 }
 export interface ApplyDone {
+  skipped?:number
+  imageFailures?:number
   jobId: number
   applied: number
   failed: [string, string][]
   cancelled: boolean
-  journalId: string
+  /** Available only when this batch's record could be verified. */
+  journalId: string | null
+  canRollback: boolean
   /** 移到废纸篓的原文件夹 */
   cleaned: string[]
   indexError: string | null
@@ -286,7 +306,9 @@ export interface RepairDone {
 }
 
 export interface EventMap {
+  'package:progress': {jobId:number;done:number;total:number}
   'library:export': { jobId: number; root: string; done: number; total: number }
+  'recovery:progress': RecoveryProgress & {jobId:number;root:string}
   'job:started': { jobId: number; requestId: string }
   /** Progress only; catalog request ownership is established by job:started. */
   'library:catalog': {jobId:number; phase:string; done:number; total:number; code:string}
@@ -419,6 +441,7 @@ export interface Metadata {
 export interface MovieFile { path: string; part: number | null; size: number }
 
 export interface MovieDetail extends MovieCard {
+  localActorNames?: string[]
   meta: Metadata
   dir: string
   files: MovieFile[]
@@ -445,6 +468,7 @@ export interface DirInfo { videos: number; nfos: number; truncated: boolean }
 
 /** 拖入窗口的路径,按跟随软链接后的类型归类 */
 export interface DroppedPath { path: string; kind: 'dir' | 'video' | 'file' | 'missing' }
+export type MediaPickerPurpose = 'import' | 'append'
 
 /** 与 kiroku-core 的 VIDEO_EXT 一致 */
 export const VIDEO_EXT = ['mp4', 'mkv', 'avi', 'wmv', 'mov', 'ts', 'm2ts', 'flv', 'rmvb']
@@ -470,6 +494,7 @@ export interface MediaDirs { videos: string | null; downloads: string | null; su
 
 export const EDITABLE_FIELDS = FIELDS.filter(f => ['title', 'plot', 'actors', 'tags', 'studio', 'publisher', 'series', 'release_date', 'runtime_min', 'directors'].includes(f.key))
 export interface RevisionPreview {
+  nfoPath?: string
   token: string; root: string; dir: string; code: string; before: Metadata; after: Metadata
   warnings?: string[]
   changes: { field: string; before: unknown; after: unknown }[]
@@ -508,7 +533,7 @@ export interface LanguageBatchPreview { token:string; root:string; items:Revisio
 export interface BatchEditPreview { token:string; root:string; items:Pick<RevisionPreview,'code'|'changes'|'warnings'>[] }
 export interface LanguageBatchResult { jobId:number; results:RevisionResult[]; failed:string[]; cancelled:boolean }
 
-export interface RecoveryEntry {id:string;kind:'partial'|'pending'|'corrupt';codes:string[];pendingOperations:number;message:string;canUndo:boolean}
+export interface RecoveryEntry {id:string;kind:'partial'|'pending'|'corrupt';codes:string[];pendingOperations:number;message:string;canUndo:boolean;canPreserve?:boolean}
 export interface RecoveryReport {root:string;entries:RecoveryEntry[]}
 
 /** Unique request ID scopes read cancellation; summaries never authorize undo. */
@@ -517,7 +542,15 @@ export type HistoryRequestId = string
 /** 删除影片的结果;missing 表示目录早已不在磁盘上,只清了索引 */
 export interface TrashResult { missing: boolean; trashed: number }
 
-export interface LibraryPruned { root: string; removed: number; skipped: boolean }
+export interface LibraryPruned {
+  root: string
+  removed: number
+  skipped: boolean
+  relocated?: number
+  refreshed?: number
+  ambiguous?: number
+  missingCodes?: string[]
+}
 
 export type LibraryOverview = { movies: number; files: number; bytes: number; favorites: number; averageScore: number | null; missingPoster: number; missingYear: number; missingScore: number }
 
@@ -526,3 +559,29 @@ export type BatchEditResult = LanguageBatchResult & {skipped:string[]}
 
 /** Dictionary suggestions require explicit acceptance before saving. */
 export type TranslatableNameField = 'series' | 'tags'
+
+export interface RecoveryProgress {stage:'inspect'|'recover'|'index'|'finished';done:number;total:number;elapsedMs:number}
+export interface PreserveResult {root:string;journalId:string;recordedOperations:number;recoveryError:string|null;indexErrors:string[];indexTotal:number;indexCompleted:number;indexPending:number;cancelled:boolean}
+
+export interface NasStatus {state:'disabled'|'invalid'|'unverified'|'verified';message:string;localRoot:string|null;remoteRoot:string|null}
+
+export interface CacheSummary {reused:number;missing:number;invalidated:number;corrupt:number;unreadable:number;skippedMovies:number}
+export interface CacheUsage {sources:{files:number;bytes:number};images:{files:number;bytes:number}}
+
+export type CsvColumn = 'code' | 'title' | 'year' | 'actors' | 'score' | 'parts' | 'favorite' | 'tags' | 'paths'
+export interface CsvOptions { columns: CsvColumn[]; codes?: string[] }
+export type {PackageExportApi, PackageManifest} from './package-export'
+export type RestoreRule = 'keep' | 'fill' | 'replace'
+export type RestoreRules = Partial<Record<'title'|'tags'|'actors'|'metadata'|'poster'|'fanart'|'favorite'|'avatars', RestoreRule>>
+export interface RestoreRow { code:string; status:'ready'|'unchanged'|'unmatched'|'error'; destination:string|null; changes:RevisionPreview['changes']; files:string[]; warnings:string[] }
+export interface RestoreReview { token:string; root:string; items:RestoreRow[] }
+
+export type SupplementKind = 'nfo' | 'poster' | 'fanart' | 'actors'
+export interface SupplementEntry {
+  kind: SupplementKind
+  path: string | null
+  status: 'missing' | 'existing' | 'unavailable'
+  reason: string
+}
+export interface SupplementReview { token: string; dir: string; code: string; entries: SupplementEntry[] }
+export interface SupplementResult { written: string[]; skipped: string[]; cancelled: boolean; journalId: string | null }

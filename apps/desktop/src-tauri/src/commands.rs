@@ -30,7 +30,7 @@ fn library_change(state: &AppState, root: Option<&str>) -> CmdResult<bool> {
 
 /// 保留预览中的目标路径;首片未选时把共享元数据交给仍被选中的分片。
 fn selected_plans(plans: &[PlanItem], item_ids: &[u32], root: &Path) -> CmdResult<Vec<PlanItem>> {
-    let mut selected: Vec<_> = plans.iter().filter(|p| item_ids.contains(&p.item_id) && p.conflict.is_none()).cloned().collect();
+    let mut selected: Vec<_> = plans.iter().filter(|p| item_ids.contains(&p.item_id) && p.conflict.is_none() && !p.ops.is_empty()).cloned().collect();
     let mut carriers: std::collections::HashSet<String> = selected.iter().filter(|p| !p.extras.is_empty()).map(|p| p.code.clone()).collect();
     for p in &mut selected {
         if carriers.insert(p.code.clone()) {
@@ -52,8 +52,9 @@ fn selected_plans(plans: &[PlanItem], item_ids: &[u32], root: &Path) -> CmdResul
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
-pub fn get_settings(state: State<'_, AppState>) -> Settings {
-    state.settings()
+pub async fn get_settings(state: State<'_, AppState>) -> CmdResult<Settings> {
+    state.wait_library_startup().await;
+    Ok(state.settings())
 }
 
 #[tauri::command]
@@ -72,6 +73,10 @@ fn persist(state: &AppState, settings: Settings) -> CmdResult<()> {
 
 fn persist_to(state: &AppState, settings: Settings, path: &Path, root_owner: Option<u64>) -> CmdResult<()> {
     let _writer = state.settings_writer.lock().unwrap_or_else(|e| e.into_inner());
+    persist_locked(state, settings, path, root_owner)
+}
+
+fn persist_locked(state: &AppState, settings: Settings, path: &Path, root_owner: Option<u64>) -> CmdResult<()> {
     let changed = state.settings().library_root != settings.library_root;
     if changed {
         let job = state.job.lock().unwrap_or_else(|e| e.into_inner());
@@ -87,6 +92,16 @@ fn persist_to(state: &AppState, settings: Settings, path: &Path, root_owner: Opt
     if scan_changed { state.pending.lock().unwrap_or_else(|e| e.into_inner()).invalidate(); }
     if config_changed {*state.batch_edit.lock().unwrap_or_else(|e|e.into_inner())=None;let mut session=state.session();session.plans.clear();session.plan_settings=None;*state.append.lock().unwrap_or_else(|e|e.into_inner())=None;*state.maintenance.lock().unwrap_or_else(|e|e.into_inner())=None;}
     Ok(())
+}
+
+#[tauri::command]
+pub async fn save_import_defaults(app: AppHandle, rules: pipeline::import_rules::ImportRules) -> CmdResult<()> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let _writer = state.settings_writer.lock().unwrap_or_else(|e| e.into_inner());
+        let effective = rules.project(&state.settings())?;
+        persist_locked(&state, effective, &Settings::default_path(), None)
+    }).await.map_err(|e| e.to_string())?
 }
 
 fn commit_library(state: &AppState, settings: Settings, candidate: Option<Library>, path: &Path, owner: u64) -> CmdResult<()> {
@@ -267,6 +282,8 @@ struct ScanDone {
     errors: Vec<pipeline::ScanIssue>,
     errors_total: usize,
     complete: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    local_imports: Vec<pipeline::LocalImportEntry>,
 }
 
 const SKIPPED_MAX: usize = 500;
@@ -309,24 +326,26 @@ pub async fn scan_start(app: AppHandle, state: State<'_, AppState>, dirs: Vec<St
             if !batch.is_empty() {
                 emit(&app2, "scan:items", id, ItemsPayload { items: batch });
             }
-            r
+            let (locals, ready) = pipeline::inspect_import(&r.items, &cancel2);
+            (r, locals, ready)
         })
         .await;
         let done = match res {
-            Ok(r) => {
+            Ok((r, local_imports, ready)) => {
                 log::info!(target: "kiroku::scan", "扫描{}:视频 {} 个,番号 {} 个,未识别 {} 个,跳过 {} 个,读取错误 {} 个", if r.summary.complete { "完成" } else { "未完成" }, r.items.len(), r.codes, r.unrecognized, r.skipped.len(), r.summary.errors_total);
                 for issue in &r.summary.errors { log::warn!(target: "kiroku::scan", "无法读取 {}: {}", issue.path.display(), issue.message); }
                 let skipped_total = r.skipped.len();
                 let skipped = r.skipped.into_iter().take(SKIPPED_MAX).collect();
-                let d = ScanDone { total: r.items.len(), codes: r.codes, unrecognized: r.unrecognized, skipped, skipped_total, cancelled: r.summary.cancelled, errors: r.summary.errors, errors_total: r.summary.errors_total, complete: r.summary.complete };
+                let cancelled = r.summary.cancelled || cancel.is_cancelled();
+                let d = ScanDone { total: r.items.len(), codes: r.codes, unrecognized: r.unrecognized, skipped, skipped_total, cancelled, errors: r.summary.errors, errors_total: r.summary.errors_total, complete: r.summary.complete && !cancelled, local_imports };
                 let st = app.state::<AppState>();
                 let mut sess = st.session();
                 sess.scan = r.items;
-                sess.metas.clear();
+                sess.metas = ready;
                 sess.plans.clear();
                 d
             }
-            Err(error) => ScanDone { total: 0, codes: 0, unrecognized: 0, skipped: vec![], skipped_total: 0, cancelled: cancel.is_cancelled(), errors: vec![pipeline::ScanIssue { path: PathBuf::new(), message: format!("扫描任务失败: {error}") }], errors_total: 1, complete: false },
+            Err(error) => ScanDone { total: 0, codes: 0, unrecognized: 0, skipped: vec![], skipped_total: 0, cancelled: cancel.is_cancelled(), errors: vec![pipeline::ScanIssue { path: PathBuf::new(), message: format!("扫描任务失败: {error}") }], errors_total: 1, complete: false, local_imports: vec![] },
         };
         drop(guard);
         emit(&app, "scan:done", id, done);
@@ -349,18 +368,34 @@ pub async fn set_source_dirs(app: AppHandle, dirs: Vec<String>) -> CmdResult<Set
 }
 
 /// 手动指定(或修正)某个扫描项的番号,返回更新后的条目。
-#[tauri::command(async)]
-pub fn set_item_code(state: State<'_, AppState>, item_id: u32, code: String) -> CmdResult<ScanItem> {
-    if state.job_running() {
-        return Err("有任务正在运行,请稍后再试".into());
-    }
-    let mut sess = state.session();
-    let item = sess.scan.get_mut(item_id as usize).ok_or("找不到该文件")?;
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanCodeUpdate {
+    #[serde(flatten)]
+    item: ScanItem,
+    local_imports: Vec<pipeline::LocalImportEntry>,
+}
+
+#[tauri::command]
+pub async fn set_item_code(app: AppHandle, state: State<'_, AppState>, item_id: u32, code: String) -> CmdResult<ScanCodeUpdate> {
+    let (id, cancel) = state.begin_job("scan-code")?;
+    let _guard = JobGuard { app, id };
+    let mut scan = state.session().scan.clone();
+    let item = scan.get_mut(item_id as usize).ok_or("找不到该文件")?;
     pipeline::override_code(item, &code)?;
     let updated = item.clone();
-    sess.metas.clear();
+    let inspection_cancel = cancel.clone();
+    let (scan, local_imports, ready) = tauri::async_runtime::spawn_blocking(move || {
+        let (local_imports, ready) = pipeline::inspect_import(&scan, &inspection_cancel);
+        (scan, local_imports, ready)
+    }).await.map_err(|error| error.to_string())?;
+    if cancel.is_cancelled() { return Err("已取消核对本地资料".into()); }
+    let mut sess = state.session();
+    sess.scan = scan;
+    sess.metas = ready;
     sess.plans.clear();
-    Ok(updated)
+    sess.plan_settings = None;
+    Ok(ScanCodeUpdate { item: updated, local_imports })
 }
 
 #[derive(Serialize, Clone)]
@@ -370,6 +405,7 @@ struct ScrapeDone {
     not_found: usize,
     failed: usize,
     cancelled: bool,
+    cache: kiroku_core::import_cache::CacheSummary,
 }
 
 #[derive(Serialize, Clone)]
@@ -380,30 +416,33 @@ struct Eta {
 
 /// 对给定的扫描项刮削(按番号去重)。
 #[tauri::command]
-pub async fn scrape_start(app: AppHandle, state: State<'_, AppState>, item_ids: Vec<u32>) -> CmdResult<u64> {
-    let codes: Vec<_> = {
+pub async fn scrape_start(app: AppHandle, state: State<'_, AppState>, item_ids: Vec<u32>, cached_sources_only: Option<bool>, refresh: Option<bool>) -> CmdResult<u64> {
+    let items: Vec<_> = {
         let sess = state.session();
-        item_ids.iter().filter_map(|i| sess.scan.get(*i as usize)).filter_map(|it| it.code.clone()).collect()
+        item_ids.iter().filter_map(|i| sess.scan.get(*i as usize)).filter(|it| it.code.is_some()).cloned().collect()
     };
-    if codes.is_empty() {
+    if items.is_empty() {
         return Err("没有可刮削的文件".into());
     }
+    let codes: std::collections::HashSet<_> = items.iter().filter_map(|it| it.code.as_ref()).map(|c| c.id.clone()).collect();
+    let refresh = refresh.unwrap_or(false);
     let (id, cancel) = state.begin_job("scrape")?;
     let guard=JobGuard{app:app.clone(),id};
     let mut previous = state.session().metas.clone();
-    if let Some(root) = state.library_root() {
-        let ids: Vec<_> = codes.iter().map(|c| c.id.clone()).collect();
+    if let Some(root) = state.library_root().filter(|_| !refresh) {
+        let ids: Vec<_> = codes.iter().cloned().collect();
         let discovery_cancel=cancel.clone();
         let existing = tauri::async_runtime::spawn_blocking(move || kiroku_core::append::existing_metadata_cancellable(&root, &ids,&discovery_cancel)).await.map_err(|e|e.to_string())?.map_err(|e|e.to_string())?;
         previous.extend(existing);
         state.session().metas.extend(previous.clone());
     }
     let scraper = scraper(state.settings())?;
+    let scraper = if cached_sources_only.unwrap_or(false) && !refresh { scraper.with_cached_sources_only() } else { scraper };
     tauri::async_runtime::spawn(async move {
         let guard = guard;
         let started = Instant::now();
         let app_ev = app.clone();
-        let results = pipeline::scrape_missing(&scraper, &codes, &previous, &cancel, &move |ev| {
+        let results = pipeline::scrape_import(&scraper, &items, &previous, refresh, &cancel, &move |ev| {
             // 用已完成项的平均耗时估算剩余时间
             if ev.done > 0 && ev.done < ev.total {
                 let per = started.elapsed().as_secs_f64() / ev.done as f64;
@@ -412,8 +451,8 @@ pub async fn scrape_start(app: AppHandle, state: State<'_, AppState>, item_ids: 
             emit(&app_ev, "scrape:event", id, ev);
         })
         .await;
-        let reused=codes.iter().filter(|c|previous.contains_key(&c.id)).map(|c|&c.id).collect::<std::collections::HashSet<_>>().len();
-        let mut done = ScrapeDone { found: reused, not_found: 0, failed: 0, cancelled: cancel.is_cancelled() };
+        let reused = if refresh { 0 } else { codes.iter().filter(|c| previous.contains_key(*c)).count() };
+        let mut done = ScrapeDone { found: reused, not_found: 0, failed: 0, cancelled: cancel.is_cancelled(), cache: scraper.cache_summary() };
         {
             let st = app.state::<AppState>();
             let mut sess = st.session();
@@ -423,7 +462,7 @@ pub async fn scrape_start(app: AppHandle, state: State<'_, AppState>, item_ids: 
                         done.found += 1;
                         sess.metas.insert(code, m);
                     }
-                    Err(pipeline::ScrapeError::NotFound) => done.not_found += 1,
+                    Err(pipeline::ScrapeError::NotFound | pipeline::ScrapeError::CacheMiss) => done.not_found += 1,
                     Err(pipeline::ScrapeError::Cancelled) => {}
                     Err(_) => done.failed += 1,
                 }
@@ -499,18 +538,19 @@ pub async fn scrape_url_start(app: AppHandle, state: State<'_, AppState>, item_i
     let code = code.clone();
     let (id, cancel) = state.begin_job("scrape")?;
     let guard = JobGuard { app: app.clone(), id };
+    let previous = state.session().metas.get(&code.id).filter(|meta| meta.import_local.is_some()).cloned();
     let scraper = scraper(state.settings())?;
     tauri::async_runtime::spawn(async move {
         let guard = guard;
         let app_ev = app.clone();
-        let r = pipeline::scrape_url_one(&scraper, &code, url.trim(), &cancel, &move |ev| emit(&app_ev, "scrape:event", id, ev)).await;
-        let mut done = ScrapeDone { found: 0, not_found: 0, failed: 0, cancelled: cancel.is_cancelled() };
+        let r = pipeline::scrape_import_url(&scraper, &code, url.trim(), previous, &cancel, &move |ev| emit(&app_ev, "scrape:event", id, ev)).await;
+        let mut done = ScrapeDone { found: 0, not_found: 0, failed: 0, cancelled: cancel.is_cancelled(), cache: scraper.cache_summary() };
         {
             let st = app.state::<AppState>();
             let mut sess = st.session();
             match r {
                 Ok(m) => { done.found = 1; sess.metas.insert(code.id.clone(), m); }
-                Err(pipeline::ScrapeError::NotFound) => done.not_found = 1,
+                Err(pipeline::ScrapeError::NotFound | pipeline::ScrapeError::CacheMiss) => done.not_found = 1,
                 Err(pipeline::ScrapeError::Cancelled) => {}
                 Err(_) => done.failed = 1,
             }
@@ -523,7 +563,7 @@ pub async fn scrape_url_start(app: AppHandle, state: State<'_, AppState>, item_i
 }
 
 /// 为已刮削到元数据的文件生成整理计划(不触碰磁盘),返回给前端预览。
-fn publish_plans(state: &AppState, id: u64, settings: Settings, root: &Path, plans: Vec<PlanItem>) -> CmdResult<Vec<PlanItem>> {
+fn publish_plans(state: &AppState, id: u64, settings: Settings, root: &Path, plans: Vec<PlanItem>, token: Option<String>) -> CmdResult<Vec<PlanItem>> {
     let _writer = state.settings_writer.lock().unwrap_or_else(|e| e.into_inner());
     let job = state.job.lock().unwrap_or_else(|e| e.into_inner());
     if !job.as_ref().is_some_and(|job| job.id == id && job.kind == "plan" && !job.cancel.is_cancelled()) {
@@ -533,13 +573,14 @@ fn publish_plans(state: &AppState, id: u64, settings: Settings, root: &Path, pla
         return Err("设置或媒体库已变化，请重新生成整理计划".into());
     }
     let mut session = state.session();
+    session.plan_token = token;
     session.plans = plans.clone();
     session.plan_settings = Some(settings);
     Ok(plans)
 }
 
 #[tauri::command]
-pub async fn plan_build(app: AppHandle, state: State<'_, AppState>, item_ids: Vec<u32>, request_id: Option<String>) -> CmdResult<Vec<PlanItem>> {
+pub async fn plan_build(app: AppHandle, state: State<'_, AppState>, item_ids: Vec<u32>, request_id: Option<String>, rules: Option<pipeline::import_rules::ImportRules>, renames: Option<std::collections::HashMap<u32, String>>) -> CmdResult<Vec<PlanItem>> {
     #[derive(Serialize, Clone)]
     #[serde(rename_all = "camelCase")]
     struct PlanStarted { request_id: Option<String> }
@@ -547,32 +588,37 @@ pub async fn plan_build(app: AppHandle, state: State<'_, AppState>, item_ids: Ve
     let _guard = JobGuard { app: app.clone(), id };
     let settings = state.settings();
     let root = state.library_root().ok_or("请先设置媒体库目录")?;
-    emit(&app, "plan:started", id, PlanStarted { request_id });
+    emit(&app, "plan:started", id, PlanStarted { request_id: request_id.clone() });
     let plan_root = root.clone();
-    let plan_settings=settings.clone();
+    let plan_settings=settings;
+    let settings=match rules { Some(rules) => rules.project(&plan_settings)?, None => plan_settings.clone() };
+    let renames=renames.unwrap_or_default();
     let (scan, metas) = { let session = state.session(); (session.scan.clone(), session.metas.clone()) };
     let metas = metas.into_iter().map(|(code, meta)| kiroku_core::names::project(&meta, &settings.name_rules).map(|p|(code,p.metadata))).collect::<Result<std::collections::HashMap<_,_>,_>>()?;
     log::info!(target: "kiroku::organize", "生成整理计划:{} 项", item_ids.len());
     let started = std::time::Instant::now();
     let plans = tauri::async_runtime::spawn_blocking(move || {
         let pairs: Vec<_> = item_ids.iter().filter_map(|id| scan.get(*id as usize)).filter_map(|it| it.code.as_ref().map(|code| (it,code))).collect();
-        pipeline::build_plans_cancellable(&pairs, &metas, &root, &settings.dir_template, settings.plan_opts(), &cancel)
+        pipeline::build_import_plans(&pairs, &metas, &root, &settings.dir_template, settings.plan_opts(), &renames, &cancel)
     }).await.map_err(|e| {
         log::error!(target: "kiroku::organize", "生成整理计划失败: {e}");
         e.to_string()
     })?.map_err(|e| e.to_string())?;
     let conflicts = plans.iter().filter(|p| p.conflict.is_some()).count();
     log::info!(target: "kiroku::organize", "整理计划已生成:{} 项,{} 项有冲突({} ms)", plans.len(), conflicts, started.elapsed().as_millis());
-    publish_plans(&state, id, plan_settings, &plan_root, plans)
+    publish_plans(&state, id, plan_settings, &plan_root, plans, request_id)
 }
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct ApplyDone {
+    skipped: usize,
+    image_failures: usize,
     applied: usize,
     failed: Vec<(String, String)>,
     cancelled: bool,
-    journal_id: String,
+    journal_id: Option<String>,
+    can_rollback: bool,
     /// 移到废纸篓的原文件夹
     cleaned: Vec<String>,
     index_error: Option<String>,
@@ -580,15 +626,17 @@ struct ApplyDone {
 
 /// 执行选中的计划项(有冲突的项会被忽略)。
 #[tauri::command]
-pub async fn apply_start(app: AppHandle, state: State<'_, AppState>, item_ids: Vec<u32>) -> CmdResult<u64> {
+pub async fn apply_start(app: AppHandle, state: State<'_, AppState>, item_ids: Vec<u32>, plan_token: Option<String>) -> CmdResult<u64> {
     let (id, cancel) = state.begin_job("apply")?;
     let guard = JobGuard { app: app.clone(), id };
     let root = state.library_root().ok_or("请先设置媒体库目录")?;
     let plans: Vec<PlanItem> = {
         let sess = state.session();
+        if plan_token.is_some() && sess.plan_token!=plan_token { return Err("整理预览已更新，请重新预览".into()); }
         if sess.plan_settings.as_ref()!=Some(&state.settings()){return Err("设置已变化，请重新生成整理计划".into())}
         selected_plans(&sess.plans, &item_ids, &root)?
     };
+    let skipped=state.session().plans.len().saturating_sub(plans.len());
     if plans.is_empty() {
         return Err("没有可执行的项目,请重新生成整理计划".into());
     }
@@ -609,9 +657,18 @@ pub async fn apply_start(app: AppHandle, state: State<'_, AppState>, item_ids: V
         emit(&app, "apply:progress", id, pipeline::ApplyProgress { phase: pipeline::ApplyPhase::Index,
             done: 0, total: dirs.len(), failed: 0, code: None });
         let (app2, dirs2) = (app.clone(), dirs.clone());
-        let index_error = match tauri::async_runtime::spawn_blocking(move || reindex(&app2, &dirs2)).await {
-            Ok(Ok(())) => None, Ok(Err(e)) => Some(e), Err(e) => Some(e.to_string()),
-        };
+        let journal = out.journal;
+        let (index_error, journal_id, can_rollback) = tauri::async_runtime::spawn_blocking(move || {
+            let index_error = reindex(&app2, &dirs2).err();
+            match journal.recorded_rollback_work() {
+                Ok(Some(can_rollback)) => (index_error, Some(journal.id), can_rollback),
+                Ok(None) => (index_error, None, false),
+                Err(error) => {
+                    log::warn!(target: "kiroku::organize", "无法核对本批整理记录：{error}");
+                    (index_error, None, false)
+                }
+            }
+        }).await.unwrap_or_else(|error| (Some(error.to_string()), None, false));
         match &index_error {
             None => log::info!(target: "kiroku::organize", "媒体库索引已更新({} 个目录)", dirs.len()),
             Some(e) => log::error!(target: "kiroku::organize", "媒体库索引更新失败: {e}"),
@@ -622,10 +679,13 @@ pub async fn apply_start(app: AppHandle, state: State<'_, AppState>, item_ids: V
             "apply:done",
             id,
             ApplyDone {
+                skipped,
+                image_failures:out.image_failures,
                 applied: out.applied.len(),
                 failed: out.failed,
                 cancelled: out.cancelled,
-                journal_id: out.journal.id.clone(),
+                journal_id,
+                can_rollback,
                 cleaned: out.cleaned.iter().map(|p| p.display().to_string()).collect(),
                 index_error,
             },
@@ -731,10 +791,15 @@ pub fn job_cancel(state: State<'_, AppState>,job_id:Option<u64>) -> bool {
 
 #[tauri::command]
 pub async fn reveal_journal(app: AppHandle, state: State<'_, AppState>, journal_id: String) -> CmdResult<()> {
-    if journal_id.is_empty() || !journal_id.bytes().all(|b| b.is_ascii_digit()) { return Err("无效的日志编号".into()); }
     let root = state.library_root().ok_or("媒体库未设置")?;
+    let sources = state.settings().source_dirs;
     tauri::async_runtime::spawn_blocking(move || {
-        let path = kiroku_core::journal::dir(&root).join(format!("journal-{journal_id}.json"));
+        let (root, id) = match crate::linked_artwork::history_target(&root, &sources, &journal_id).map_err(|e|e.to_string())? {
+            Some((link,id)) => (link.root,id),
+            None => (root,journal_id),
+        };
+        if id.is_empty() || !id.bytes().all(|b|b.is_ascii_digit()) {return Err("无效的日志编号".into())}
+        let path = kiroku_core::journal::dir(&root).join(format!("journal-{id}.json"));
         if !inside(&root, &path) { return Err("日志不存在或不在当前媒体库内".into()); }
         app.opener().reveal_item_in_dir(path).map_err(|e| e.to_string())
     }).await.map_err(|e| e.to_string())?
@@ -749,23 +814,26 @@ pub struct RollbackResult {
 }
 
 #[tauri::command]
-pub async fn rollback(app: AppHandle, state: State<'_, AppState>, journal_id: String) -> CmdResult<RollbackResult> {
-    if state.job_running() {
-        return Err("有任务正在运行,请稍后再试".into());
-    }
-    // id 是时间戳;拒绝其他形态,避免拼出库外路径
-    if journal_id.is_empty() || !journal_id.bytes().all(|b| b.is_ascii_digit()) {
-        return Err("无效的日志编号".into());
-    }
-    let root = state.library_root().ok_or("请先设置媒体库目录")?;
-    let settings = state.settings();
-    let root_label = root.display().to_string();
+pub async fn rollback(app: AppHandle, state: State<'_, AppState>, journal_id: String, expected_root: Option<PathBuf>) -> CmdResult<RollbackResult> {
     let (id, _cancel) = state.begin_job("rollback")?;
     let guard = JobGuard { app: app.clone(), id };
+    let root = state.library_root().ok_or("请先设置媒体库目录")?;
+    if expected_root.as_ref().is_some_and(|expected| expected != &root) {
+        return Err("媒体库已变化，请重新核对操作记录".into());
+    }
+    let settings = state.settings();
+    let root_label = root.display().to_string();
     let app_bg = app.clone();
     let (result, dirs) = tauri::async_runtime::spawn_blocking(move || {
-        let path = kiroku_core::journal::dir(&root).join(format!("journal-{journal_id}.json"));
-        let mut j = Journal::load(&path).map_err(|e| e.to_string())?;
+        let sources = app.state::<AppState>().settings().source_dirs;
+        let linked = crate::linked_artwork::history_target(&root, &sources, &journal_id).map_err(|e|e.to_string())?;
+        let mut j = if let Some((link,id)) = &linked {
+            crate::linked_artwork::checked_journal(link,id,&CancellationToken::new()).map_err(|e|e.to_string())?
+        } else {
+            if journal_id.is_empty() || !journal_id.bytes().all(|b| b.is_ascii_digit()) {return Err("无效的日志编号".into())}
+            let path = kiroku_core::journal::dir(&root).join(format!("journal-{journal_id}.json"));
+            Journal::load(&path).map_err(|e|e.to_string())?
+        };
         let mut dirs: Vec<PathBuf> = j.items.iter().map(|i| i.dir.clone()).collect();
         // 旧格式日志没有 items:从移动操作推断影片目录
         for op in &j.ops {
@@ -774,7 +842,11 @@ pub async fn rollback(app: AppHandle, state: State<'_, AppState>, journal_id: St
             }
         }
         let failures = j.rollback();
-        let index_error = reindex(&app, &dirs).err();
+        let index_error = if let Some((link,journal)) = linked {
+            let err=crate::linked_artwork::note_journal(&root,&link.root,&link.dir(),&link.code,&journal).err();
+            emit(&app,"library:changed",id,serde_json::json!({}));
+            err
+        } else { reindex(&app, &dirs).err() };
         Ok::<_, String>((RollbackResult { failures, index_error, status: j.status }, dirs))
     })
     .await
@@ -810,16 +882,34 @@ async fn query_lib<T: Send + 'static>(app: AppHandle, f: impl FnOnce(&kiroku_cor
 }
 
 #[tauri::command]
+pub async fn cached_poster(app: AppHandle, code: String, version: Option<String>) -> CmdResult<Option<String>> {
+    let path = query_lib(app.clone(), move |reader| {
+        let settings = Settings::default_path();
+        reader.cached_poster(settings.parent().expect("settings within config directory"), &code, version.as_deref())
+    }).await?;
+    let Some(path) = path else { return Ok(None) };
+    app.asset_protocol_scope().allow_file(&path).map_err(|e| e.to_string())?;
+    Ok(Some(path.to_string_lossy().into_owned()))
+}
+
+#[tauri::command]
 pub async fn library_overview(app: AppHandle, query: Query) -> CmdResult<kiroku_core::library::Overview> {
     query_lib(app, move |l| l.overview(&query)).await
 }
 
 #[tauri::command]
 pub async fn library_list(app: AppHandle, query: Query) -> CmdResult<Page> {
-    query_lib(app, move |l| l.list(&query)).await
+    let display = app.clone();
+    let sources = app.state::<AppState>().settings().source_dirs;
+    query_lib(app, move |reader| {
+        let mut page = reader.list(&query)?;
+        crate::linked_artwork::project(&display, reader.root(), &sources, &mut page.items)?;
+        Ok(page)
+    }).await
 }
 
 fn export_library_snapshot(
+    options: &kiroku_core::library::CsvOptions,
     state: &AppState,
     snapshot: &crate::state::LibraryReadSnapshot,
     query: &Query,
@@ -834,7 +924,7 @@ fn export_library_snapshot(
     let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
     let count = {
         let mut output = std::io::BufWriter::new(temp.as_file_mut());
-        let count = with_read_snapshot(state, snapshot, |reader| reader.export_csv(query, &mut output, cancel, progress))?;
+        let count = with_read_snapshot(state, snapshot, |reader| reader.export_csv_with(query, options, &mut output, cancel, progress))?;
         output.flush().map_err(|e| e.to_string())?;
         count
     };
@@ -849,7 +939,7 @@ fn export_library_snapshot(
 /// Export only the captured library snapshot; the native dialog owns the output
 /// path. A private temporary file is published only after a complete export.
 #[tauri::command]
-pub async fn library_export_csv(app: AppHandle, query: Query, request_id: Option<String>) -> CmdResult<Option<usize>> {
+pub async fn library_export_csv(app: AppHandle, query: Query, options: Option<kiroku_core::library::CsvOptions>, request_id: Option<String>) -> CmdResult<Option<usize>> {
     let snapshot = app.state::<AppState>().read_snapshot()?;
     // A chooser is not a disk task: do not hold the shutdown/job guard while
     // waiting for human input in a native modal. The captured root is revalidated.
@@ -868,36 +958,32 @@ pub async fn library_export_csv(app: AppHandle, query: Query, request_id: Option
     tauri::async_runtime::spawn_blocking(move || {
         let _guard = guard;
         if cancel.is_cancelled() { return Err("导出已停止".into()); }
-        let count = export_library_snapshot(&app.state::<AppState>(), &snapshot, &query, &path, &cancel, &mut |done, total| emit(&app, "library:export", id, serde_json::json!({"root":snapshot.handle.root().to_string_lossy(),"done":done,"total":total})))?;
+        let count = export_library_snapshot(&options.unwrap_or_default(), &app.state::<AppState>(), &snapshot, &query, &path, &cancel, &mut |done, total| emit(&app, "library:export", id, serde_json::json!({"root":snapshot.handle.root().to_string_lossy(),"done":done,"total":total})))?;
         Ok(Some(count))
     }).await.map_err(|e| e.to_string())?
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct LibraryPruned { root: String, removed: usize, skipped: bool }
+pub struct LibraryPruned { root: String, #[serde(flatten)] changes: kiroku_core::library::RefreshStats, skipped: bool }
 
-fn prune_library_snapshot(state: &AppState, snapshot: &crate::state::LibraryReadSnapshot, cancel: &CancellationToken) -> CmdResult<usize> {
+fn prune_library_snapshot(state: &AppState, snapshot: &crate::state::LibraryReadSnapshot, remove_missing: Option<&[String]>, cancel: &CancellationToken) -> CmdResult<kiroku_core::library::RefreshStats> {
     state.validate_read(snapshot)?;
     let slot = state.lib();
     state.validate_read(snapshot)?;
     let library = slot.as_ref().ok_or("媒体库索引已关闭")?;
-    library.prune_missing(cancel, &mut |_, _| {}).map_err(|e| e.to_string())
+    library.refresh_index(remove_missing, cancel, &mut |_, _| {}).map_err(|e| e.to_string())
 }
 
-/// Check only known movie directories, off the UI thread. Auto checks yield to
-/// existing jobs; explicit refresh reports contention. No media files are deleted.
+/// Reconcile indexed movies only on explicit request. Old clients may still send automatic checks.
 #[tauri::command]
-pub async fn library_prune_missing(app: AppHandle, root: String, automatic: bool, request_id: Option<String>) -> CmdResult<LibraryPruned> {
+pub async fn library_prune_missing(app: AppHandle, root: String, automatic: bool, request_id: Option<String>, remove_missing: Option<Vec<String>>) -> CmdResult<LibraryPruned> {
     let state = app.state::<AppState>();
     let snapshot = state.read_snapshot()?;
     state.validate_read(&snapshot)?;
     if snapshot.handle.root() != Path::new(&root) { return Err("媒体库已变化，请重新刷新".into()); }
-    let (id, cancel) = match state.begin_job("library-prune") {
-        Ok(job) => job,
-        Err(_) if automatic => return Ok(LibraryPruned { root, removed: 0, skipped: true }),
-        Err(error) => return Err(error),
-    };
+    if automatic { return Ok(LibraryPruned { root, changes: Default::default(), skipped: true }); }
+    let (id, cancel) = state.begin_job("library-prune")?;
     let guard = JobGuard { app: app.clone(), id };
     if let Some(request_id) = request_id {
         emit(&app, "job:started", id, serde_json::json!({"requestId":request_id}));
@@ -905,33 +991,100 @@ pub async fn library_prune_missing(app: AppHandle, root: String, automatic: bool
     let app2 = app.clone();
     // The worker retains the guard until its transaction has committed/rolled back,
     // even if the caller drops the invoke future during shutdown.
-    let removed = tauri::async_runtime::spawn_blocking(move || {
+    let changes = tauri::async_runtime::spawn_blocking(move || {
         let _guard = guard;
-        prune_library_snapshot(&app2.state::<AppState>(), &snapshot, &cancel)
+        prune_library_snapshot(&app2.state::<AppState>(), &snapshot, remove_missing.as_deref(), &cancel)
     }).await.map_err(|e| e.to_string())??;
-    if removed > 0 { emit(&app, "library:changed", id, serde_json::json!({"root":root})); }
-    Ok(LibraryPruned { root, removed, skipped: false })
+    if changes.removed + changes.relocated + changes.refreshed > 0 { emit(&app, "library:changed", id, serde_json::json!({"root":root})); }
+    Ok(LibraryPruned { root, changes, skipped: false })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all="camelCase")]
+pub struct DetailWithAvatars {
+    #[serde(flatten)] detail:MovieDetail,
+    local_actor_names:Vec<String>,
 }
 
 #[tauri::command]
-pub async fn library_get(app: AppHandle, code: String) -> CmdResult<Option<MovieDetail>> {
-    query_lib(app, move |l| l.get(&code)).await
+pub async fn library_get(app: AppHandle, code: String) -> CmdResult<Option<DetailWithAvatars>> {
+    let display = app.clone();
+    let sources = app.state::<AppState>().settings().source_dirs;
+    query_lib(app, move |reader| {
+        let Some(mut detail)=reader.get(&code)? else {return Ok(None)};
+        crate::linked_artwork::project(&display, reader.root(), &sources, std::slice::from_mut(&mut detail.card))?;
+        let mut local_actor_names=vec![];
+        if let Ok(dir)=kiroku_core::append::confined_path(reader.root(),Path::new(&detail.dir)) {
+            if std::fs::symlink_metadata(dir.join(".actors")).is_ok_and(|m| m.is_dir()) {
+                for a in &detail.meta.fields.actors {
+                    if kiroku_core::supplement::local_avatar_path(&dir,&a.name).is_ok_and(|path|path.is_some()){local_actor_names.push(a.name.clone())}
+                }
+            }
+        }
+        Ok(Some(DetailWithAvatars{detail,local_actor_names}))
+    }).await
 }
 
-/// Only fetch avatar URLs already attached to this library item; no disk mutation.
+/// Fetch avatars attached to this library item or its current revision preview.
 #[tauri::command]
-pub async fn actor_image(app: AppHandle, code: String, url: String) -> CmdResult<serde_json::Value> {
+pub async fn actor_image(
+    app: AppHandle,
+    code: String,
+    url: String,
+    revision_token: Option<String>,
+    actor_name: Option<String>,
+) -> CmdResult<serde_json::Value> {
     let state = app.state::<AppState>();
     let snapshot = state.read_snapshot()?;
     let read_snapshot = snapshot.clone();
     let app_read = app.clone();
     let expected = url.clone();
-    let allowed = tauri::async_runtime::spawn_blocking(move || {
-        with_read_snapshot(&app_read.state::<AppState>(), &read_snapshot, |reader| {
-            Ok(reader.get(&code)?.is_some_and(|d| d.meta.fields.actors.iter().any(|a| a.thumb.as_deref() == Some(expected.as_str()))))
+    let (allowed, cached) = tauri::async_runtime::spawn_blocking(move || {
+        let state = app_read.state::<AppState>();
+        let settings = state.settings();
+        let has_thumb = |meta: &kiroku_core::Metadata| {
+            meta.fields.actors.iter().any(|actor| actor.thumb.as_deref() == Some(expected.as_str()))
+        };
+        with_read_snapshot(&state, &read_snapshot, |reader| {
+            let Some(detail) = reader.get(&code)? else { return Ok((false, None)) };
+            if let Some(name) = actor_name.as_deref().filter(|_|revision_token.is_none()) {
+                if detail.meta.fields.actors.iter().any(|a| a.name==name && a.thumb.as_deref().unwrap_or("")==expected) {
+                    if let Ok(dir)=kiroku_core::append::confined_path(reader.root(),Path::new(&detail.dir)) {
+                        if let Ok(Some(bytes))=kiroku_core::supplement::read_local_avatar(&dir,name) {return Ok((true,Some(bytes)))}
+                    }
+                }
+                if expected.is_empty(){return Ok((false,None))}
+            }
+            let preview = revision_token.as_ref().and_then(|token| {
+                let root = read_snapshot.handle.root().canonicalize().ok();
+                let pending = state.revision.lock().unwrap_or_else(|e| e.into_inner());
+                pending.as_ref().filter(|p| {
+                    &p.token == token && p.preview.code == code
+                        && root.as_deref() == Some(p.preview.root.as_path())
+                        && p.settings.as_ref().is_none_or(|s| s == &settings)
+                        && has_thumb(&p.preview.after)
+                }).map(|p| p.preview.cached_avatar(&expected).map(<[u8]>::to_vec))
+            });
+            if let Some(Some(bytes)) = preview { return Ok((true, Some(bytes))); }
+            if has_thumb(&detail.meta) {
+                if let Ok(dir) = kiroku_core::append::confined_path(read_snapshot.handle.root(), Path::new(&detail.dir)) {
+                    if let Some(actor) = detail.meta.fields.actors.iter().find(|a| a.thumb.as_deref() == Some(expected.as_str())) {
+                        if let Ok(Some(bytes)) = kiroku_core::supplement::read_local_avatar(&dir, &actor.name) {
+                            return Ok((true, Some(bytes)));
+                        }
+                    }
+                }
+                let cached = kiroku_core::actor_hosting::cached_avatar(&detail.meta, &expected, &settings.actor_hosting);
+                return Ok((true, cached.ok().flatten()));
+            }
+            Ok((preview.is_some(), None))
         })
     }).await.map_err(|e| e.to_string())??;
     if !allowed { return Err("影片中没有此头像地址".into()); }
+    if let Some(bytes) = cached {
+        state.validate_read(&snapshot)?;
+        return Ok(serde_json::json!({"bytes": bytes, "mime": "image/png"}));
+    }
     static REQUESTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
     let _permit = REQUESTS.acquire().await.map_err(|_| "头像加载已停止")?;
     state.validate_read(&snapshot)?;
@@ -1293,10 +1446,10 @@ mod tests {
         let old = state.read_snapshot().unwrap();
         state.settings.lock().unwrap().library_root = Some(root_b.display().to_string());
         state.replace_library(Some(second));
-        assert!(prune_library_snapshot(&state, &old, &CancellationToken::new()).is_err());
+        assert!(prune_library_snapshot(&state, &old, None, &CancellationToken::new()).is_err());
         assert_eq!(with_lib(&state, |l| l.list(&Query::default())).unwrap().total, 1);
         let current = state.read_snapshot().unwrap();
-        assert_eq!(prune_library_snapshot(&state, &current, &CancellationToken::new()).unwrap(), 1);
+        assert_eq!(prune_library_snapshot(&state, &current, None, &CancellationToken::new()).unwrap().removed, 1);
         assert_eq!(with_lib(&state, |l| l.list(&Query::default())).unwrap().total, 0);
     }
 
@@ -1311,16 +1464,16 @@ mod tests {
         let snapshot = state.read_snapshot().unwrap();
         let path = temp.path().join("report.csv");
         let query = Query::default();
-        assert_eq!(export_library_snapshot(&state, &snapshot, &query, &path, &CancellationToken::new(), &mut |_, _| {}).unwrap(), 1);
+        assert_eq!(export_library_snapshot(&Default::default(), &state, &snapshot, &query, &path, &CancellationToken::new(), &mut |_, _| {}).unwrap(), 1);
         let bytes = std::fs::read(&path).unwrap();
         assert!(String::from_utf8_lossy(&bytes).contains("ABC-123"));
-        assert!(export_library_snapshot(&state, &snapshot, &query, &path, &CancellationToken::new(), &mut |_, _| {}).is_err());
+        assert!(export_library_snapshot(&Default::default(), &state, &snapshot, &query, &path, &CancellationToken::new(), &mut |_, _| {}).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         let cancel = CancellationToken::new(); let cancelled = temp.path().join("cancelled.csv");
-        assert!(export_library_snapshot(&state, &snapshot, &query, &cancelled, &cancel, &mut |done, _| { if done > 0 { cancel.cancel(); } }).is_err());
+        assert!(export_library_snapshot(&Default::default(), &state, &snapshot, &query, &cancelled, &cancel, &mut |done, _| { if done > 0 { cancel.cancel(); } }).is_err());
         assert!(!cancelled.exists());
         state.settings.lock().unwrap().library_root = Some(temp.path().join("other").display().to_string());
-        assert!(export_library_snapshot(&state, &snapshot, &query, &cancelled, &CancellationToken::new(), &mut |_, _| {}).is_err());
+        assert!(export_library_snapshot(&Default::default(), &state, &snapshot, &query, &cancelled, &CancellationToken::new(), &mut |_, _| {}).is_err());
         assert!(!cancelled.exists());
         assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 2, "temporary output files are removed on every failure");
         assert_eq!(std::fs::read(dir.join("ABC-123.mp4")).unwrap(), b"video");
@@ -1454,7 +1607,7 @@ mod tests {
         state.session().plans = vec![part(1, true)];
         let (id, cancel) = state.begin_job("plan").unwrap();
         cancel.cancel();
-        assert!(publish_plans(&state, id, settings, Path::new("/library-a"), vec![part(2, true)]).is_err());
+        assert!(publish_plans(&state, id, settings, Path::new("/library-a"), vec![part(2, true)], None).is_err());
         assert_eq!(state.session().plans[0].item_id, 1);
     }
 
@@ -1464,8 +1617,8 @@ mod tests {
         let state = AppState::new(settings.clone());
         state.session().plans = vec![part(1, true)];
         let (id, _) = state.begin_job("plan").unwrap();
-        assert!(publish_plans(&state, id + 1, settings.clone(), Path::new("/library-a"), vec![part(2, true)]).is_err());
-        assert!(publish_plans(&state, id, settings, Path::new("/library-b"), vec![part(2, true)]).is_err());
+        assert!(publish_plans(&state, id + 1, settings.clone(), Path::new("/library-a"), vec![part(2, true)], None).is_err());
+        assert!(publish_plans(&state, id, settings, Path::new("/library-b"), vec![part(2, true)], None).is_err());
         assert_eq!(state.session().plans[0].item_id, 1);
     }
 
@@ -1478,7 +1631,7 @@ mod tests {
         let changed = Settings { dir_template: "{code}".into(), file_template: "{code}.{ext}".into(), ..settings.clone() };
         assert_ne!(changed, settings);
         persist_to(&state, changed, &temp.path().join("settings.json"), None).unwrap();
-        assert!(publish_plans(&state, id, settings, Path::new("/library-a"), vec![part(2, true)]).is_err());
+        assert!(publish_plans(&state, id, settings, Path::new("/library-a"), vec![part(2, true)], None).is_err());
         assert!(state.session().plans.is_empty());
     }
 
@@ -1495,7 +1648,7 @@ mod tests {
         assert!(persist_to(&state, changed, &blocked, None).is_err());
         assert_eq!(state.session().plans[0].item_id, 1);
         assert_eq!(state.settings(), settings);
-        assert_eq!(publish_plans(&state, id, settings, Path::new("/library-a"), vec![part(2, true)]).unwrap()[0].item_id, 2);
+        assert_eq!(publish_plans(&state, id, settings, Path::new("/library-a"), vec![part(2, true)], None).unwrap()[0].item_id, 2);
     }
 
     #[test]
@@ -1537,7 +1690,7 @@ mod tests {
         let preview = kiroku_core::revision::preview(&root, &root, "ABC-123", serde_json::json!({"title":"new"})).unwrap();
         let root_label = root.display().to_string();
         let state = AppState::new(Settings { library_root: Some(root_label.clone()), ..Settings::default() });
-        *state.revision.lock().unwrap() = Some(PendingRevision{token:"preview-token".into(),preview,settings:None});
+        *state.revision.lock().unwrap() = Some(PendingRevision{artwork_library:None,token:"preview-token".into(),preview,settings:None});
         assert!(!library_change(&state, Some(&root_label)).unwrap());
         assert!(state.revision.lock().unwrap().is_some());
         assert!(library_change(&state, Some("/other-library")).unwrap());
@@ -1581,12 +1734,66 @@ mod tests {
         let after = kiroku_core::refresh::select_source(&meta, "title", "javdb").unwrap();
         let preview = kiroku_core::revision::prepare(&root, &dir, "ABC-001", after).unwrap();
         *state.revision.lock().unwrap() = Some(PendingRevision {
+            artwork_library: None,
             token: "source-token".into(),
             preview,
             settings: Some(settings),
         });
         (temp, state, root.display().to_string())
     }
+    #[test]
+    fn linked_artwork_preview_binds_both_libraries_across_commit() {
+        for change in ["none", "reopened-index", "replaced-directory", "cancelled"] {
+            let temp = tempfile::tempdir().unwrap();
+            let base = temp.path().canonicalize().unwrap();
+            let active = base.join("library");
+            let source = base.join("source");
+            let code = "ABC-111";
+            let indexed = active.join(code);
+            let real = source.join(code);
+            std::fs::create_dir_all(&indexed).unwrap();
+            std::fs::create_dir(&source).unwrap();
+            let meta = kiroku_core::Metadata { code: code.into(), ..Default::default() };
+            std::fs::write(indexed.join("kiroku.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+            std::fs::write(indexed.join("movie.nfo"), "<movie><num>ABC-111</num></movie>").unwrap();
+            std::fs::write(indexed.join("ABC-111.mp4"), b"video").unwrap();
+            let lib = Library::open(&active).unwrap();
+            lib.reindex_dir(&indexed).unwrap();
+            std::fs::rename(&indexed, &real).unwrap();
+            let settings = Settings { library_root: Some(active.display().to_string()), source_dirs: vec![source.display().to_string()], ..Default::default() };
+            let state = AppState::new(settings.clone());
+            state.replace_library(Some(lib));
+            let library = state.read_snapshot().unwrap();
+            let cancel = CancellationToken::new();
+            let location = artwork_location(&state, &library, code, &settings, &cancel).unwrap();
+            assert_eq!((location.root,location.dir), (source.clone(),real.clone()));
+            let preview = kiroku_core::revision::capture(&source,&real,code).unwrap();
+            *state.revision.lock().unwrap() = Some(PendingRevision {
+                token: "crop".into(), preview, settings: Some(settings), artwork_library: Some(library),
+            });
+            match change {
+                "reopened-index" => state.replace_library(Some(Library::open(&active).unwrap())),
+                "replaced-directory" => {
+                    let old = base.join("retired");
+                    std::fs::rename(&real,&old).unwrap();
+                    std::fs::create_dir(&real).unwrap();
+                    for name in ["kiroku.json","movie.nfo","ABC-111.mp4"] {
+                        std::fs::copy(old.join(name), real.join(name)).unwrap();
+                    }
+                }
+                "cancelled" => cancel.cancel(),
+                _ => {}
+            }
+            let result = commit_revision(&state, "crop", active.to_str().unwrap(), code, &cancel, |preview| {
+                assert_eq!(preview.root,source);
+                assert_eq!(preview.dir,real);
+                Ok(())
+            });
+            assert_eq!(result.is_ok(), change == "none", "{change}");
+            assert!(!indexed.exists());
+        }
+    }
+
     #[test]
     fn source_revision_save_rejects_same_library_changed_settings_without_writes() {
         for changed_field in ["base", "cookie", "proxy", "route", "enabled"] {
@@ -1614,6 +1821,7 @@ mod tests {
                     "source-token",
                     &root,
                     "ABC-001",
+                    &CancellationToken::new(),
                     kiroku_core::revision::apply
                 )
                 .is_err(),
@@ -1639,7 +1847,7 @@ mod tests {
             let state_ref = &state;
             let root_ref = &root;
             let save = scope.spawn(move || {
-                commit_revision(state_ref, "source-token", root_ref, "ABC-001", |preview| {
+                commit_revision(state_ref, "source-token", root_ref, "ABC-001", &CancellationToken::new(), |preview| {
                     entered_tx.send(()).unwrap();
                     release_rx.recv().unwrap();
                     kiroku_core::revision::apply(preview)
@@ -1690,6 +1898,7 @@ mod tests {
             "source-token",
             &root,
             "ABC-001",
+            &CancellationToken::new(),
             kiroku_core::revision::apply
         )
         .is_ok());
@@ -1738,13 +1947,16 @@ pub async fn revision_preview(
     let result = tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
         let detail = with_lib(&state, |lib| lib.get(&code))?.ok_or("影片不在媒体库中")?;
+        let update_version = patch.get("artwork_phase").is_some();
         let preview = kiroku_core::revision::preview(&root, Path::new(&detail.dir), &code, patch)
             .map_err(|e| e.to_string())?;
         let settings = state.settings();
-        let preview = kiroku_core::artwork::revise_phase(preview, &settings).map_err(|e| e.to_string())?;
+        let preview = if update_version {
+            kiroku_core::artwork::revise_phase(preview, &settings).map_err(|e| e.to_string())?
+        } else { preview };
         let token = id.to_string();
         *state.revision.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some(PendingRevision{token:token.clone(),preview:preview.clone(),settings:Some(settings)});
+            Some(PendingRevision{artwork_library:None,token:token.clone(),preview:preview.clone(),settings:Some(settings)});
         Ok(RevisionPreview { token, preview })
     })
     .await
@@ -1752,11 +1964,36 @@ pub async fn revision_preview(
     drop(guard);
     result
 }
+fn artwork_location(
+    state: &AppState, library: &crate::state::LibraryReadSnapshot,
+    code: &str, settings: &Settings, cancel: &CancellationToken,
+) -> CmdResult<kiroku_core::library::ArtworkLocation> {
+    let dir = with_read_snapshot(state, library, |reader| Ok(reader.get(code)?.map(|detail| detail.dir)))?
+        .ok_or("影片已不在媒体库中")?;
+    let location = kiroku_core::library::resolve_artwork_location(
+        library.handle.root(), Path::new(&dir), code, &settings.source_dirs, cancel,
+    ).map_err(|error| error.to_string())?;
+    state.validate_read(library)?;
+    Ok(location)
+}
+
+fn validate_artwork_location(
+    state: &AppState, library: &crate::state::LibraryReadSnapshot,
+    preview: &kiroku_core::revision::Preview, settings: &Settings, cancel: &CancellationToken,
+) -> CmdResult<()> {
+    let current = artwork_location(state, library, &preview.code, settings, cancel)?;
+    if current.root != preview.root || current.dir != preview.dir {
+        return Err("影片来源目录已变化，请重新打开裁剪".into());
+    }
+    preview.verify_location().map_err(|e| e.to_string())
+}
+
 fn commit_revision<T>(
     state: &AppState,
     token: &str,
     root: &str,
     code: &str,
+    cancel: &CancellationToken,
     apply: impl FnOnce(&kiroku_core::revision::Preview) -> std::io::Result<T>,
 ) -> CmdResult<(kiroku_core::revision::Preview, T)> {
     // Keep settings persistence outside the final identity-check / file-commit interval.
@@ -1764,13 +2001,8 @@ fn commit_revision<T>(
         .settings_writer
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let pending = state
-        .revision
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take()
-        .filter(|p| p.token == token)
-        .ok_or("预览已过期，请重新预览")?;
+    let pending = state.revision.lock().unwrap_or_else(|e| e.into_inner())
+        .take_if(|p| p.token == token).ok_or("预览已过期，请重新预览")?;
     if pending
         .settings
         .as_ref()
@@ -1779,21 +2011,20 @@ fn commit_revision<T>(
         return Err("设置已变化，预览已过期，请重新预览".into());
     }
     let preview = pending.preview;
-    let current_root = state.library_root().ok_or("请先设置媒体库")?;
-    if current_root.canonicalize().map_err(|e| e.to_string())? != preview.root
-        || Path::new(root) != preview.root
-        || code != preview.code
-    {
+    let current_root = state.library_root().ok_or("请先设置媒体库")?.canonicalize().map_err(|e| e.to_string())?;
+    if Path::new(root) != current_root || code != preview.code {
         return Err("预览的媒体库或番号不匹配".into());
     }
-    let detail = with_lib(state, |lib| lib.get(code))?.ok_or("影片已不在媒体库中")?;
-    if Path::new(&detail.dir)
-        .canonicalize()
-        .map_err(|e| e.to_string())?
-        != preview.dir
-    {
-        return Err("影片目录已变化，请重新预览".into());
+    if let Some(library) = &pending.artwork_library {
+        validate_artwork_location(state, library, &preview, &state.settings(), cancel)?;
+    } else {
+        if current_root != preview.root { return Err("预览的媒体库不匹配".into()) }
+        let detail = with_lib(state, |lib| lib.get(code))?.ok_or("影片已不在媒体库中")?;
+        if Path::new(&detail.dir).canonicalize().map_err(|e| e.to_string())? != preview.dir {
+            return Err("影片目录已变化，请重新预览".into());
+        }
     }
+    if cancel.is_cancelled() { return Err("已取消".into()) }
     let outcome = apply(&preview).map_err(|e| e.to_string())?;
     Ok((preview, outcome))
 }
@@ -1806,20 +2037,38 @@ pub async fn revision_save(
     root: String,
     code: String,
 ) -> CmdResult<RevisionResult> {
-    let (id, _) = state.begin_job("revision-save")?;
+    let (id, cancel) = state.begin_job("revision-save")?;
     let guard = JobGuard {
         app: app.clone(),
         id,
     };
     let result = tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let (preview, out) = commit_revision(&state, &token, &root, &code, kiroku_core::revision::apply)?;
-        let index_error = reindex(&app, &[preview.dir]).err();
+        let active_root = Path::new(&root);
+        let (preview, out) = commit_revision(&state, &token, &root, &code, &cancel, |preview| {
+            if active_root != preview.root {
+                crate::linked_artwork::register(active_root, &preview.root, &preview.dir, &preview.code)
+                    .map_err(std::io::Error::other)?;
+            }
+            kiroku_core::revision::apply(preview)
+        })?;
+        let index_error = if preview.root == active_root {
+            reindex(&app, &[preview.dir]).err()
+        } else {
+            let result = crate::linked_artwork::note_journal(active_root, &preview.root, &preview.dir, &code, &out.journal.id);
+            emit(&app, "library:changed", id, serde_json::json!({}));
+            result.err()
+        };
+        let journal_id = if preview.root == active_root {
+            out.journal.id
+        } else {
+            crate::linked_artwork::history_id(&out.journal.id)
+        };
         Ok(RevisionResult {
             job_id: id,
             root,
             code,
-            journal_id: out.journal.id,
+            journal_id,
             error: out.error,
             index_error,
         })
@@ -1962,7 +2211,7 @@ pub async fn metadata_update_preview(
         }
         let token = id.to_string();
         *state.revision.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some(PendingRevision{token:token.clone(),preview:preview.clone(),settings:Some(settings)});
+            Some(PendingRevision{artwork_library:None,token:token.clone(),preview:preview.clone(),settings:Some(settings)});
         Ok(RevisionPreview { token, preview })
     })
     .await
@@ -2025,15 +2274,13 @@ pub async fn artwork_open(
         id,
     };
     let settings = state.settings();
-    let root = state.library_root().ok_or("请先设置媒体库")?;
-    let (a, r, c) = (app.clone(), root.clone(), code.clone());
+    let library = state.read_snapshot()?;
+    let (a, current, c, config, stop) = (app.clone(), library.clone(), code, settings.clone(), cancel.clone());
     let captured = tauri::async_runtime::spawn_blocking(move || -> CmdResult<_> {
         let state = a.state::<AppState>();
-        let detail = with_lib(&state, |lib| lib.get(&c))?.ok_or("影片不在媒体库中")?;
-        kiroku_core::revision::capture(&r, Path::new(&detail.dir), &c).map_err(|e| e.to_string())
-    })
-    .await
-    .map_err(|e| e.to_string())??;
+        let location = artwork_location(&state, &current, &c, &config, &stop)?;
+        kiroku_core::revision::capture(&location.root, &location.dir, &c).map_err(|e| e.to_string())
+    }).await.map_err(|e| e.to_string())??;
     let snapshot = captured.clone();
     let initial_poster = tauri::async_runtime::spawn_blocking(move || {
         kiroku_core::assets::Paths::for_movie(&snapshot.dir, &snapshot.before)
@@ -2143,9 +2390,8 @@ pub async fn artwork_open(
         if cancel.is_cancelled() {
             return Err("已取消".into());
         }
-        if state.settings() != settings || state.library_root() != Some(root) {
-            return Err("媒体库或设置已变化".into());
-        }
+        if state.settings() != settings { return Err("媒体库或设置已变化".into()) }
+        validate_artwork_location(&state, &library, &original.captured, &settings, &cancel)?;
         if kiroku_core::revision::snapshot_file(
             &original.captured.root,
             &kiroku_core::assets::Paths::for_movie(&original.captured.dir, &original.captured.before).map_err(|e| e.to_string())?.poster,
@@ -2163,7 +2409,7 @@ pub async fn artwork_open(
         let token = id.to_string();
         let out = ArtworkOriginal {
             token: token.clone(),
-            root: original.captured.root.display().to_string(),
+            root: library.handle.root().canonicalize().map_err(|e| e.to_string())?.display().to_string(),
             code: original.captured.code.clone(),
             width,
             height,
@@ -2173,6 +2419,7 @@ pub async fn artwork_open(
         };
         *state.artwork.lock().unwrap_or_else(|e| e.into_inner()) =
             Some(crate::state::PendingArtwork {
+                library,
                 token,
                 original,
                 settings,
@@ -2212,17 +2459,11 @@ pub async fn artwork_preview(
             .as_ref()
             .filter(|p| p.token == token)
             .ok_or("原图已过期，请重新打开裁剪")?;
-        if p.settings != state.settings()
-            || Path::new(&root) != p.original.captured.root
-            || code != p.original.captured.code
-            || state
-                .library_root()
-                .and_then(|p| p.canonicalize().ok())
-                .as_ref()
-                != Some(&p.original.captured.root)
-        {
+        if p.settings != state.settings() || code != p.original.captured.code ||
+            Path::new(&root) != p.library.handle.root().canonicalize().map_err(|e| e.to_string())? {
             return Err("原图媒体库或设置已变化".into());
         }
+        validate_artwork_location(&state, &p.library, &p.original.captured, &p.settings, &cancel)?;
         let stamp = p
             .settings
             .badges
@@ -2237,15 +2478,21 @@ pub async fn artwork_preview(
             .original
             .preview(crop, stamp.as_ref())
             .map_err(|e| e.to_string())?;
+        let mut preview = if p.settings.plex.naming || p.settings.plex.enabled {
+            preview.with_plex_poster().map_err(|e| e.to_string())?
+        } else { preview };
         if cancel.is_cancelled() {
             return Err("已取消".into());
         }
         let token = id.to_string();
         *state.revision.lock().unwrap_or_else(|e| e.into_inner()) = Some(PendingRevision {
+            artwork_library: Some(p.library.clone()),
             token: token.clone(),
             preview: preview.clone(),
             settings: Some(p.settings.clone()),
         });
+        // The public token belongs to the currently open library. Its server-side copy retains the verified write root.
+        preview.root = PathBuf::from(root);
         Ok(ArtworkPreview {
             revision: RevisionPreview { token, preview },
             image,
@@ -2342,8 +2589,74 @@ pub async fn nfo_export_apply(app:AppHandle,state:State<'_,AppState>,token:Strin
 }
 
 #[tauri::command]
-pub async fn recovery_inspect(app:AppHandle,state:State<'_,AppState>)->CmdResult<kiroku_core::recovery::Report>{
- let root=state.library_root().ok_or("请先设置媒体库")?;
- let(id,cancel)=state.begin_job("recovery-check")?;let _guard=JobGuard{app,id};
- tauri::async_runtime::spawn_blocking(move||kiroku_core::recovery::inspect(&root,&cancel).map_err(|e|e.to_string())).await.map_err(|e|e.to_string())?
+pub async fn recovery_inspect(state: State<'_, AppState>) -> CmdResult<kiroku_core::recovery::Report> {
+    let snapshot = state.history_snapshot()?;
+    let mut reads = state.journal_reads();
+    loop {
+        let cancel = reads.wait_for(Option::is_some).await.map_err(|e| e.to_string())?
+            .as_ref().expect("journal reads allowed").clone();
+        state.validate_history(&snapshot)?;
+        let root = snapshot.root.clone();
+        let read_cancel = cancel.clone();
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            kiroku_core::recovery::inspect(&root, &read_cancel)
+        }).await.map_err(|e| e.to_string())?;
+        if cancel.is_cancelled() {
+            continue;
+        }
+        state.validate_history(&snapshot)?;
+        return result.map_err(|e| e.to_string());
+    }
 }
+
+
+#[tauri::command]
+pub async fn recovery_preserve(app: AppHandle, state: State<'_, AppState>, root: String, journal_id: String, request_id: Option<String>) -> CmdResult<kiroku_core::recovery::PreserveResult> {
+    let current = state.library_root().ok_or("请先设置媒体库目录")?;
+    if current != PathBuf::from(&root) { return Err("媒体库已变化，请重新核对".into()); }
+    let (id, cancel) = reliability::begin_reported_job(&state, "recovery-preserve", request_id, |id, request_id| {
+        emit(&app, "job:started", id, serde_json::json!({"requestId":request_id}));
+    })?;
+    let _guard = JobGuard { app: app.clone(), id };
+    if state.library_root().as_ref()!=Some(&current){return Err("媒体库已变化，请重新核对".into())}
+    let worker = app.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        let state = worker.state::<AppState>();
+        let writer = state.lib();
+        let library = writer.as_ref().ok_or("媒体库索引尚未打开")?;
+        kiroku_core::recovery::preserve_with_index(&current, &journal_id, &cancel, Some(library), &mut |progress| {
+            emit(&worker, "recovery:progress", id, serde_json::json!({
+                "root": current.to_string_lossy(), "stage": progress.stage, "done": progress.done,
+                "total": progress.total, "elapsedMs": progress.elapsed_ms,
+            }));
+        }).map_err(|e| e.to_string())
+    }).await.map_err(|e|e.to_string())??;
+    emit(&app, "library:changed", id, serde_json::json!({"root":root}));
+    Ok(result)
+}
+
+
+#[tauri::command]
+pub async fn nas_status() -> CmdResult<kiroku_core::nas_ops::Status> {
+    tauri::async_runtime::spawn_blocking(kiroku_core::nas_ops::status).await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn nas_diagnose(app: AppHandle, state: State<'_, AppState>, request_id: Option<String>) -> CmdResult<kiroku_core::nas_ops::Status> {
+    let (id, cancel) = reliability::begin_reported_job(&state, "nas-diagnose", request_id, |id, request_id| {
+        emit(&app, "job:started", id, serde_json::json!({"requestId":request_id}));
+    })?;
+    let _guard = JobGuard { app, id };
+    tauri::async_runtime::spawn_blocking(move || kiroku_core::nas_ops::diagnose(&|| cancel.is_cancelled()).map_err(|e| e.to_string())).await.map_err(|e|e.to_string())?
+}
+
+
+#[tauri::command]
+pub async fn import_cache_usage(app: AppHandle, state: State<'_,AppState>, request_id: Option<String>) -> CmdResult<kiroku_core::import_cache::CacheUsage> {
+    let (id,cancel)=reliability::begin_reported_job(&state,"cache-usage",request_id,|id,request_id|emit(&app,"job:started",id,serde_json::json!({"requestId":request_id})))?;
+    let _guard=JobGuard{app,id};
+    tauri::async_runtime::spawn_blocking(move||kiroku_core::import_cache::ImportCache::new(kiroku_core::import_cache::cache_path(&Settings::default_path())).usage(&cancel).map_err(|e|e.to_string())).await.map_err(|e|e.to_string())?
+}
+
+pub mod package_restore;
+pub mod supplement;

@@ -24,6 +24,10 @@ export function cleanQuery(raw: unknown): Query {
   }
 }
 export const defaultBrowser = (): BrowserState => ({ query: cleanQuery({}), layout: 'posters', density: 'comfortable', posterScale: 100, gridMode: false, columns: 4, visibleRows: 2, scroll: 0, saved: [], recent: [] })
+export function filterCount(query: Query): number {
+  return Number(!!query.contentType) + Number(query.year !== undefined) + Number(query.minScore !== undefined)
+    + Number(!!query.missing) + (query.filters?.length ?? 0)
+}
 function records(): Record<string, unknown> {
   try { const raw = JSON.parse(localStorage.getItem(KEY) ?? '{}'); return raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {} } catch { return {} }
 }

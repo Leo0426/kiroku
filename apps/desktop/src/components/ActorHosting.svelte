@@ -1,5 +1,6 @@
 <script lang="ts">
   import Icon from './Icon.svelte'
+  import ActorAvatar from './ActorAvatar.svelte'
  import {onDestroy,untrack} from 'svelte'
  import {api} from '../lib/api'
  import {app} from '../lib/state.svelte'
@@ -33,20 +34,33 @@
  <button class="btn" aria-expanded={opened} disabled={busy} onclick={()=>opened=!opened}><Icon name="image" size={15}/>演员头像<Icon name="chevron-down" size={16}/></button>
  {#if opened}
  <div class="tool-content">
- <p>为 Plex NFO 发布可直接读取的头像地址，保留原站头像记录。</p>
+ <p>发布后，kiroku 优先读取头像缓存，Plex 用 NFO 中的头像链接。</p>
  {#if !app.settings?.actor_hosting.enabled}<p>请先到设置 → 媒体服务器 → 演员头像托管，填写保存目录与 NAS 主机名 URL 前缀并保存。</p>{:else}
  <p class="path">保存目录：{app.settings.actor_hosting.directory}<br/>URL 前缀：{app.settings.actor_hosting.base_url}</p>
  <p>预览只下载到内存。确认后写入缓存及 NFO；没有头像的演员会跳过，下载失败时不保存。</p>
- <button class="btn" disabled={busy} onclick={inspect}>{busy?'处理中…':'预览头像发布'}</button>
- {#if busy&&task}<button class="btn" onclick={()=>task?.cancel()}>取消头像下载</button>{/if}
+ <div class="tool-actions start">
+  <button class="btn" disabled={busy} onclick={inspect}>{busy?'处理中…':'预览头像发布'}</button>
+  {#if busy&&task}<button class="btn" onclick={()=>task?.cancel()}>取消头像下载</button>{/if}
+ </div>
  {/if}
  {#if preview}
  <div aria-label="头像发布预览">
- {#each preview.after.actors as actor}{#if actor.thumb && preview.after.hosted_actor_images?.[actor.thumb]}<p class="path">{actor.name} → {preview.after.hosted_actor_images[actor.thumb].url}</p>{/if}{/each}
+ <ul class="previews">
+  {#each preview.after.actors as actor}
+   {#if actor.thumb && preview.after.hosted_actor_images?.[actor.thumb]}
+    <li>
+     <ActorAvatar code={meta.code} url={actor.thumb} libraryRoot={app.settings?.library_root} revisionToken={preview.token} size={44} placeholder />
+     <div><strong>{actor.name}</strong><p class="path">{preview.after.hosted_actor_images[actor.thumb].url}</p></div>
+    </li>
+   {/if}
+  {/each}
+ </ul>
  {#each preview.warnings??[] as warning}<p>{warning}</p>{/each}
  <p>头像缓存可被多部影片共用，撤销时不会删除。请确保 URL 前缀对应保存目录。</p>
- <button class="btn primary" disabled={busy} onclick={save}>确认发布头像</button>
- <button class="btn" disabled={busy} onclick={()=>preview=null}>放弃预览</button>
+ <div class="tool-actions">
+  <button class="btn primary" disabled={busy} onclick={save}>确认发布头像</button>
+  <button class="btn" disabled={busy} onclick={()=>preview=null}>放弃预览</button>
+ </div>
  </div>
  {/if}
  {#if message}<p role="status">{message}</p>{/if}
@@ -56,4 +70,11 @@
  </div>
  {/if}
 </section>
-<style>p{font-size:var(--fs-sm);margin:12px 0}.path{overflow-wrap:anywhere}button{margin:4px 4px 4px 0}</style>
+<style>
+ p { font-size: var(--fs-sm); margin: var(--s3) 0; }
+ .path { overflow-wrap: anywhere; }
+ .previews { display: grid; gap: var(--s2); padding: 0; list-style: none; }
+ .previews li { display: flex; align-items: center; gap: var(--s3); padding: var(--s2); border: 1px solid var(--line); border-radius: var(--r-sm); }
+ .previews li p { margin: var(--s1) 0 0; color: var(--text-2); }
+ button { margin: var(--s1) var(--s1) var(--s1) 0; }
+</style>

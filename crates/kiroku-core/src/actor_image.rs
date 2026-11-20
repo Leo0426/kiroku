@@ -2,12 +2,16 @@
 use crate::net::Http;
 use std::io::{self, Cursor};
 
+pub(crate) fn validate_url(url: &str) -> io::Result<()> {
+    match reqwest::Url::parse(url) {
+        Ok(parsed) if matches!(parsed.scheme(), "http" | "https") && parsed.has_host() => Ok(()),
+        _ => Err(io::Error::other("演员头像网址必须是有效的 HTTP 或 HTTPS 地址")),
+    }
+}
+
 /// Return a small, decoded PNG. Never pass an upstream HTML error page to the UI.
 pub async fn fetch(http: &Http, url: &str) -> io::Result<Vec<u8>> {
-    let parsed = reqwest::Url::parse(url).map_err(|_| io::Error::other("头像地址无效"))?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        return Err(io::Error::other("头像地址必须使用 HTTP 或 HTTPS"));
-    }
+    validate_url(url)?;
     let (status, bytes) = http.get_image_bytes(url, 8 * 1024 * 1024).await
         .map_err(|_| io::Error::other("头像下载失败"))?;
     if !(200..300).contains(&status) {
@@ -16,7 +20,7 @@ pub async fn fetch(http: &Http, url: &str) -> io::Result<Vec<u8>> {
     tokio::task::spawn_blocking(move || thumbnail(&bytes)).await.map_err(io::Error::other)?
 }
 
-fn thumbnail(bytes: &[u8]) -> io::Result<Vec<u8>> {
+pub(crate) fn thumbnail(bytes: &[u8]) -> io::Result<Vec<u8>> {
     use image::ImageDecoder;
     let mut reader = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
     let mut limits = image::Limits::default();

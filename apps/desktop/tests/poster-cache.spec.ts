@@ -196,3 +196,118 @@ test('asset URLs preserve escaped paths and inline images while replacing only t
   expect(result.absent).toBeNull()
   expect(result.blob).toBe('blob:test')
 })
+
+test('missing originals display a labeled preview in the wall, list and detail until a refresh restores the original', async ({ page }) => {
+  await seedLibrary(page)
+  let restored = false
+  await page.route('**/image-test/**', async route => {
+    const kind = new URL(route.request().url()).pathname.split('/').pop()
+    if (kind === 'preview' || (restored && kind === 'poster')) {
+      await route.fulfill({ contentType: 'image/svg+xml', body: '<svg xmlns="http://www.w3.org/2000/svg" width="4" height="6"/>' })
+    } else await route.fulfill({ status:404, body:'' })
+  })
+  await overrideApi(page, `
+    const list=api.libraryList, get=api.libraryGet;
+    const image=location.origin+'/image-test/';
+    const patch=m=>({...m,poster:image+'poster',posterVersion:'v-one'});
+    api.libraryList=async q=>{const p=await list(q);return {...p,total:1,items:p.items.slice(0,1).map(patch)}};
+    api.libraryGet=async code=>({...patch(await get(code)),fanart:image+'fanart',files:[]});
+    window.cacheReads=[];
+    api.cachedPoster=async (code,v)=>{window.cacheReads.push([code,v]);return image+'preview'};
+    api.libraryPruneMissing=async root=>({root,removed:0,skipped:false});
+  `)
+  await page.goto('/')
+  const card = page.locator('button.pcard').first()
+  await expect(card).toContainText('缓存海报')
+  await expect(card.locator('img')).toHaveAttribute('src', /image-test\/preview/)
+  await page.getByLabel('列表视图', {exact:true}).click()
+  await expect(card).toContainText('缓存海报')
+  await card.click()
+  const panel = page.getByRole('complementary', {name:'影片详情'})
+  await expect(panel).toContainText('缓存海报')
+  await expect(panel.locator('.hero-img')).toHaveAttribute('src', /image-test\/preview/)
+  await expect(panel.getByRole('button', {name:'播放',exact:true})).toBeDisabled()
+  expect(await page.evaluate(() => (window as any).cacheReads.length)).toBe(1)
+  await panel.getByRole('button', {name:'关闭详情'}).click()
+  restored = true
+  await page.getByRole('button', {name:'刷新媒体库',exact:true}).click()
+  await expect(card).not.toContainText('缓存海报')
+  await expect(card.locator('img.ready')).toHaveAttribute('src', /image-test\/poster/)
+})
+
+test('retired preview lookups cannot replace a newer image or leak between libraries', async ({ page }) => {
+  await seedLibrary(page)
+  await page.route('**/revision-test/**', async route => {
+    if (route.request().url().includes('new')) await route.fulfill({contentType:'image/svg+xml',body:'<svg xmlns="http://www.w3.org/2000/svg" width="4" height="6"/>'})
+    else await route.fulfill({status:404,body:''})
+  })
+  await overrideApi(page, `
+    const list=api.libraryList;
+    window.rev='old'; window.lookups=[];
+    api.libraryList=async q=>{const p=await list(q);return {...p,total:1,items:p.items.slice(0,1).map(m=>({...m,poster:location.origin+'/revision-test/'+window.rev,posterVersion:window.rev}))}};
+    api.cachedPoster=(code,v)=>new Promise(resolve=>window.lookups.push({v,resolve}));
+  `)
+  await page.goto('/')
+  await expect.poll(() => page.evaluate(() => (window as any).lookups.length)).toBe(1)
+  await page.evaluate(async () => {
+    const {app}=await import('/src/lib/state.svelte.ts')
+    ;(window as any).rev='new'
+    app.libraryVersion++
+  })
+  const image = page.locator('button.pcard img.ready').first()
+  await expect(image).toHaveAttribute('src', /revision-test\/new/)
+  await page.evaluate(() => (window as any).lookups[0].resolve('/revision-test/wrong'))
+  await expect(image).toHaveAttribute('src', /revision-test\/new/)
+  await page.evaluate(async () => {
+    const {app}=await import('/src/lib/state.svelte.ts')
+    ;(window as any).rev='old'
+    app.settings={...app.settings!,library_root:'/mock/other-library'}
+  })
+  await expect.poll(() => page.evaluate(() => (window as any).lookups.length)).toBe(2)
+})
+
+test('visible native assets warm at most two previews together and reuse the same revisions', async ({ page }) => {
+  await seedLibrary(page)
+  await page.route('http://asset.localhost/**', route => route.fulfill({
+    contentType:'image/svg+xml', body:'<svg xmlns="http://www.w3.org/2000/svg" width="4" height="6"/>',
+  }))
+  await overrideApi(page, `
+    const list=api.libraryList;
+    api.libraryList=async q=>{const p=await list(q);return {...p,total:4,items:p.items.slice(0,4).map((m,i)=>({...m,poster:'http://asset.localhost/native/'+i,posterVersion:'r1'}))}};
+    window.warming={calls:0,active:0,max:0};
+    api.cachedPoster=async (code,v)=>{
+      const state=window.warming;
+      state.calls++;state.active++;state.max=Math.max(state.max,state.active);
+      await new Promise(r=>setTimeout(r,75));
+      state.active--;return 'http://asset.localhost/preview/'+code;
+    };
+  `)
+  await page.goto('/')
+  await expect(page.locator('button.pcard img.ready')).toHaveCount(4)
+  await expect.poll(() => page.evaluate(() => (window as any).warming)).toEqual({calls:4,active:0,max:2})
+  await page.getByRole('navigation').getByRole('button', {name:'历史',exact:true}).click()
+  await page.getByRole('navigation').getByRole('button', {name:'媒体库',exact:true}).click()
+  await expect(page.locator('button.pcard img.ready')).toHaveCount(4)
+  expect(await page.evaluate(() => (window as any).warming.calls)).toBe(4)
+})
+
+test('an unreadable cached preview stops at the retry action', async ({ page }) => {
+  await seedLibrary(page)
+  const paths: string[] = []
+  await page.route('**/unreadable/**', async route => {
+    paths.push(new URL(route.request().url()).pathname)
+    await route.fulfill({status:404,body:''})
+  })
+  await overrideApi(page, `
+    const list=api.libraryList;
+    api.libraryList=async q=>{const p=await list(q);return {...p,total:1,items:p.items.slice(0,1).map(m=>({...m,code:'DEMO-001',poster:location.origin+'/unreadable/original',posterVersion:'one'}))}};
+    api.cachedPoster=async()=>location.origin+'/unreadable/cache';
+  `)
+  await page.goto('/')
+  const retry = page.getByRole('button', {name:'重试 DEMO-001 的海报'})
+  await expect(retry).toBeVisible()
+  expect(paths).toEqual(['/unreadable/original','/unreadable/cache'])
+  await retry.click()
+  await expect(page.getByRole('status', {name:'仍无法读取 DEMO-001 的海报'})).toBeVisible()
+  expect(paths).toEqual(['/unreadable/original','/unreadable/cache','/unreadable/original','/unreadable/cache'])
+})

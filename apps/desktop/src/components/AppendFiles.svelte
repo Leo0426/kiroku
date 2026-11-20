@@ -52,17 +52,32 @@
  <div class="tool-content" hidden={!(!collapsed && (opened || notice || error))}>
  {#if opened && !collapsed}
  <h3>追加视频或字幕</h3><p>保留现有元数据和海报</p>
- <select class="input" aria-label="追加目标目录" value={target} onchange={e=>chooseTarget(e.currentTarget.value)} disabled={busy}><option value="">选择已有影片目录</option>{#each targets as dir}<option value={dir}>{dir}</option>{/each}</select>
- <select class="input" aria-label="字幕目标视频" value={video} onchange={e=>chooseVideo(e.currentTarget.value)} disabled={busy}><option value="">按字幕番号和分片自动匹配</option>{#each videos as v}<option value={v}>{v}</option>{/each}</select>
- <button class="btn" onclick={()=>pick()} disabled={busy}>选择文件</button><button class="btn" onclick={()=>pick(true)} disabled={busy}>选择追加文件夹</button>
+ <div class="tool-fields">
+  <label class="tool-field">追加目标目录<select class="input" aria-label="追加目标目录" value={target} onchange={e=>chooseTarget(e.currentTarget.value)} disabled={busy}><option value="">选择已有影片目录</option>{#each targets as dir}<option value={dir}>{dir}</option>{/each}</select></label>
+  <label class="tool-field">字幕目标视频<select class="input" aria-label="字幕目标视频" value={video} onchange={e=>chooseVideo(e.currentTarget.value)} disabled={busy}><option value="">按字幕番号和分片自动匹配</option>{#each videos as v}<option value={v}>{v}</option>{/each}</select></label>
+ </div>
+ <div class="tool-actions start">
+  <button class="btn" onclick={()=>pick()} disabled={busy}>选择文件</button>
+  <button class="btn" onclick={()=>pick(true)} disabled={busy}>选择追加文件夹</button>
+ </div>
  {#each inputs as input}<p class="muted">{input}</p>{/each}
- <button class="btn" onclick={inspect} disabled={busy||!inputs.length||!target}>预览追加</button>
- {#if preview}{#each preview.ops as op}<p>{Object.values(op)[0]?.from} → {Object.values(op)[0]?.to}</p>{/each}{#each preview.skipped as reason}<p>{reason}</p>{/each}{#each preview.conflicts as conflict}<p role="alert">{conflict}</p>{/each}<button class="btn primary" onclick={save} disabled={busy||!preview.ops.length||!!preview.conflicts.length}>确认追加</button>{/if}
- {#if result}<p role="status">{result.cancelled?'追加已取消':'追加完成'}：{result.completed} 个文件</p>{#each result.failed as failure}<p role="alert">{failure}</p>{/each}{#if result.completed}<button class="btn" onclick={undo} disabled={busy}>撤销本次追加</button>{/if}{/if}
- {#if busy&&task}<button class="btn" onclick={()=>task?.cancel()}>取消追加任务</button>{/if}
- <button class="btn ghost" onclick={()=>{opened=false;preview=null}} disabled={busy}>关闭追加</button>
+ {#if preview}
+  {#each preview.ops as op}<p>{Object.values(op)[0]?.from} → {Object.values(op)[0]?.to}</p>{/each}
+  {#each preview.skipped as reason}<p>{reason}</p>{/each}
+  {#each preview.conflicts as conflict}<p role="alert">{conflict}</p>{/each}
+ {/if}
+ {#if result}
+  <p role="status">{result.cancelled?'追加已取消':'追加完成'}：{result.completed} 个文件</p>
+  {#each result.failed as failure}<p role="alert">{failure}</p>{/each}
+ {/if}
+ <div class="tool-actions">
+  <button class="btn" onclick={inspect} disabled={busy||!inputs.length||!target}>预览追加</button>
+  {#if preview}<button class="btn primary" onclick={save} disabled={busy||!preview.ops.length||!!preview.conflicts.length}>确认追加</button>{/if}
+  {#if result?.completed}<button class="btn" onclick={undo} disabled={busy}>撤销本次追加</button>{/if}
+  {#if busy&&task}<button class="btn" onclick={()=>task?.cancel()}>取消追加任务</button>{/if}
+  <button class="btn ghost" onclick={()=>{opened=false;preview=null}} disabled={busy}>关闭追加</button>
+ </div>
  {/if}
  {#if notice && !collapsed}<p role="status">{notice}</p>{/if}{#if error && !collapsed}<p role="alert">{error}</p>{/if}
 </div>
 </section>
-<style>section{margin:0}p{overflow-wrap:anywhere}button{margin:4px 4px 4px 0}select{max-width:100%}</style>

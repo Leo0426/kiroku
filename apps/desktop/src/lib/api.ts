@@ -1,8 +1,10 @@
+import {nativePackageExport, type PackageExportApi} from './package-export'
+import type {CsvOptions,RestoreRules,RestoreReview} from './types'
 import { inTauri } from './events'
 import { assetUrl } from './asset-url'
 import type {
   HistoryRequestId, HistoryPage, HistoryPageRequest,
-  RecoveryReport,
+  RecoveryReport, PreserveResult, NasStatus, CacheUsage,
   CatalogInventory, CatalogPreview, CatalogResult,
   AppendPreview, AppendResult, SourceCheck, HealthReport, MaintenancePreview, MaintenanceResult,
   RevisionPreview, ArtworkOriginal, ArtworkPreview, CropBox,
@@ -15,21 +17,29 @@ import type {
   Facets,
   JournalSummary,
   MediaDirs,
+  MediaPickerPurpose,
   MovieDetail,
   Page,
   PendingList, PendingSummary,
-  PlanItem,
+  PlanItem, ImportRules,
   PlexTest, MediaServerCfg, ServerTest,
   Query,
   RollbackResult,
-  ScanItem,
+  ScanCodeUpdate,
   Settings,
   TrashResult, LibraryPruned,
 } from './types'
 
 /** 后端能力的统一接口。Tauri 里走 invoke,浏览器里走 mock 引擎(便于不启动桌面壳就预览/验证界面)。 */
-export interface Api {
+export interface Api extends PackageExportApi {
+  supplementPreview(code:string, itemId?:number, requestId?:string):Promise<import('./types').SupplementReview>
+  supplementApply(token:string, kinds:import('./types').SupplementKind[], requestId?:string):Promise<import('./types').SupplementResult>
+  packageRestorePreview(directory:string,rules:RestoreRules,requestId?:string):Promise<RestoreReview>
+  packageRestoreApply(token:string,codes:string[],requestId?:string):Promise<LanguageBatchResult>
+  nasStatus():Promise<NasStatus>
+  nasDiagnose(requestId?:string):Promise<NasStatus>
   recoveryInspect():Promise<RecoveryReport>
+  recoveryPreserve(root:string,journalId:string,requestId?:string):Promise<PreserveResult>
   catalogInventory(requestId?:string):Promise<CatalogInventory>
   catalogPreview(dirs:string[],requestId?:string):Promise<CatalogPreview>
   catalogApply(token:string,requestId?:string):Promise<CatalogResult>
@@ -38,7 +48,7 @@ export interface Api {
   libraryHealth(requestId?:string):Promise<HealthReport>
   revealLibraryPath(path:string):Promise<void>
   sourcesCheck(ids?:string[], draft?:Settings, requestId?:string):Promise<SourceCheck[]>
-  pickMediaFiles():Promise<string[]>
+  pickMediaFiles(purpose?: MediaPickerPurpose): Promise<string[]>
   appendTargetVideos(code:string,target:string,requestId?:string):Promise<string[]>
   appendTargets(code:string,requestId?:string):Promise<string[]>
   appendPreview(code:string,inputs:string[],target?:string,video?:string,requestId?:string):Promise<AppendPreview>
@@ -64,6 +74,7 @@ export interface Api {
   clearTranslationCache(): Promise<void>
   /** 清空可重建的抓取信息和图片缓存，不改动媒体文件 */
   clearImportCache(): Promise<void>
+  importCacheUsage(requestId?:string):Promise<CacheUsage>
   /** 长任务结束的系统通知;设置关闭或窗口在前台时不发,返回是否发出 */
   notifyFinish(title: string, body: string): Promise<boolean>
   /** 把内置标签译名并入(尚未保存的)名称规则,不改动已有规则 */
@@ -79,11 +90,12 @@ export interface Api {
   setSourceDirs(dirs: string[]): Promise<Settings>
   scanStart(dirs: string[], rememberSources?: boolean): Promise<number>
   /** 手动指定/修正某个文件的番号;无法识别会抛错 */
-  setItemCode(itemId: number, code: string): Promise<ScanItem>
-  scrapeStart(itemIds: number[]): Promise<number>
+  setItemCode(itemId: number, code: string): Promise<ScanCodeUpdate>
+  scrapeStart(itemIds: number[], cachedSourcesOnly?:boolean, refresh?: boolean): Promise<number>
   /** 预览冲突包含视频、字幕和全部辅助产物的具体路径。 */
-  planBuild(itemIds: number[], requestId?: string): Promise<PlanItem[]>
-  applyStart(itemIds: number[]): Promise<number>
+  saveImportDefaults(rules: ImportRules): Promise<void>
+  planBuild(itemIds: number[], requestId?: string, rules?: ImportRules, renames?: Record<number,string>): Promise<PlanItem[]>
+  applyStart(itemIds: number[], planToken?: string): Promise<number>
   /** 用某站详情页重刮一部影片;结果经 scrape:event / scrape:done 返回 */
   scrapeUrlStart(itemIds: number[], url: string): Promise<number>
   // Preparation progress is delivered through EventMap['apply:progress'] before
@@ -91,18 +103,18 @@ export interface Api {
   jobCancel(jobId?:number): Promise<boolean>
 
   /** 按 id 从新到旧分页;只读取本页日志 */
-  historyDetail(requestId:string, journalId:string, offset?:number): Promise<import('./types').HistoryDetail>
+  historyDetail(requestId:string, journalId:string, offset?:number, expectedRoot?:string): Promise<import('./types').HistoryDetail>
   historyList(requestId?:HistoryRequestId, page?:HistoryPageRequest): Promise<HistoryPage>
   historyCancel(requestId:HistoryRequestId):Promise<boolean>
   revealJournal(journalId: string): Promise<void>
-  rollback(journalId: string): Promise<RollbackResult>
+  rollback(journalId: string, expectedRoot?: string): Promise<RollbackResult>
 
   libraryOverview(query: Query): Promise<import('./types').LibraryOverview>
   libraryList(query: Query): Promise<Page>
-  libraryExportCsv(query: Query, requestId?: string): Promise<number | null>
-  libraryPruneMissing(root: string, automatic: boolean, requestId?: string): Promise<LibraryPruned>
+  libraryExportCsv(query: Query, requestId?: string, options?: CsvOptions): Promise<number | null>
+  libraryPruneMissing(root: string, automatic: boolean, requestId?: string, removeMissing?: string[]): Promise<LibraryPruned>
   libraryGet(code: string): Promise<MovieDetail | null>
-  actorImage(code: string, url: string): Promise<import('./types').ActorImage>
+  actorImage(code: string, url: string, revisionToken?: string, actorName?: string): Promise<import('./types').ActorImage>
   /** 移到系统废纸篓并移出索引。keepMedia:只移走资料(NFO/图片等),视频和字幕留下;否则整个影片目录 */
   libraryTrash(code: string, keepMedia: boolean): Promise<TrashResult>
   repairImagesStart(code: string): Promise<number>
@@ -130,6 +142,7 @@ export interface Api {
   /** 打开日志文件夹(<设置目录>/logs) */
   openLogDir(): Promise<void>
 
+  cachedPoster(code: string, version: string): Promise<string | null>
   /** 把后端给的海报路径转成 <img> 可用的 URL */
   posterUrl(path: string | null, revision?: string | null): string | null
 }
@@ -145,7 +158,7 @@ async function tauriApi(): Promise<Api> {
     libraryHealth:(requestId)=>invoke('library_health',{requestId}),
     revealLibraryPath:(path)=>invoke('reveal_library_path',{path}),
     sourcesCheck:(ids,draft,requestId)=>invoke('sources_check',{ids,draft,requestId}),
-    pickMediaFiles:()=>invoke('pick_media_files'),
+    pickMediaFiles: (purpose = 'append') => invoke('pick_media_files', { purpose }),
     appendTargetVideos:(code,target,requestId)=>invoke('append_target_videos',{code,target,requestId}),
     appendTargets:(code,requestId)=>invoke('append_targets',{code,requestId}),
     appendPreview:(code,inputs,target,video,requestId)=>invoke('append_preview',{code,inputs,target,video,requestId}),
@@ -173,24 +186,34 @@ async function tauriApi(): Promise<Api> {
     setSourceDirs: (dirs) => invoke('set_source_dirs', { dirs }),
     scanStart: (dirs, rememberSources = true) => invoke('scan_start', { dirs, rememberSources }),
     setItemCode: (itemId, code) => invoke('set_item_code', { itemId, code }),
-    scrapeStart: (itemIds) => invoke('scrape_start', { itemIds }),
-    planBuild: (itemIds, requestId) => invoke('plan_build', { itemIds, requestId }),
-    applyStart: (itemIds) => invoke('apply_start', { itemIds }),
+    scrapeStart: (itemIds, cachedSourcesOnly, refresh) => invoke('scrape_start', { itemIds, cachedSourcesOnly, refresh }),
+    saveImportDefaults: rules => invoke('save_import_defaults', { rules }),
+    planBuild: (itemIds, requestId, rules, renames) => invoke('plan_build', { itemIds, requestId, rules, renames }),
+    applyStart: (itemIds, planToken) => invoke('apply_start', { itemIds, planToken }),
     scrapeUrlStart: (itemIds, url) => invoke('scrape_url_start', { itemIds, url }),
     jobCancel: (jobId) => invoke('job_cancel',{jobId}),
+    importCacheUsage:(requestId)=>invoke('import_cache_usage',{requestId}),
+    ...nativePackageExport(invoke),
+    packageRestorePreview:(directory,rules,requestId)=>invoke('package_restore_preview',{directory,rules,requestId}),
+    packageRestoreApply:(token,codes,requestId)=>invoke('package_restore_apply',{token,codes,requestId}),
+    nasStatus:()=>invoke('nas_status'),
+    nasDiagnose:(requestId)=>invoke('nas_diagnose',{requestId}),
     recoveryInspect:()=>invoke('recovery_inspect'),
-    historyDetail: (requestId, journalId, offset = 0) => invoke('history_detail', { requestId, journalId, offset }),
+    recoveryPreserve:(root,journalId,requestId)=>invoke('recovery_preserve',{root,journalId,requestId}),
+    historyDetail: (requestId, journalId, offset = 0, expectedRoot) => invoke('history_detail', { requestId, journalId, offset, expectedRoot }),
     historyList: (requestId, page = {}) => invoke('history_list', {requestId, before: page.before ?? null, limit: page.limit ?? null, filter:page.filter ?? null}),
     historyCancel: (requestId) => invoke('history_cancel', {requestId}),
     revealJournal: (journalId) => invoke('reveal_journal', { journalId }),
-    rollback: (journalId) => invoke('rollback', { journalId }),
+    rollback: (journalId, expectedRoot) => invoke('rollback', { journalId, expectedRoot }),
     libraryOverview: (query) => invoke('library_overview', { query }),
     libraryList: (query) => invoke('library_list', { query }),
-    libraryExportCsv: (query, requestId) => invoke('library_export_csv', { query, requestId }),
-    libraryPruneMissing: (root, automatic, requestId) => invoke('library_prune_missing', { root, automatic, requestId }),
+    libraryExportCsv: (query, requestId,options) => invoke('library_export_csv', { query, requestId,options }),
+    libraryPruneMissing: (root, automatic, requestId, removeMissing) => invoke('library_prune_missing', { root, automatic, requestId, removeMissing }),
     libraryGet: (code) => invoke('library_get', { code }),
-    actorImage: (code, url) => invoke('actor_image', { code, url }),
+    actorImage: (code, url, revisionToken, actorName) => invoke('actor_image', { code, url, revisionToken, actorName }),
     libraryTrash: (code, keepMedia) => invoke('library_trash', { code, keepMedia }),
+    supplementPreview: (code,itemId,requestId) => invoke('supplement_preview',{code,itemId,requestId}),
+    supplementApply: (token,kinds,requestId) => invoke('supplement_apply',{token,kinds,requestId}),
     repairImagesStart: (code) => invoke('repair_images_start', { code }),
     metadataSourceCandidates: (code) => invoke('metadata_source_candidates', { code }),
     batchEditPreview: (codes,edit,requestId) => invoke('batch_edit_preview',{codes,edit,requestId}),
@@ -210,6 +233,10 @@ async function tauriApi(): Promise<Api> {
     play: (code, part, requestId) => invoke('play', { code, part, requestId }),
     reveal: (code, part, requestId) => invoke('reveal', { code, part, requestId }),
     openLogDir: () => invoke('open_log_dir'),
+    cachedPoster: async (code, version) => {
+      const file = await invoke<string | null>('cached_poster', { code, version })
+      return assetUrl(file, version, convertFileSrc)
+    },
     // A revision replaces bytes at the same path; refreshed cards must request new bytes.
     posterUrl: (path, revision) => assetUrl(path, revision, convertFileSrc),
   }

@@ -201,6 +201,7 @@ pub fn project_fields(
     }
     let mut metadata: Metadata = serde_json::from_value(value).map_err(|e| e.to_string())?;
     metadata.name_projection = records;
+    metadata.import_local.clone_from(&meta.import_local);
     Ok(NameProjection { metadata, warnings })
 }
 

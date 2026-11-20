@@ -29,11 +29,12 @@ async function prepare(page: Page, kind: Kind) {
     if(kind==='picker')api.pickMediaFiles=()=>pending(null,[]);
     if(kind==='candidates')api.metadataSourceCandidates=()=>pending(null,{});
     if(kind==='undo')api.rollback=()=>pending(null,{failures:[],indexError:null});
-    if(kind==='list'){const list=api.libraryList;api.libraryList=q=>q.limit===200?pending(null,{items:[],total:0}):list(q)};
+    if(kind==='list'){const list=api.libraryList;api.libraryList=q=>state.holdList?pending(null,{items:[],total:0}):list(q)};
   `)
   await page.goto('/')
   if (kind.startsWith('export') || kind === 'list') {
     await page.getByRole('button', { name: '媒体库工具', exact: true }).click()
+    if (kind === 'list') await page.evaluate(() => { (window as any).editor.holdList=true })
     await page.getByRole('button', { name: '批量导出 NFO 语言', exact: true }).click()
     if (kind !== 'list') {
       await page.getByLabel('批量 NFO 语言导出', { exact: true }).getByRole('checkbox').first().check()
@@ -182,8 +183,8 @@ test('batch export cancellation keeps the completed film and its undo journal',a
     window.testApi=api;
   `)
   await page.goto('/')
-  const before=await page.evaluate(async()=>{const api=(window as any).testApi;const codes=(await api.libraryList({limit:2})).items.map((m:any)=>m.code);return Promise.all(codes.map((code:string)=>api.libraryGet(code)))})
   await page.getByRole('button',{name:'媒体库工具',exact:true}).click()
+  const before=await page.evaluate(async()=>{const api=(window as any).testApi;const codes=(await api.libraryList({limit:2})).items.map((m:any)=>m.code);return Promise.all(codes.map((code:string)=>api.libraryGet(code)))})
   await page.getByRole('button',{name:'批量导出 NFO 语言',exact:true}).click()
   const batch=page.getByLabel('批量 NFO 语言导出',{exact:true})
   await batch.getByRole('checkbox').nth(0).check();await batch.getByRole('checkbox').nth(1).check()
@@ -210,3 +211,81 @@ for(const kind of ['artwork-open','artwork-preview','artwork-save'] as const){
     await expect(page.getByText('海报已保存并锁定，可从历史撤销')).toHaveCount(0)
   })
 }
+
+for (const background of ['pending-scan', 'recovery-check']) {
+  test(`crop automatically opens when ${background} finishes`, async ({ page }) => {
+    await seedLibrary(page)
+    await overrideApi(page, `
+      const open=api.artworkOpen;
+      window.occupied=true;window.cropAttempts=0;
+      api.artworkOpen=(...args)=>{window.cropAttempts++;if(window.occupied)throw Error('已有任务在运行:'+ '${background}');return open(...args)};
+    `)
+    await page.goto('/')
+    await page.locator('button.pcard').first().click()
+    await page.getByRole('button',{name:'裁剪海报',exact:true}).click()
+    const dialog = page.getByRole('dialog',{name:'裁剪海报'})
+    await expect(dialog.getByRole('status')).toContainText('自动继续')
+    await expect(dialog.getByRole('alert')).toHaveCount(0)
+    await page.evaluate(()=>{(window as any).occupied=false})
+    await expect(dialog.getByAltText('裁剪原图')).toBeVisible()
+    expect(await page.evaluate(()=>(window as any).cropAttempts)).toBeGreaterThan(1)
+  })
+}
+
+test('closing a waiting crop abandons the retry and leaves the background owner alone', async ({ page }) => {
+  await seedLibrary(page)
+  await overrideApi(page, `
+    const {emitMock}=await import('/src/lib/events.ts');
+    window.cropAttempts=0;window.stops=[];
+    api.artworkOpen=()=>{window.cropAttempts++;emitMock('job:started',{requestId:'other',jobId:930});throw '已有任务在运行:pending-scan'};
+    api.jobCancel=async id=>{window.stops.push(id);return true};
+  `)
+  await page.clock.install()
+  await page.goto('/')
+  await page.locator('button.pcard').first().click()
+  await page.getByRole('button',{name:'裁剪海报',exact:true}).click()
+  const dialog = page.getByRole('dialog',{name:'裁剪海报'})
+  await expect(dialog.getByRole('status')).toContainText('自动继续')
+  await dialog.getByRole('button',{name:'关闭裁剪'}).click()
+  const attempts = await page.evaluate(()=>(window as any).cropAttempts)
+  await page.clock.runFor(3000)
+  expect(await page.evaluate(()=>(window as any).cropAttempts)).toBe(attempts)
+  expect(await page.evaluate(()=>(window as any).stops)).toEqual([])
+})
+
+test('a blocked crop preview reuses the crop and saves once after the background check', async ({ page }) => {
+  await seedLibrary(page)
+  await overrideApi(page, `
+    window.cropInputs=[];window.occupied=true;window.commits=0;
+    const preview=api.artworkPreview,save=api.revisionSave;
+    api.artworkPreview=(token,root,code,crop,id)=>{
+      window.cropInputs.push(JSON.stringify([token,root,code,crop]));
+      if(window.occupied)throw '已有任务在运行:recovery-check';
+      return preview(token,root,code,crop,id);
+    };
+    api.revisionSave=(...args)=>{window.commits++;return save(...args)};
+  `)
+  await page.goto('/')
+  await page.locator('button.pcard').first().click()
+  await page.getByRole('button',{name:'裁剪海报',exact:true}).click()
+  const dialog=page.getByRole('dialog',{name:'裁剪海报'})
+  await dialog.getByRole('button',{name:'保存海报',exact:true}).click()
+  await expect(dialog.getByRole('status')).toContainText('自动继续')
+  await expect(dialog.getByRole('button',{name:'关闭裁剪'})).toBeEnabled()
+  await page.evaluate(()=>{(window as any).occupied=false})
+  await expect(dialog).toHaveCount(0)
+  expect(await page.evaluate(()=>new Set((window as any).cropInputs).size)).toBe(1)
+  expect(await page.evaluate(()=>(window as any).commits)).toBe(1)
+})
+
+test('a competing write job leaves the crop retry to the user', async ({page})=>{
+  await seedLibrary(page)
+  await overrideApi(page,`window.attempts=0;api.artworkOpen=()=>{window.attempts++;throw '已有任务在运行:apply'}`)
+  await page.goto('/')
+  await page.locator('button.pcard').first().click()
+  await page.getByRole('button',{name:'裁剪海报',exact:true}).click()
+  const dialog=page.getByRole('dialog',{name:'裁剪海报'})
+  await expect(dialog.getByRole('alert')).toHaveText('已有任务在运行:apply')
+  await expect(dialog.getByRole('button',{name:'重试'})).toBeVisible()
+  expect(await page.evaluate(()=>(window as any).attempts)).toBe(1)
+})

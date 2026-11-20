@@ -44,21 +44,31 @@ pub async fn history_list(app:AppHandle,state:State<'_,AppState>,request_id:Opti
     tauri::async_runtime::spawn_blocking(move||{
         let _permit=permit;let _lease=lease;let state=app.state::<AppState>();
         state.validate_history(&snapshot)?;
-        let result=state.history.cache.lock().unwrap_or_else(|e|e.into_inner()).read_filtered_page(&snapshot.root,before.as_deref(),limit,&filter.unwrap_or_default(),&cancel).map_err(|e|e.to_string());
+        let filter=filter.unwrap_or_default();
+        let page=state.history.cache.lock().unwrap_or_else(|e|e.into_inner()).read_filtered_page(&snapshot.root,before.as_deref(),limit,&filter,&cancel).map_err(|e|e.to_string())?;
+        let result=crate::linked_artwork::merge_history(&snapshot.root,&state.settings().source_dirs,page,before.as_deref(),limit,&filter,&cancel).map_err(|e|e.to_string());
         if let Err(error)=state.validate_history(&snapshot){state.history.cache.lock().unwrap_or_else(|e|e.into_inner()).clear();return Err(error)}
         let result=result?;if cancel.is_cancelled(){return Err("历史读取已取消".into())}Ok(result)
     }).await.map_err(|e|e.to_string())?
 }
 #[tauri::command]
-pub async fn history_detail(app:AppHandle,state:State<'_,AppState>,request_id:String,journal_id:String,offset:usize)->Result<HistoryDetail,String>{
+pub async fn history_detail(app:AppHandle,state:State<'_,AppState>,request_id:String,journal_id:String,offset:usize,expected_root:Option<String>)->Result<HistoryDetail,String>{
     let snapshot=state.history_snapshot()?;
+    if expected_root.as_deref().is_some_and(|root| std::path::Path::new(root) != snapshot.root) {
+        return Err("媒体库已变化，请切回本批所在的媒体库".into());
+    }
     let cancel=state.history.requests.lock().unwrap_or_else(|e|e.into_inner()).begin(request_id.clone())?;
     let lease=Lease{app:app.clone(),id:request_id};let queue=state.history.queue.clone();
     let permit=tokio::select!{_ = cancel.cancelled()=>return Err("历史读取已取消".into()),permit=queue.acquire_owned()=>permit.map_err(|e|e.to_string())?};
     tauri::async_runtime::spawn_blocking(move||{
         let _permit=permit;let _lease=lease;let state=app.state::<AppState>();
         state.validate_history(&snapshot)?;
-        let result=HistoryDetail::read(&snapshot.root,&journal_id,offset,&cancel).map_err(|e|e.to_string())?;
+        let target=crate::linked_artwork::history_target(&snapshot.root,&state.settings().source_dirs,&journal_id).map_err(|e|e.to_string())?;
+        let mut result=if let Some((link,id))=target {
+            crate::linked_artwork::checked_journal(&link,&id,&cancel).map_err(|e|e.to_string())?;
+            HistoryDetail::read(&link.root,&id,offset,&cancel)
+        } else {HistoryDetail::read(&snapshot.root,&journal_id,offset,&cancel)}.map_err(|e|e.to_string())?;
+        result.id=journal_id;
         state.validate_history(&snapshot)?;if cancel.is_cancelled(){return Err("历史读取已取消".into())}Ok(result)
     }).await.map_err(|e|e.to_string())?
 }

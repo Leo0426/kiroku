@@ -61,7 +61,9 @@ pub fn parse_nfo(xml: &str, fallback_code: &str) -> Option<Metadata> {
                         f.series.get_or_insert(text);
                     }
                     ["movie", "genre"] | ["movie", "tag"] => {
-                        if !f.tags.contains(&text) {
+                        if let Some(mark) = crate::badge::Phase::from_nfo_label(&text) {
+                            m.artwork_phase.get_or_insert_with(Default::default).merge(&mark);
+                        } else if !f.tags.contains(&text) {
                             f.tags.push(text);
                         }
                     }

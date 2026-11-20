@@ -12,6 +12,7 @@ use std::{
 #[derive(Clone)]
 pub struct LibraryReadHandle {
     pub(super) root: PathBuf,
+    pub(super) db_path: PathBuf,
     pub(super) root_identity: Arc<same_file::Handle>,
     pub(super) db_identity: Arc<same_file::Handle>,
     pub(super) read_cache: Arc<super::query::ReadCache>,
@@ -25,10 +26,10 @@ impl LibraryReadHandle {
         if same_file::Handle::from_path(&self.root)? != *self.root_identity {
             return Err(io::Error::other("库目录身份已变化，请重新打开媒体库"));
         }
-        if !std::fs::symlink_metadata(Library::db_path(&self.root))?.is_file() {
+        if !std::fs::symlink_metadata(&self.db_path)?.is_file() {
             return Err(io::Error::other("索引文件不是普通文件，请重新打开媒体库"));
         }
-        if same_file::Handle::from_path(Library::db_path(&self.root))? != *self.db_identity {
+        if same_file::Handle::from_path(&self.db_path)? != *self.db_identity {
             return Err(io::Error::other("索引文件身份已变化，请重新打开媒体库"));
         }
         Ok(())
@@ -37,7 +38,7 @@ impl LibraryReadHandle {
     pub fn open(&self) -> Result<LibraryReader> {
         self.verify()?;
         let connection = Connection::open_with_flags(
-            Library::db_path(&self.root),
+            &self.db_path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
         connection.busy_timeout(Duration::from_millis(250))?;
@@ -46,6 +47,7 @@ impl LibraryReadHandle {
         Ok(LibraryReader {
             library: Library {
                 root: self.root.clone(),
+                db_path: self.db_path.clone(),
                 root_identity: self.root_identity.clone(),
                 db_identity: self.db_identity.clone(),
                 conn: connection,
@@ -129,7 +131,7 @@ impl LibraryReader {
     pub fn root(&self) -> &Path {
         self.library.root()
     }
-    fn snapshot<T>(&self, read: impl FnOnce(&Library) -> Result<T>) -> Result<T> {
+    pub(super) fn snapshot<T>(&self, read: impl FnOnce(&Library) -> Result<T>) -> Result<T> {
         self.library.verify_binding()?;
         // A logical query spans one committed snapshot, including COUNT/page,
         // metadata/files, and all facet groups. Drop also rolls back on errors.
@@ -147,6 +149,9 @@ impl LibraryReader {
     }
     pub fn export_csv(&self, query: &Query, out: &mut impl io::Write, cancel: &tokio_util::sync::CancellationToken, progress: &mut impl FnMut(usize, usize)) -> Result<usize> {
         self.snapshot(|library| library.export_csv(query, out, cancel, progress))
+    }
+    pub fn export_csv_with(&self, query: &Query, options: &super::CsvOptions, out: &mut impl io::Write, cancel: &tokio_util::sync::CancellationToken, progress: &mut impl FnMut(usize,usize)) -> Result<usize> {
+        self.snapshot(|lib| lib.export_csv_with(query,options,out,cancel,progress))
     }
     pub fn get(&self, code: &str) -> Result<Option<MovieDetail>> {
         self.snapshot(|library| library.get(code))

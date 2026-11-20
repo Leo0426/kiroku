@@ -277,6 +277,7 @@ impl Journal {
     ) -> io::Result<()> {self.replace_files_checked(inputs,checkpoint,&||false)}
     pub fn replace_files_cancellable(&mut self,inputs:&[ReplacementInput],cancel:&tokio_util::sync::CancellationToken)->io::Result<()>{self.replace_files_checked(inputs,&mut |_|Ok(()),&||cancel.is_cancelled())}
     pub(crate) fn replace_files_checked(&mut self,inputs:&[ReplacementInput],checkpoint:&mut dyn FnMut(ReplacementCheckpoint)->io::Result<()>,cancel:&dyn Fn()->bool)->io::Result<()> {
+        crate::nas_ops::ensure_writes_allowed()?;
         crate::append::check_stopped(cancel)?;
         if self.version!=4 && (!self.ops.is_empty() || !self.replacements.is_empty()) {
             return Err(io::Error::other("修订必须使用独立日志"));

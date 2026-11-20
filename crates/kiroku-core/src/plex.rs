@@ -1,6 +1,5 @@
 //! Plex Media Server 联动:整理/撤销后只刷新变动的文件夹(局部扫描),不用等 Plex 定时扫描。
-//! Plex 不读 NFO,它用文件名识别影片、用目录里的 poster.jpg / fanart.jpg 作封面背景,
-//! 所以配合「Plex 友好命名」(见 organize::PlanOpts::plex_naming)效果最好。
+//! 默认影片代理依赖文件名和本地海报；Plex NFO Movie 代理可读取同目录 NFO（PMS 1.43.1 起）。
 
 use serde::Serialize;
 use std::{path::Path, time::Duration};

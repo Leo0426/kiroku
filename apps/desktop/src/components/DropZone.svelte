@@ -17,7 +17,7 @@
       // 进行中的一批不受拖入影响:不换页、不改列表
       if (e.type !== 'drop' || !flow.canAcceptDrop) return
       app.navigate('import')
-      void flow.dropPaths(e.paths)
+      void flow.addSourcePaths(e.paths)
     }).then((un) => (disposed ? un() : (stop = un)))
     return () => {
       disposed = true
@@ -31,11 +31,11 @@
     <div class="card">
       <Icon name={flow.canAcceptDrop ? 'folder' : 'alert'} size={28} />
       {#if flow.canAcceptDrop}
-        <h2>松开以添加待整理文件夹</h2>
+        <h2>松开以添加待整理来源</h2>
         <p>可以拖入文件夹（会查找子文件夹）或单个视频文件。</p>
       {:else}
-        <h2>现在不能添加文件夹</h2>
-        <p>当前这批还没整理完。完成后或回到导入页的「选择文件夹」再拖入。</p>
+        <h2>现在不能添加来源</h2>
+        <p>当前这批还没整理完。回到「选择来源」后可以继续添加。</p>
       {/if}
     </div>
   </div>

@@ -8,8 +8,17 @@ test('append is previewed then saved and undone',async({page})=>{
  await panel.getByRole('button',{name:'确认追加',exact:true}).click();await expect(panel.getByText(/追加完成/)).toBeVisible();await panel.getByRole('button',{name:'撤销本次追加',exact:true}).click();await expect(panel.getByText('本次追加已撤销')).toBeVisible();
 })
 test('sources can be checked and a failed source retried',async({page})=>{
- await overrideApi(page,`api.sourcesCheck=async()=>[{sourceId:'javdb',outcome:{status:'failed',reason:'needLogin',httpStatus:401},elapsedMs:12,checkedAt:1780000000}];`)
- await page.goto('/');await page.getByRole('button',{name:'设置',exact:true}).click();await page.getByRole('tab',{name:'数据源',exact:true}).click();await page.getByRole('button',{name:'检测已用来源',exact:true}).click();await expect(page.getByText('需要登录或更新 Cookie')).toBeVisible();await expect(page.getByRole('button',{name:'重测 JavDB',exact:true})).toBeVisible();
+ await overrideApi(page,`api.sourcesCheck=async(ids)=>[{sourceId:'javdb',outcome:ids?.includes('javdb')
+   ? {status:'ok',reason:'authenticated',httpStatus:200}
+   : {status:'failed',reason:'needLogin',httpStatus:401},elapsedMs:12,checkedAt:1780000000}];`)
+ await page.goto('/')
+ await page.getByRole('button',{name:'设置',exact:true}).click()
+ await page.getByRole('tab',{name:'数据源',exact:true}).click()
+ const checks = page.getByRole('region', {name:'来源自检'})
+ await checks.getByRole('button',{name:'检测已用来源',exact:true}).click()
+ await expect(checks.getByText('站点要求登录，请核对 Cookie · HTTP 401')).toBeVisible()
+ await checks.getByRole('button',{name:'重测 JavDB',exact:true}).click()
+ await expect(checks.getByText('站点可达，已登录 · HTTP 200')).toBeVisible()
 })
 test('health report displays issues without starting playback',async({page})=>{
  await overrideApi(page,`window.testPlayed=false;api.play=async()=>{window.testPlayed=true};api.libraryHealth=async()=>({root:'/mock/library',scannedAt:1780000000,scanned:1,cancelled:false,issues:[{kind:'missingVideo',severity:'error',dir:'/mock/library/ABQ-100',code:'ABQ-100',path:'/mock/library/ABQ-100',message:'影片目录没有视频',action:'reveal'}]});`)

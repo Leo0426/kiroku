@@ -9,12 +9,21 @@ interface PendingRequest {
 const waiting: PendingRequest[] = []
 const owners = new Set<PendingRequest>()
 let active = false
+let suspended = 0
 let completion: Promise<void> = Promise.resolve()
 
 /** Cancel each owner, then wait for the actual dispatched read to release the job slot. */
 export async function cancelPendingReads() {
   for (const owner of [...owners]) owner.cancel()
   await completion
+}
+/** Keep automatic source reads from competing with an explicit recovery. */
+export async function suspendPendingReads():Promise<()=>void> {
+  suspended++
+  try { await cancelPendingReads() }
+  catch(error) { suspended--; drain(); throw error }
+  let released=false
+  return ()=>{if(released)return;released=true;suspended--;drain()}
 }
 export function pendingRead<T>(read: (requestId: string) => Promise<T>) {
   const requestId = crypto.randomUUID()
@@ -45,7 +54,7 @@ export function pendingRead<T>(read: (requestId: string) => Promise<T>) {
   return { promise, cancel: () => request.cancel() }
 }
 function drain() {
-  if (active || !waiting.length) return
+  if (active || suspended || !waiting.length) return
   const request = waiting.shift()!
   active = true
   request.started = true

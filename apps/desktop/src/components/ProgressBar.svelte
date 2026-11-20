@@ -1,11 +1,11 @@
 <script lang="ts">
-  /** value 为 0–1;active 时叠一层流光,表示任务仍在进行 */
-  let { value = 0, active = false, label }: { value?: number; active?: boolean; label?: string } = $props()
-  const pct = $derived(Math.max(0, Math.min(1, value)) * 100)
+  /** value 为 0–1，省略时表示进度未知。 */
+  let { value, active = false, label }: { value?: number; active?: boolean; label: string } = $props()
+  const pct = $derived(value === undefined ? undefined : Math.max(0, Math.min(1, value)) * 100)
 </script>
 
-<div class="track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow={Math.round(pct)} aria-label={label}>
-  <div class="bar" class:active style="width: {pct}%"></div>
+<div class="track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow={pct === undefined ? undefined : Math.round(pct)} aria-label={label}>
+  <div class="bar" class:active class:indeterminate={pct === undefined} style:width={pct === undefined ? undefined : `${pct}%`}></div>
 </div>
 
 <style>
@@ -19,5 +19,11 @@
     background-size: 200% 100%; background-color: var(--accent);
     animation: shimmer 1.6s linear infinite;
   }
-  @media (prefers-reduced-motion: reduce) { .bar.active { animation: none; } }
+  .bar.indeterminate { width: 36%; animation: progress-slide 1.5s ease-in-out infinite; }
+  @keyframes progress-slide { from { transform: translateX(-100%); } to { transform: translateX(278%); } }
+  @media (prefers-reduced-motion: reduce) {
+    .bar { transition: none; }
+    .bar.active, .bar.indeterminate { animation: none; }
+    .bar.indeterminate { margin-inline: auto; }
+  }
 </style>

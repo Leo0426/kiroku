@@ -112,10 +112,16 @@ impl Fixture {
                 let request = String::from_utf8_lossy(&request);
                 let path = request.split_whitespace().nth(1).unwrap();
                 assert!(
-                    ["/NET-101", "/NET-102", "/NET-103"].contains(&path),
+                    ["/NET-101", "/NET-102", "/NET-103", "/avatar.png"].contains(&path),
                     "unexpected fixture request: {path}"
                 );
                 worker_state.requests.lock().unwrap().push(path.to_string());
+                if path == "/avatar.png" {
+                    let bytes = include_bytes!("../apps/desktop/src-tauri/icons/32x32.png");
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", bytes.len()).unwrap();
+                    stream.write_all(bytes).unwrap();
+                    continue;
+                }
                 let hold = path == worker_state.hold_path.lock().unwrap().as_str();
                 if hold && !held_once {
                     held_once = true;

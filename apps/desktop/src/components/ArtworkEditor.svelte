@@ -1,4 +1,5 @@
 <script lang="ts">
+  import LoadingStatus from './LoadingStatus.svelte'
   import { onDestroy, untrack } from 'svelte'
   import { fade, scale } from 'svelte/transition'
   import {cancellableJob,type CancellableJob} from '../lib/cancellable-job'
@@ -27,6 +28,9 @@
   let img: HTMLImageElement | undefined = $state()
   let frame: HTMLDivElement | undefined = $state()
   let task = $state<CancellableJob<unknown> | null>(null)
+  let waiting = $state('')
+  let stopWaiting: (() => void) | null = null
+  const lockClose = $derived(saving && !waiting)
   let generation = 0
   let url = ''
   const openedSettings = untrack(() => app.settings)
@@ -45,12 +49,49 @@
 
   function release() {
     generation++
+    stopWaiting?.()
+    stopWaiting = null
+    waiting = ''
     void task?.cancel()
     task = null
     if (url) URL.revokeObjectURL(url)
     url = ''
   }
   onDestroy(release)
+
+  function close() {
+    if (lockClose) return
+    release()
+    onclose()
+  }
+
+  async function runArtworkRead<T>(g: number, run: (requestId: string) => Promise<T>): Promise<T> {
+    let delay = 200
+    while (g === generation) {
+      const request = cancellableJob(run, e => { if (g === generation) error = String(e) })
+      task = request
+      try {
+        const result = await request.promise
+        if (g !== generation || request.cancelled) throw new Error('已取消裁剪')
+        waiting = ''
+        return result
+      } catch (e) {
+        const message = e instanceof Error ? e.message : String(e)
+        const background = /^已有任务在运行\s*[:：]\s*(pending-scan|recovery-check)$/.exec(message.trim())
+        if (!background || request.jobId !== null || request.cancelled || g !== generation) throw e
+        waiting = background[1] === 'pending-scan' ? '正在检查待整理文件，完成后会自动继续…' : '正在检查整理日志，完成后会自动继续…'
+      } finally {
+        if (g === generation) task = null
+      }
+      await new Promise<void>(resolve => {
+        const timer = setTimeout(resolve, delay)
+        stopWaiting = () => { clearTimeout(timer); resolve() }
+      })
+      if (g === generation) stopWaiting = null
+      delay = Math.min(1500, delay * 2)
+    }
+    throw new Error('已取消裁剪')
+  }
 
   $effect(() => {
     code
@@ -68,12 +109,12 @@
     release()
     const g = generation
     original = null
+    saving = false
     busy = true
     error = ''
-    const request = cancellableJob(id => api.artworkOpen(code,id), e => { if(g===generation) error=String(e) })
-    task = request
+    const requestedCode = code
     try {
-      const o = await request.promise
+      const o = await runArtworkRead(g, id => api.artworkOpen(requestedCode, id))
       if (g !== generation) return
       url = URL.createObjectURL(new Blob([new Uint8Array(o.image)], { type: 'image/png' }))
       source = url
@@ -86,7 +127,7 @@
     } catch (e) {
       if (g === generation) error = String(e)
     } finally {
-      if (g === generation) { task = null; busy = false }
+      if (g === generation) { waiting = ''; task = null; busy = false }
     }
   }
 
@@ -97,11 +138,8 @@
     saving = true
     error = ''
     const o = original, crop = { ...rect }
-    const request = cancellableJob(id => api.artworkPreview(o.token,o.root,o.code,crop,id), e => { if(g===generation) error=String(e) })
-    task = request
     try {
-      const p = (await request.promise).revision
-      if(request.cancelled) return
+      const p = (await runArtworkRead(g, id => api.artworkPreview(o.token, o.root, o.code, crop, id))).revision
       if (g !== generation) return
       task = null
       const r = await api.revisionSave(p.token, p.root, p.code)
@@ -116,7 +154,7 @@
     } catch (e) {
       if (g === generation) error = String(e)
     } finally {
-      if (g === generation) { task = null; busy = false; saving = false }
+      if (g === generation) { waiting = ''; task = null; busy = false; saving = false }
     }
   }
 
@@ -138,7 +176,7 @@
 
   function onkey(e: KeyboardEvent) {
     if (e.key === 'Escape') {
-      if (!saving) onclose()
+      close()
       return
     }
     if (e.target !== frame || !original) return
@@ -155,18 +193,18 @@
 
 <svelte:window onkeydown={onkey} />
 
-<div class="scrim" role="presentation" onclick={() => !saving && onclose()} transition:fade={{ duration: dur(160) }}></div>
+<div class="scrim" role="presentation" onclick={close} transition:fade={{ duration: dur(160) }}></div>
 <div class="dlg" role="dialog" aria-modal="true" aria-label="裁剪海报" tabindex="-1" transition:scale={{ start: 0.97, duration: dur(200) }}>
   <header>
     <div>
       <h2>裁剪海报 <span class="mono code">{code}</span></h2>
       <p class="muted">拖动原图上的框选择海报区域，框里的内容就是保存后的海报。方向键微调，按住 Shift 移动更快。</p>
     </div>
-    <button class="btn icon ghost" aria-label="关闭裁剪" onclick={onclose} disabled={saving}><Icon name="x" size={18} /></button>
+    <button class="btn icon ghost" aria-label="关闭裁剪" onclick={close} disabled={lockClose}><Icon name="x" size={18} /></button>
   </header>
 
   {#if !original}
-    <div class="loading">{#if error}<p role="alert">{error}</p><button class="btn" onclick={open}>重试</button>{:else}<p class="muted">正在读取原图…</p>{/if}</div>
+    <div class="loading">{#if error}<p role="alert">{error}</p><button class="btn" onclick={open}>重试</button>{:else}<LoadingStatus label={waiting || '正在读取原图…'} />{/if}</div>
   {:else}
     <div class="body">
       <div class="stage">
@@ -203,10 +241,11 @@
         {#if original.source}<p class="source">图片来源：{original.source}</p>{/if}
       </aside>
     </div>
+    {#if waiting}<LoadingStatus label={waiting} />{/if}
     {#if error}<p role="alert" class="err">{error}</p>{/if}
     <footer>
       <span class="muted">保存后锁定海报字段，可从历史撤销。</span>
-      <button class="btn" onclick={onclose} disabled={saving}>取消</button>
+      <button class="btn" onclick={close} disabled={lockClose}>取消</button>
       <button class="btn primary" onclick={save} disabled={busy}>{saving ? '正在保存…' : '保存海报'}</button>
     </footer>
   {/if}

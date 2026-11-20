@@ -17,7 +17,7 @@
 
 ## 架构要点
 - 流程集中在 `kiroku_core::pipeline`(scan → scrape_all → build_plans → apply),CLI 与 Tauri 命令共用;核心不做 UI、不依赖 Tauri。
-- 磁盘是唯一真相:影片目录里的视频同名 NFO(兼容旧 `movie.nfo`) + `kiroku.json` + 视频;新海报/背景为 `<影片名>-poster.jpg` / `<影片名>-fanart.jpg`,主体名由 sidecar 的 `asset_stem` 固定;`library.rs` 的 SQLite 索引(`<库>/.kiroku/library.db`)只是缓存,**唯一写入口是 `Library::reindex_dir`**(整理、回滚、重建都走它)。
+- 磁盘是唯一真相:影片目录里的视频同名 NFO(兼容旧 `movie.nfo`) + `kiroku.json` + 视频;新海报/背景为 `<影片名>-poster.jpg` / `<影片名>-fanart.jpg`,主体名由 sidecar 的 `asset_stem` 固定;`library.rs` 的 SQLite 索引只是缓存（本地卷为 `<库>/.kiroku/library.db`，macOS 网络卷使用本机 `library-index`，见 ADR-0013）,**唯一写入口是 `Library::reindex_dir`**(整理、回滚、重建都走它)。
 - 整理日志 `<库>/.kiroku/journal-<ts>.json`:`apply` 每完成一项就落盘,取消/失败也有日志;回滚尽力而为并清理空目录。
 - Tauri 事件(`scan:items` `scrape:event` `apply:event` `job:eta` `library:*`)都带 `jobId`;同一时间只允许一个任务(`AppState::begin_job`)。
 - 运行日志用 `kiroku_core::logging` 按 `Settings.log` 分发；核心 `log` target 为 `kiroku::<模块>`，App 事件为 `log:line`。

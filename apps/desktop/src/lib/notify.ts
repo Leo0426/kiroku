@@ -11,11 +11,22 @@ export function scrapeNotice(d: ScrapeDone): Notice {
   return { title: d.cancelled ? '刮削已取消' : '刮削完成', body: parts.join('，') }
 }
 
-export function applyNotice(d: ApplyDone): Notice {
-  const parts = [`已整理 ${d.applied} 部`]
-  if (d.failed.length) parts.push(`失败 ${d.failed.length} 部`)
+export function applyNotice(d: ApplyDone, filesWithNotes: number): Notice {
+  let title = '整理完成'
+  if (d.cancelled) title = '整理已停止'
+  else if (d.failed.length) title = d.applied ? '整理部分完成' : '整理未完成'
+  else if (d.indexError) title = '媒体库索引待更新'
+  else if (d.imageFailures) title = '整理完成，有图片待补'
+
+  // 同一计划项可以先写入视频，再因保存资料失败而上报错误。
+  const parts: string[] = []
+  if (d.applied || d.cancelled || d.failed.length) parts.push(`${d.applied} 项已写入视频或字幕`)
+  if (d.failed.length) parts.push(`${d.failed.length} 条执行错误`)
+  if (d.skipped) parts.push(`${d.skipped} 项未选或有冲突`)
+  if (d.imageFailures) parts.push(`${d.imageFailures} 张图片准备失败`)
   if (d.indexError) parts.push('索引更新失败')
-  return { title: d.cancelled ? '整理已取消' : d.failed.length || d.indexError ? '整理完成，有失败项' : '整理完成', body: parts.join('，') }
+  if (filesWithNotes && !d.imageFailures) parts.push(`${filesWithNotes} 项有文件提示`)
+  return { title, body: parts.join('，') || '文件操作已完成' }
 }
 
 export function rebuildNotice(e: RebuiltEvent): Notice {

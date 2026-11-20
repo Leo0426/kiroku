@@ -3,7 +3,15 @@ import {seedLibrary,overrideApi} from './helpers'
 
 test('configure hostname hosting, preview, publish, and undo NFO actor URLs',async({page})=>{
  await seedLibrary(page)
- await overrideApi(page,`const originalGet=api.libraryGet;api.libraryGet=async code=>{const d=await originalGet(code);if(d)d.meta.actors=[{name:'Performer A',gender:'female',thumb:'https://images.example.invalid/a.jpg'}];return d};`)
+ await overrideApi(page,`
+  const originalGet=api.libraryGet;
+  api.libraryGet=async code=>{const d=await originalGet(code);if(d)d.meta.actors=[{name:'Performer A',gender:'female',thumb:'https://images.example.invalid/a.jpg'}];return d};
+  const originalImage=api.actorImage;
+  api.actorImage=async(code,url,token)=>{
+    if(!token && !(await api.libraryGet(code))?.meta.hosted_actor_images?.[url])throw '来源头像暂时无法访问';
+    return originalImage(code,url,token);
+  };
+ `)
  await page.goto('/')
  const nav=page.getByRole('navigation',{name:'主导航'})
  await nav.getByRole('button',{name:'设置',exact:true}).click()
@@ -19,16 +27,21 @@ test('configure hostname hosting, preview, publish, and undo NFO actor URLs',asy
  await expect(page.getByRole('button',{name:/保存更改/})).toHaveCount(0)
  await nav.getByRole('button',{name:'媒体库',exact:true}).click()
  await page.locator('button.pcard').first().click()
+ const detailAvatar=page.locator('.chip',{hasText:'Performer A'}).locator('img.avatar')
+ await expect(detailAvatar).toHaveCount(0)
  const tool=page.getByLabel('演员头像发布',{exact:true})
  await tool.getByRole('button',{name:'演员头像',exact:true}).click()
  await tool.getByRole('button',{name:'预览头像发布'}).click()
  await expect(tool.getByLabel('头像发布预览')).toContainText('http://nas.home.arpa:8088/actors/')
+ await expect(tool.getByLabel('头像发布预览').locator('img.avatar')).toHaveAttribute('src', /^blob:/)
  await expect(tool.getByRole('button',{name:'撤销头像 NFO 更新'})).toHaveCount(0)
  await tool.getByRole('button',{name:'确认发布头像'}).click()
  await expect(tool.getByRole('status')).toContainText('头像与 NFO 已保存')
+ await expect(detailAvatar).toHaveAttribute('src', /^blob:/)
  await expect(tool.getByRole('button',{name:'打开头像链接 1'})).toBeVisible()
  await tool.getByRole('button',{name:'撤销头像 NFO 更新'}).click()
  await expect(tool.getByRole('status')).toContainText('NFO 和元数据已恢复')
+ await expect(detailAvatar).toHaveCount(0)
  await expect(tool.getByRole('button',{name:'打开头像链接 1'})).toHaveCount(0)
 })
 

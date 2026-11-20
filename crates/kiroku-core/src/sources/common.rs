@@ -61,7 +61,9 @@ fn authentication_required() -> SourceError {
 }
 pub fn check(p: &Page) -> Result<(), SourceError> {
     body_error(&p.body)?;
-    if p.url.contains("/login") || p.url.contains("/signin") {
+    if reqwest::Url::parse(&p.url).is_ok_and(|url| {
+        url.path().split('/').any(|part| matches!(part, "login" | "signin"))
+    }) {
         return Err(SourceError::NeedLogin(
             "站点要求登录；请在数据源设置填写有效 Cookie".into(),
         ));

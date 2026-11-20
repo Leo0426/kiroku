@@ -4,7 +4,7 @@
   import Icon from './Icon.svelte'
 
   /** 刮削时实时出现的结果卡:横版封面只露出右侧(正面)部分,像海报 */
-  let { code, p }: { code: string; p: Preview } = $props()
+  let { code, p, note, onrefresh, busy = false }: { code: string; p: Preview; note?: string; onrefresh?: () => void; busy?: boolean } = $props()
   let loaded = $state(false)
   let failed = $state(false)
   $effect(() => { p.cover; loaded = false; failed = false })
@@ -17,7 +17,7 @@
       <img class:ready={loaded} src={p.cover} alt="" loading="lazy" referrerpolicy="no-referrer" onload={() => (loaded = true)} onerror={() => (failed = true)} />
       {/key}
     {/if}
-    {#if !loaded}<div class="ph mono" class:skeleton-fill={!!p.cover && !failed}>{failed ? '图片加载失败' : !p.cover ? '暂无封面' : code}</div>{/if}
+    {#if !loaded}<div class="ph mono" class:skeleton-fill={!!p.cover && !failed}>{failed ? '图片加载失败' : !p.cover ? p.localCover ? '本地海报' : '暂无封面' : code}</div>{/if}
     {#if p.score !== null}<span class="score tnum"><Icon name="star" size={10} />{(p.score / 10).toFixed(1)}</span>{/if}
     <span class="check" aria-hidden="true"><Icon name="check" size={12} /></span>
   </div>
@@ -31,6 +31,9 @@
     </p>
     {#if p.actors.length}<p class="actors">{p.actors.join('、')}</p>{/if}
     <p class="src">{p.sources.map((s) => SOURCE_NAMES[s] ?? s).join(' · ')}</p>
+    {#if p.localAssets}<p title={p.localAssets}>{p.localAssets}</p>{/if}
+    {#if note && note !== p.localAssets}<p title={note}>{note}</p>{/if}
+    {#if onrefresh}<button class="btn sm ghost" type="button" aria-label={`重新抓取 ${code}`} disabled={busy} onclick={onrefresh}>重新抓取</button>{/if}
   </div>
 </article>
 
@@ -60,5 +63,6 @@
   p { margin: 0; font-size: var(--fs-xs); color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .meta span + span::before { content: '·'; margin: 0 5px; color: var(--text-3); }
   .src { color: var(--text-3); margin-top: auto; }
+  .body > button { align-self: flex-start; }
   @media (prefers-reduced-motion: reduce) { .rc, .check { animation: none; } }
 </style>

@@ -44,7 +44,8 @@ def main():
         print(result.stdout, end="", flush=True)
         assert result.returncode == 0, result.returncode
         assert "panicked" not in result.stdout
-        for case in ("before_listener", "delayed_started", "busy_and_settled", "real_preview_cancel", "real_export", "real_rollback", "network_batch_cancel_retry", "network_detail_cancel_retry", "import_component_roundtrip", "rebuild_cancel_transaction", "rebuild_retry_restore"):
+        assert "PASS bridge_actor_avatar_preview" in result.stdout
+        for case in ("before_listener", "delayed_started", "busy_and_settled", "real_preview_cancel", "real_export", "real_rollback", "network_batch_cancel_retry", "network_detail_cancel_retry", "import_component_roundtrip", "rebuild_cancel_transaction", "rebuild_retry_restore", "resume_preserve_remaining_undo"):
             assert f"PASS bridge_{case}" in result.stdout, case
 
 

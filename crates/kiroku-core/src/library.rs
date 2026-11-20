@@ -6,7 +6,6 @@
 use crate::{
     code::{parse_file_info, parse_text},
     metadata::{Metadata, SourcedScore},
-    nfo_read,
     organize::SIDECAR,
     pipeline::VIDEO_EXT,
 };
@@ -196,15 +195,24 @@ pub struct Library {
     root_identity: Arc<same_file::Handle>,
     db_identity: Arc<same_file::Handle>,
     root: PathBuf,
+    db_path: PathBuf,
     conn: Connection,
     read_cache: Arc<query::ReadCache>,
 }
 
 mod reader;
+mod storage;
 mod query;
 mod rebuild;
+mod directory;
+mod poster_cache;
+mod artwork_location;
+pub use artwork_location::{resolve_artwork_location, ArtworkLocation};
+use directory::MovieDirectory;
 mod prune;
+pub use prune::RefreshStats;
 mod export;
+pub use export::{CsvColumn,CsvOptions};
 mod overview;
 pub use overview::Overview;
 pub use reader::{LibraryReadHandle, LibraryReader};
@@ -228,13 +236,14 @@ fn optional_metadata_text(path: &Path) -> io::Result<Option<String>> {
 
 impl Library {
     pub fn db_path(root: &Path) -> PathBuf {
-        crate::journal::dir(root).join("library.db")
+        storage::db_path(root)
     }
 
     pub fn open(root: &Path) -> Result<Self> {
         fs::create_dir_all(crate::journal::dir(root))?;
         let root_identity = Arc::new(same_file::Handle::from_path(root)?);
         let path = Self::db_path(root);
+        storage::prepare(root, &path)?;
         let file = match fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -246,16 +255,20 @@ impl Library {
             Err(error) => return Err(error.into()),
         };
         let binding = LibraryReadHandle { root: root.to_path_buf(), root_identity, read_cache: Arc::new(query::ReadCache::default()),
-            db_identity: Arc::new(same_file::Handle::from_file(file)?) };
+            db_identity: Arc::new(same_file::Handle::from_file(file)?), db_path: path };
         Self::open_bound(binding)
     }
 
     fn open_bound(binding: LibraryReadHandle) -> Result<Self> {
         binding.verify()?;
-        let conn = Connection::open_with_flags(Self::db_path(&binding.root),
+        let conn = Connection::open_with_flags(&binding.db_path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
         binding.verify()?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+        let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+        if !mode.eq_ignore_ascii_case("wal") {
+            return Err(io::Error::other(format!("索引无法启用 WAL（实际为 {mode}），请使用本机索引缓存")).into());
+        }
+        conn.execute_batch("PRAGMA foreign_keys=ON;")?;
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if v < 1 {
             conn.execute_batch(&format!("BEGIN; {SCHEMA} PRAGMA user_version=2; COMMIT;"))?;
@@ -287,7 +300,7 @@ impl Library {
         if v < 5 {
             conn.execute_batch(&format!("BEGIN; {} PRAGMA user_version=5; COMMIT;", query::REVERSE_INDEXES))?;
         }
-        let library = Self { root_identity: binding.root_identity, db_identity: binding.db_identity, root: binding.root, conn, read_cache: binding.read_cache };
+        let library = Self { root_identity: binding.root_identity, db_identity: binding.db_identity, root: binding.root, db_path: binding.db_path, conn, read_cache: binding.read_cache };
         library.verify_binding()?;
         Ok(library)
     }
@@ -298,7 +311,7 @@ impl Library {
 
     /// Cheap clone: opening a query connection happens later, off the UI thread.
     pub fn reader_handle(&self) -> LibraryReadHandle {
-        LibraryReadHandle { root: self.root.clone(), root_identity: self.root_identity.clone(), db_identity: self.db_identity.clone(), read_cache: self.read_cache.clone() }
+        LibraryReadHandle { db_path: self.db_path.clone(), root: self.root.clone(), root_identity: self.root_identity.clone(), db_identity: self.db_identity.clone(), read_cache: self.read_cache.clone() }
     }
     fn verify_binding(&self) -> io::Result<()> { self.reader_handle().verify() }
 
@@ -310,6 +323,18 @@ impl Library {
 
     /// 读取一个影片目录并更新索引;目录不存在、没有元数据或没有视频文件时移除该目录的索引。
     /// 返回入库的番号。
+    /// Recovery must not multiply the default five-second lock timeout by the
+    /// batch size. Restore the normal timeout even on errors or unwinding.
+    pub(crate) fn reindex_dir_bounded(&self, dir: &Path, cancel: &CancellationToken) -> Result<Option<String>> {
+        struct Reset<'a>(&'a Connection);
+        impl Drop for Reset<'_> {
+            fn drop(&mut self) { let _ = self.0.busy_timeout(std::time::Duration::from_secs(5)); }
+        }
+        self.conn.busy_timeout(std::time::Duration::from_millis(250))?;
+        let _reset = Reset(&self.conn);
+        self.reindex_dir_cancellable(dir, cancel)
+    }
+
     pub fn reindex_dir(&self,dir:&Path)->Result<Option<String>>{self.reindex_dir_cancellable(dir,&CancellationToken::new())}
     pub fn reindex_dir_cancellable(&self,dir:&Path,cancel:&CancellationToken)->Result<Option<String>> {
         crate::append::check_cancel(cancel)?;
@@ -320,43 +345,23 @@ impl Library {
         let Ok(rel) = dir.strip_prefix(&self.root) else { return Ok(None) };
         let rel = rel_str(rel);
         crate::append::confined_path(&self.root,dir)?;
-        let mut links=vec![];
-        let (mut videos, mut sidecar, mut nfo) = (vec![], None::<String>, None::<String>);
-        let mut nfo_path = None;
-        let rd = match fs::read_dir(dir) {
-            Ok(entries) => Some(entries),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e.into()),
-        };
-        if let Some(rd) = rd {
-            for entry in rd {
-                let e = entry?;
-                let name = e.file_name().to_string_lossy().into_owned();
-                let ext = Path::new(&name).extension().and_then(|x| x.to_str()).unwrap_or("").to_ascii_lowercase();
-                if name == SIDECAR {
-                    sidecar = optional_metadata_text(&e.path())?;
-                } else if ext == "nfo" && (nfo.is_none() || name == "movie.nfo") {
-                    nfo = optional_metadata_text(&e.path())?;
-                    nfo_path = Some(e.path());
-                } else if VIDEO_EXT.contains(&ext.as_str()) && !name.starts_with("._") {
-                    if e.file_type()?.is_symlink(){links.push(e.path());continue;}
-                    match e.metadata() {
-                        Ok(metadata) => videos.push((name, metadata.len())),
-                        Err(e) if e.kind() == io::ErrorKind::NotFound => {},
-                        Err(e) => return Err(e.into()),
-                    }
+        let contents = MovieDirectory::read(dir, cancel)?;
+        let meta = contents.metadata(dir)?;
+        let mut videos = Vec::new();
+        for entry in &contents.videos {
+            let size = if entry.file_type()?.is_symlink() {
+                let meta = meta.as_ref().ok_or_else(|| io::Error::other("未登记媒体链接"))?;
+                let path = crate::placement::resolve_media_cancellable(&self.root, dir, &entry.path(), meta, cancel)?;
+                fs::metadata(path)?.len()
+            } else {
+                match entry.metadata() {
+                    Ok(metadata) => metadata.len(),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e.into()),
                 }
-            }
+            };
+            videos.push((entry.file_name().to_string_lossy().into_owned(), size));
         }
-        let dir_name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-        let meta = sidecar
-            .and_then(|s| serde_json::from_str::<Metadata>(&s).ok())
-            .or_else(|| nfo.and_then(|x| nfo_read::parse_nfo(&x, &dir_name)).map(|mut meta| {
-                if let Some(path) = &nfo_path { crate::assets::infer_from_nfo(&mut meta, path); }
-                meta
-            }));
-        if let Some(meta)=&meta {for link in &links {let resolved=crate::placement::resolve_media_cancellable(&self.root,dir,link,meta,cancel)?;videos.push((link.file_name().unwrap().to_string_lossy().into_owned(),fs::metadata(resolved)?.len()));}}
-        else if !links.is_empty(){return Err(io::Error::other("未登记媒体链接").into())}
         let Some(meta) = meta.filter(|_| !videos.is_empty()) else {
             self.conn.execute("DELETE FROM movie WHERE dir = ?1", params![rel])?;
             self.verify_binding()?;
@@ -364,14 +369,14 @@ impl Library {
             if let Some(transaction) = transaction { transaction.commit()?; }
             return Ok(None);
         };
-        self.upsert(&meta, &rel, dir, &videos, cancel)?;
+        self.upsert(&meta, &rel, dir, &videos, &contents, cancel)?;
         self.verify_binding()?;
         crate::append::check_cancel(cancel)?;
         if let Some(transaction) = transaction { transaction.commit()?; }
         Ok(Some(meta.code))
     }
 
-    fn upsert(&self, m: &Metadata, rel_dir: &str, dir: &Path, videos: &[(String, u64)], cancel: &CancellationToken) -> Result<()> {
+    fn upsert(&self, m: &Metadata, rel_dir: &str, dir: &Path, videos: &[(String, u64)], contents: &MovieDirectory, cancel: &CancellationToken) -> Result<()> {
         let f = &m.fields;
         let actors: Vec<&str> = f.actors.iter().map(|a| a.name.as_str()).collect();
         let search = [
@@ -385,10 +390,11 @@ impl Library {
         .to_lowercase();
         let year: Option<i32> = m.year().and_then(|y| y.parse().ok());
         let ct = serde_json::to_value(parse_text(&m.code).content_type).ok().and_then(|v| v.as_str().map(String::from));
-        let assets = crate::assets::Paths::for_movie(dir, m)?;
-        let poster = assets.poster.exists().then(|| rel_str(assets.poster.strip_prefix(&self.root).expect("movie within library")));
-        let poster_version = self.image_version(&assets.poster, cancel)?;
-        let fanart_version = self.image_version(&assets.fanart, cancel)?;
+        crate::assets::Paths::for_movie(dir, m)?;
+        let (poster_path, fanart_path) = contents.artwork(m);
+        let poster = poster_path.as_ref().map(|path| rel_str(path.strip_prefix(&self.root).expect("movie within library")));
+        let poster_version = self.image_version(poster_path, cancel)?;
+        let fanart_version = self.image_version(fanart_path, cancel)?;
         crate::append::check_cancel(cancel)?;
         self.verify_binding()?;
         let added = fs::metadata(dir).and_then(|md| md.modified()).ok()
@@ -420,7 +426,8 @@ impl Library {
         Ok(())
     }
 
-    fn image_version(&self, path: &Path, cancel: &CancellationToken) -> Result<Option<String>> {
+    fn image_version(&self, path: Option<&Path>, cancel: &CancellationToken) -> Result<Option<String>> {
+        let Some(path) = path else { return Ok(None) };
         use std::io::Read;
         use sha2::{Digest, Sha256};
         let result = (|| -> io::Result<Option<String>> {
@@ -564,8 +571,9 @@ impl Library {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let dir = self.abs(&rel_dir);
         let meta: Metadata = serde_json::from_str(&meta_json).unwrap_or_default();
-        let assets = crate::assets::Paths::for_movie(&dir, &meta)?;
-        let fanart = assets.fanart.exists().then(|| assets.fanart.to_string_lossy().into_owned());
+        crate::append::confined_path(&self.root, &dir)?;
+        let contents = MovieDirectory::read(&dir, &CancellationToken::new())?;
+        let fanart = contents.artwork(&meta).1.map(|path| path.to_string_lossy().into_owned());
         Ok(Some(MovieDetail { card, meta, dir: dir.to_string_lossy().into_owned(), files, fanart, fanart_version }))
     }
 

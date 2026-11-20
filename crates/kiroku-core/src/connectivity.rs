@@ -1,11 +1,11 @@
 //! Source-owned, non-destructive connectivity probes using the scraping HTTP stack.
 use crate::{
-    net::{Http, Page, Retry},
-    settings::Settings,
+    net::{Http, Page, Retry, Solver},
+    settings::{Settings, SourceCfg},
     source::SourceError,
 };
 use serde::Serialize;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::{error::Error, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
 use tokio_util::sync::CancellationToken;
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -39,19 +39,22 @@ pub fn assess(page: &Page, markers: &[&str]) -> ConnectivityOutcome {
     let body = page.body.to_lowercase();
     let error = crate::sources::common::check(page).err();
     if let Some(e) = error {
-        let reason = match e {
-            SourceError::NeedLogin(_) => "needLogin",
-            SourceError::Blocked(_) => {
+        let reason = match (page.status, e) {
+            (407, _) => "proxyAuthRequired",
+            (429, _) => "rateLimited",
+            (525 | 526, _) => "upstreamTlsError",
+            (503, _) if crate::sources::common::body_error(&page.body).is_ok() => "upstreamError",
+            (_, SourceError::NeedLogin(_)) => "needLogin",
+            (_, SourceError::Blocked(_)) => {
                 if body.contains("region") || body.contains("地域") {
                     "geoBlocked"
-                } else if page.status == 429 {
-                    "rateLimited"
                 } else {
                     "blocked"
                 }
             }
-            SourceError::NotFound => "endpointNotFound",
-            _ => "network",
+            (_, SourceError::NotFound) => "endpointNotFound",
+            (500..=599, _) => "upstreamError",
+            _ => "httpError",
         };
         return ConnectivityOutcome::new("failed", reason, status);
     }
@@ -68,8 +71,10 @@ pub fn assess_javdb(page: &Page, has_cookie: bool) -> ConnectivityOutcome {
     if outcome.status != "ok" { return outcome; }
     let doc = scraper::Html::parse_document(&page.body);
     let selector = scraper::Selector::parse(".navbar a[href]").expect("static selector");
+    let Ok(base) = reqwest::Url::parse(&page.url) else {
+        return ConnectivityOutcome::new("failed", "unexpectedResponse", Some(page.status));
+    };
     let paths: Vec<String> = doc.select(&selector).filter_map(|a| {
-        let base = reqwest::Url::parse(&page.url).ok()?;
         let url = base.join(a.value().attr("href")?).ok()?;
         (url.origin() == base.origin()).then(|| url.path().trim_end_matches('/').to_owned())
     }).collect();
@@ -83,23 +88,51 @@ pub fn assess_javdb(page: &Page, has_cookie: bool) -> ConnectivityOutcome {
     outcome
 }
 pub async fn probe_javdb(http: &Http, url: &str, cookie: &str) -> ConnectivityOutcome {
+    let Ok(base) = reqwest::Url::parse(url) else {
+        return ConnectivityOutcome::new("failed", "invalidUrl", None);
+    };
+    if !matches!(base.scheme(), "http" | "https") || !base.has_host() {
+        return ConnectivityOutcome::new("failed", "invalidUrl", None);
+    }
     let cookie = crate::sources::javdb::clean_cookie(cookie);
     http.seed_cookies(url, &cookie);
     match http.get_text(url).await {
-        Ok(page) => assess_javdb(&page, !cookie.is_empty()),
+        Ok(page) => {
+            if !reqwest::Url::parse(&page.url).is_ok_and(|u| u.origin() == base.origin()) {
+                return ConnectivityOutcome::new("failed", "unexpectedOrigin", Some(page.status));
+            }
+            assess_javdb(&page, !cookie.is_empty())
+        }
         Err(error) => network(error),
     }
 }
 fn network(error: reqwest::Error) -> ConnectivityOutcome {
-    ConnectivityOutcome::new(
-        "failed",
-        if error.is_timeout() {
-            "timeout"
-        } else {
-            "network"
-        },
-        error.status().map(|s| s.as_u16()),
-    )
+    let reason = if error.is_timeout() { "timeout" }
+        else if error.is_builder() { "invalidUrl" }
+        else if error.is_redirect() { "redirectError" }
+        else if let Some(tls) = tls_failure(&error) { tls }
+        else if error.is_connect() { "connectionFailed" }
+        else if error.is_body() || error.is_decode() { "responseReadFailed" }
+        else { "network" };
+    ConnectivityOutcome::new("failed", reason, error.status().map(|s| s.as_u16()))
+}
+
+fn tls_failure(error: &(dyn Error + 'static)) -> Option<&'static str> {
+    let mut cause = Some(error);
+    while let Some(current) = cause {
+        if let Some(tls) = current.downcast_ref::<rustls::Error>() {
+            return Some(match tls {
+                rustls::Error::InvalidCertificate(_) | rustls::Error::NoCertificatesPresented => "certificateError",
+                _ => "tlsError",
+            });
+        }
+        // An io::Error may wrap the TLS error directly; source() skips that wrapper's payload.
+        cause = match current.downcast_ref::<std::io::Error>().and_then(std::io::Error::get_ref) {
+            Some(inner) => Some(inner),
+            None => current.source(),
+        };
+    }
+    None
 }
 pub async fn probe_html(
     http: &Http,
@@ -135,28 +168,46 @@ pub async fn check(
     });
     let mut seen = std::collections::HashSet::new();
     let sources = settings.build_sources();
-    let http = settings.build_http().map(|h| {
-        h.with_retry(Retry {
-            attempts: 1,
-            unit: Duration::ZERO,
-        })
-    });
-    let per_source = http.as_ref().ok().map(|h| crate::pipeline::source_clients(settings, h));
+    // Start without a configured proxy: an invalid global proxy must only
+    // affect the sites that inherit it. All clients share cookies and throttling.
+    let direct = Http::new(Duration::from_secs(settings.min_interval_secs), None)
+        .ok()
+        .map(|http| http.with_retry(Retry { attempts: 1, unit: Duration::ZERO }));
+    let mut clients = std::collections::HashMap::<String, Http>::new();
+    let mut client_for = |cfg: &SourceCfg| -> Option<Http> {
+        let direct = direct.as_ref()?;
+        let proxy = settings.proxy_for(cfg);
+        if let Some((url, timeout)) = settings.solver_for(cfg) {
+            let solver = Solver::new(url, timeout, proxy).ok()?;
+            return Some(direct.with_solver(Some(solver)));
+        }
+        let Some(url) = proxy else { return Some(direct.clone()) };
+        if let Some(client) = clients.get(url) {
+            return Some(client.clone());
+        }
+        let client = direct.with_proxy(Some(url)).ok()?;
+        clients.insert(url.to_owned(), client.clone());
+        Some(client)
+    };
     let mut out = vec![];
     for id in ids {
         if !seen.insert(id.clone()) {
             continue;
         }
         let start = Instant::now();
+        let source = sources.iter().find(|s| s.id() == id);
+        let cfg = settings.sources.iter().find(|c| c.enabled && c.id == id);
         let outcome = if cancel.is_cancelled() {
             ConnectivityOutcome::skipped("cancelled")
-        } else if let Some(source) = sources.iter().find(|s| s.id() == id) {
-            match (&http, &per_source) {
-                (Ok(h), Some(Ok(clients))) => {
-                    let h = clients.get(&id).unwrap_or(h);
-                    tokio::select! {_ = cancel.cancelled()=>ConnectivityOutcome::skipped("cancelled"),result=source.check_connectivity(h)=>result}
+        } else if let (Some(source), Some(cfg)) = (source, cfg) {
+            match client_for(cfg) {
+                Some(http) => {
+                    tokio::select! {
+                        _ = cancel.cancelled() => ConnectivityOutcome::skipped("cancelled"),
+                        result = source.check_connectivity(&http) => result,
+                    }
                 }
-                _ => ConnectivityOutcome::new("failed", "invalidProxy", None),
+                None => ConnectivityOutcome::new("failed", "invalidProxy", None),
             }
         } else {
             ConnectivityOutcome::skipped("disabledOrUnknown")
@@ -191,6 +242,34 @@ mod tests {
         let blocked = Page { status: 403, url: "https://javdb.com/".into(), body: "JavDB Access denied".into() };
         assert_eq!(assess_javdb(&blocked, true).reason, "blocked");
     }
+    #[tokio::test]
+    async fn invalid_proxy_only_affects_the_source_that_uses_it() {
+        use crate::settings::SourceProxy;
+        let mut settings = Settings::default();
+        // An unsupported URL scheme reaches the probe but never opens a socket.
+        for cfg in &mut settings.sources {
+            cfg.base = "file:///synthetic-connectivity-test".into();
+        }
+        let ids = ["jav321".to_string()];
+        let cancel = CancellationToken::new();
+        let reference = check(&settings, Some(&ids), &cancel).await.remove(0).outcome.reason;
+        assert_ne!(reference, "invalidProxy");
+
+        let other = settings.sources.iter_mut().find(|c| c.id == "javbus").unwrap();
+        other.proxy = SourceProxy::Custom { url: "http://[".into() };
+        assert_eq!(check(&settings, Some(&ids), &cancel).await[0].outcome.reason, reference);
+
+        settings.proxy = Some("http://[".into());
+        let all = ["javbus".into(), "jav321".into(), "javdb".into()];
+        for mode in [SourceProxy::Direct, SourceProxy::Custom { url: "http://127.0.0.1:3128".into() }] {
+            settings.sources.iter_mut().find(|c| c.id == "jav321").unwrap().proxy = mode;
+            let checks = check(&settings, Some(&all), &cancel).await;
+            assert_eq!(checks[0].outcome.reason, "invalidProxy"); // Own custom proxy
+            assert_eq!(checks[1].outcome.reason, reference);
+            assert_eq!(checks[2].outcome.reason, "invalidProxy"); // Inherited global proxy
+        }
+    }
+
     #[tokio::test]
     async fn self_check_uses_each_source_proxy() {
         use std::io::{Read, Write};

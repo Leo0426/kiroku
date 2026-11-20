@@ -18,22 +18,45 @@ struct Backend {
     cfg: Config,
     verified: Mutex<Option<same_file::Handle>>,
 }
-static BACKEND: OnceLock<Mutex<Option<Arc<Backend>>>> = OnceLock::new();
-pub fn configure(config: Option<Config>) -> io::Result<()> {
-    if let Some(c) = &config {
-        if c.host.is_empty()
-            || c.host.starts_with('-')
-            || !c
-                .host
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"._-@".contains(&b))
-            || !c.local_root.is_absolute()
-            || !c.remote_root.is_absolute()
-        {
-            return Err(io::Error::other("NAS SSH 配置无效"));
-        }
+#[derive(Default)]
+struct Configuration {
+    backend: Option<Arc<Backend>>,
+    error: Option<String>,
+}
+static CONFIGURATION: OnceLock<Mutex<Configuration>> = OnceLock::new();
+fn configuration() -> std::sync::MutexGuard<'static, Configuration> {
+    CONFIGURATION
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+fn validate(c: &Config) -> io::Result<()> {
+    if c.host.is_empty()
+        || c.host.starts_with('-')
+        || !c
+            .host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-@".contains(&b))
+        || !c.local_root.is_absolute()
+        || !c.remote_root.is_absolute()
+        || c.local_root
+            .components()
+            .chain(c.remote_root.components())
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(io::Error::other(
+            "NAS SSH 配置无效，请检查主机与绝对路径映射",
+        ));
     }
-    *BACKEND.get_or_init(Default::default).lock().unwrap() = config.map(|cfg| {
+    Ok(())
+}
+pub fn configure(config: Option<Config>) -> io::Result<()> {
+    let result = config.as_ref().map(validate).transpose();
+    let mut state = configuration();
+    state.backend = None;
+    state.error = result.as_ref().err().map(ToString::to_string);
+    result?;
+    state.backend = config.map(|cfg| {
         Arc::new(Backend {
             cfg,
             verified: Mutex::new(None),
@@ -42,18 +65,108 @@ pub fn configure(config: Option<Config>) -> io::Result<()> {
     Ok(())
 }
 pub fn configure_file(settings: &Path) -> io::Result<()> {
-    let p = settings.with_file_name("nas-operations.json");
-    match fs::read(p) {
-        Ok(b) => configure(Some(serde_json::from_slice(&b)?)),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => configure(None),
-        Err(e) => Err(e),
+    let path = settings.with_file_name("nas-operations.json");
+    let parsed = match fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|_| {
+            io::Error::other("NAS 配置文件格式无效，请修正 nas-operations.json 后重启")
+        }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(_) => Err(io::Error::other("无法读取 NAS 配置文件，请检查权限后重启")),
+    };
+    match parsed {
+        Ok(config) => configure(config),
+        Err(error) => {
+            *configuration() = Configuration {
+                backend: None,
+                error: Some(error.to_string()),
+            };
+            Err(error)
+        }
     }
 }
+/// Invalid opt-in configuration must never silently enable the local fallback.
+pub fn ensure_writes_allowed() -> io::Result<()> {
+    match &configuration().error {
+        Some(error) => Err(io::Error::other(format!("{error}；媒体写入已阻止"))),
+        None => Ok(()),
+    }
+}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Status {
+    pub state: String,
+    pub message: String,
+    pub local_root: Option<PathBuf>,
+    pub remote_root: Option<PathBuf>,
+}
+pub fn status() -> Status {
+    let state = configuration();
+    if let Some(error) = &state.error {
+        return Status {
+            state: "invalid".into(),
+            message: error.clone(),
+            local_root: None,
+            remote_root: None,
+        };
+    }
+    match &state.backend {
+        None => Status {
+            state: "disabled".into(),
+            message: "未配置 NAS SSH，使用普通文件操作".into(),
+            local_root: None,
+            remote_root: None,
+        },
+        Some(b) => {
+            // A previously checked mount can disappear or be replaced.
+            let current = same_file::Handle::from_path(&b.cfg.local_root).ok();
+            let verified = b.verified.lock().unwrap_or_else(|e| e.into_inner());
+            let ready = current.is_some() && current.as_ref() == verified.as_ref();
+            Status {
+                state: if ready { "verified" } else { "unverified" }.into(),
+                message: if ready {
+                    "NAS 映射已核验；能力检测仅代表检测时的文件系统"
+                } else {
+                    "已配置 NAS SSH，等待核验当前挂载"
+                }
+                .into(),
+                local_root: Some(b.cfg.local_root.clone()),
+                remote_root: Some(b.cfg.remote_root.clone()),
+            }
+        }
+    }
+}
+/// Explicit capability probe. Its only writes are in a newly owned temporary
+/// directory under the configured mount; it never uses a media path.
+pub fn diagnose(cancel: &dyn Fn() -> bool) -> io::Result<Status> {
+    ensure_writes_allowed()?;
+    let configured = { configuration().backend.clone() };
+    let Some(b) = configured else {
+        return Ok(status());
+    };
+    crate::append::check_stopped(cancel)?;
+    let guard = crate::pipeline::RootGuard::capture(&b.cfg.local_root, false)?;
+    let temp = tempfile::Builder::new()
+        .prefix(".kiroku-nas-check-")
+        .tempdir_in(&b.cfg.local_root)?;
+    let probe = temp.path().join("probe");
+    let token = format!("neutral:{}:{:?}", std::process::id(), Instant::now());
+    fs::write(&probe, token.as_bytes())?;
+    let result = b.call(serde_json::json!({"op":"capabilities","root":b.cfg.remote_root,"from":b.mapped(&probe)?,"token":token}), cancel);
+    // Keep the root identity bound across remote execution and cleanup.
+    guard.verify()?;
+    let cleanup = temp.close();
+    let value = result?;
+    if value["ok"] != true {
+        return Err(io::Error::other("NAS 路径映射或文件操作能力核验失败"));
+    }
+    cleanup.map_err(|_| io::Error::other("NAS 核验完成，但临时探针未能清理，请检查挂载"))?;
+    *b.verified.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some(same_file::Handle::from_path(&b.cfg.local_root)?);
+    Ok(status())
+}
 fn backend(path: &Path) -> Option<Arc<Backend>> {
-    BACKEND
-        .get()?
-        .lock()
-        .ok()?
+    configuration()
+        .backend
         .clone()
         .filter(|b| path.starts_with(&b.cfg.local_root))
 }
@@ -146,11 +259,20 @@ impl Backend {
                 18 => io::ErrorKind::CrossesDevices,
                 2 => io::ErrorKind::NotFound,
                 13 => io::ErrorKind::PermissionDenied,
+                95 => io::ErrorKind::Unsupported,
                 _ => io::ErrorKind::Other,
+            };
+            let stage = match value.get("stage").and_then(|v| v.as_str()) {
+                Some("mapping") => "路径映射",
+                Some("link") => "恢复硬链接",
+                Some("rename") => "不覆盖移动",
+                Some("digest") => "摘要",
+                Some("sync") => "目录同步",
+                _ => "文件操作",
             };
             return Err(io::Error::new(
                 kind,
-                format!("NAS 文件操作失败（服务器错误 {n}）"),
+                format!("NAS {stage}核验失败（服务器错误 {n}）"),
             ));
         }
         Ok(value)
@@ -326,8 +448,50 @@ def safe(p,missing=False):
  return cur
 def identity(s):return (s.st_dev,s.st_ino,s.st_size,s.st_mtime_ns,s.st_ctime_ns)
 try:
+ stage='mapping'
  src=safe(q['from'])
- if q['op']=='probe':
+ if q['op']=='capabilities':
+  with open(src,'rb') as f:
+   if f.read(1024)!=q['token'].encode():raise OSError(13,'mapping mismatch')
+  parent=os.path.dirname(src);anchor=os.path.join(parent,'anchor');target=os.path.join(parent,'target');occupied=os.path.join(parent,'occupied')
+  owned={}
+  def own(p):
+   st=os.lstat(p);owned[p]=(st.st_dev,st.st_ino)
+  stage='rename'
+  libc=ctypes.CDLL(None,use_errno=True)
+  if not hasattr(libc,'renameat2'):raise OSError(95,'exclusive rename unsupported')
+  rename=libc.renameat2
+  rename.argtypes=[ctypes.c_int,ctypes.c_char_p,ctypes.c_int,ctypes.c_char_p,ctypes.c_uint];rename.restype=ctypes.c_int
+  def move(a,b):
+   if rename(-100,os.fsencode(a),-100,os.fsencode(b),1)!=0:raise OSError(ctypes.get_errno(),'exclusive rename failed')
+  try:
+   stage='link'
+   os.link(src,anchor,follow_symlinks=False);own(anchor)
+   with open(occupied,'xb') as f:f.write(b'neutral occupied');f.flush();os.fsync(f.fileno())
+   own(occupied)
+   stage='rename'
+   try:move(src,occupied)
+   except OSError as e:
+    if e.errno!=17:raise
+   else:raise OSError(5,'collision was overwritten')
+   move(src,target);own(target)
+   if not os.path.samefile(target,anchor):raise OSError(5,'anchor mismatch')
+   stage='digest'
+   with open(target,'rb') as f:
+    if hashlib.sha256(f.read()).hexdigest()!=hashlib.sha256(q['token'].encode()).hexdigest():raise OSError(5,'digest mismatch')
+   move(target,src)
+   stage='sync'
+   fd=os.open(parent,os.O_RDONLY)
+   try:os.fsync(fd)
+   finally:os.close(fd)
+   result={'ok':True}
+  finally:
+   for p,expected in owned.items():
+    try:
+     st=os.lstat(p)
+     if (st.st_dev,st.st_ino)==expected:os.unlink(p)
+    except FileNotFoundError:pass
+ elif q['op']=='probe':
   with open(src,'rb') as f: ok=f.read(1024)==q['token'].encode()
   result={'ok':ok}
  elif q['op']=='stat':
@@ -378,7 +542,7 @@ try:
   result={'digest':h.hexdigest()}
  else:raise OSError(22,'unknown operation')
  print(json.dumps(result))
-except OSError as e:print(json.dumps({'errno':e.errno or 5}))
+except OSError as e:print(json.dumps({'errno':e.errno or 5,'stage':stage}))
 "#;
 
 #[cfg(test)]

@@ -5,7 +5,7 @@
   import { PosterPages, POSTER_PAGE_LIMIT, POSTER_REQUEST_LIMIT, type PosterPage } from '../lib/poster-pages'
   import type { MovieCard, Query } from '../lib/types'
   import type { Layout } from '../lib/library-browser'
-  import PosterCard from './PosterCard.svelte'
+  import PosterCard, { type PosterMenu } from './PosterCard.svelte'
   import LoadingStatus from './LoadingStatus.svelte'
 
   /**
@@ -15,6 +15,8 @@
   let {
     query,
     version,
+    retryEpoch = 0,
+    onretryfailed,
     onopen,
     onmenu,
     ontotal,
@@ -24,8 +26,10 @@
   }: {
     query: Query
     version: number
-    onopen: (code: string, index?: number) => void
-    onmenu?: (card: MovieCard, x: number, y: number) => void
+    retryEpoch?: number
+    onretryfailed?: (code: string) => void
+    onopen: (code: string, index: number, trigger: HTMLButtonElement) => void
+    onmenu?: (menu: PosterMenu) => void
     ontotal?: (total: number) => void
     onloading?: (loading: boolean) => void
     empty?: Snippet
@@ -173,14 +177,20 @@
       pump()
     })
   })
-  let presentation = ''
+  let previousGeometry: { columns: number; rowHeight: number } | undefined
   $effect(() => {
-    const key = `${layout}:${posterScale}:${gridMode}:${columns}:${visibleRows}`
+    const geometry = { columns: cols, rowHeight: rowH }
+    const previous = previousGeometry
+    previousGeometry = geometry
+    if (!previous || (previous.columns === cols && previous.rowHeight === rowH)) return
     untrack(() => {
-      if (presentation && presentation !== key && scroller) {
-        scroller.scrollTop = 0; scrollTop = 0; onscrollposition?.(0)
-      }
-      presentation = key
+      if (!scroller || !loaded || !total || restorePending || focusTarget !== null) return
+      // Preserve the first visible film and its row offset when the grid reflows.
+      const oldRow = scrollTop / previous.rowHeight
+      const anchor = Math.min(total - 1, Math.floor(oldRow) * previous.columns)
+      scroller.scrollTop = (Math.floor(anchor / geometry.columns) + oldRow % 1) * geometry.rowHeight
+      scrollTop = scroller.scrollTop
+      onscrollposition?.(scrollTop)
     })
   })
   $effect(() => {
@@ -224,9 +234,9 @@
   })
   function keyNavigate(e: KeyboardEvent) {
     if (e.isComposing || e.altKey || e.metaKey || e.shiftKey || !total) return
-    const from = (e.target as HTMLElement).closest<HTMLElement>('[data-card-index]')
+    const from = (e.target as HTMLElement).closest<HTMLElement>('[data-card-index], [data-poster-for]')
     if (!from && e.target !== scroller) return
-    const index = focusTarget ?? (from ? Number(from.dataset.cardIndex) : focusIndex)
+    const index = focusTarget ?? (from ? Number(from.dataset.cardIndex ?? from.dataset.posterFor) : focusIndex)
     const delta = e.key === 'ArrowRight' ? 1 : e.key === 'ArrowLeft' ? -1 : e.key === 'ArrowDown' ? cols : e.key === 'ArrowUp' ? -cols : 0
     if (!delta && e.key !== 'Home' && e.key !== 'End') return
     e.preventDefault()
@@ -296,7 +306,7 @@
     <div class="spacer" bind:this={spacer} style="height:{rows * rowH}px">
       <div class="grid" style="transform:translateY({first * rowH}px);grid-template-columns:{tracks};gap:{layout === 'list' ? 12 : GAP}px">
         {#each indices as i (`${i}:${cardAt(i)?.code ?? 'placeholder'}`)}
-          <PosterCard card={cardAt(i)} {layout} index={i} tabIndex={i === (indices.includes(focusIndex) ? focusIndex : indices[0]) ? 0 : -1} onfocus={() => { focusIndex = i; focusTarget = null }} delay={fresh ? Math.min(i - first * cols, 14) * 30 : -1} onopen={code => onopen(code, i)} {onmenu} />
+          <PosterCard card={cardAt(i)} retryEpoch={pages[Math.floor(i / PAGE)]?.generation === gen ? retryEpoch : undefined} {onretryfailed} {layout} index={i} tabIndex={i === (indices.includes(focusIndex) ? focusIndex : indices[0]) ? 0 : -1} onfocus={() => { focusIndex = i; focusTarget = null }} delay={fresh ? Math.min(i - first * cols, 14) * 30 : -1} {onopen} {onmenu} />
         {/each}
       </div>
     </div>

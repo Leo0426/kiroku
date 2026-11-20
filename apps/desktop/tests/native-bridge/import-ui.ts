@@ -24,8 +24,8 @@ const network = () => invoke<{ requests: string[], holding: boolean }>('bridge_n
 export async function runImportUi(passed: string[]) {
   const fixture = await invoke<{ settings: Settings, inputRoot: string, base: string }>('bridge_network_prepare', { scanFromUi: true })
   flow.reset()
-  flow.dirs = [fixture.inputRoot]
   app.settings = fixture.settings
+  await flow.addSourcePaths([fixture.inputRoot])
   const host = document.createElement('main')
   host.style.cssText = 'height:100vh;overflow:auto'
   document.body.append(host)
@@ -52,12 +52,12 @@ export async function runImportUi(passed: string[]) {
   }
   try {
     await tick()
-    assert(has('h1', '导入整理') && has('li[aria-current="step"] .lbl', '选择文件夹'), 'Import view did not mount at source step')
+    assert(has('h1', '导入整理') && has('li[aria-current="step"] .lbl', '选择来源'), 'Import view did not mount at source step')
     await click(/^开始扫描$/)
     await until(() => !flow.scanRunning && flow.scanSummary !== null, 'real scan completion')
     await tick()
     assert([...flow.items].length === 3 && flow.scanSummary?.complete && !flow.error, 'UI scan did not discover fixture videos')
-    assert(has('li[aria-current="step"] .lbl', '识别文件'), 'Scan stepper not updated')
+    assert(has('li[aria-current="step"] .lbl', '核对资料'), 'Scan stepper not updated')
     const [first, second, third] = flow.uniqueCodes
     // Real directory iteration has no lexical-order guarantee. Hold the actual
     // second item without rearranging the scanned production session or UI.
@@ -118,11 +118,25 @@ export async function runImportUi(passed: string[]) {
       assert(detail?.meta.title === `Neutral ${code}` && detail.meta.provenance?.title === 'javbus', `Imported index is wrong: ${code}`)
     }
     await invoke('bridge_import_verify', { journalId: applied.journalId, rolledBack: false })
+    await click(/^查看本批操作$/)
+    const batchOperations = () => host.querySelector('[aria-label="历史操作详情"]')?.textContent ?? ''
+    await until(() => ['NET-101', 'NET-102', 'NET-103'].every(code => batchOperations().includes(code)), 'journal contains operations for the three imported films')
+    assert(applied.journalId && applied.canRollback === true, 'No verified rollback record for imported files')
+    const wrongRoot = await api.historyDetail(crypto.randomUUID(), applied.journalId, 0, fixture.inputRoot).then(() => '', String)
+    assert(wrongRoot.includes('媒体库已变化'), 'Journal read accepted a different library')
+    const wrongUndo = await api.rollback(applied.journalId, fixture.inputRoot).then(() => '', String)
+    assert(wrongUndo.includes('媒体库已变化'), 'Rollback accepted a different library')
+    assert((await job()).jobId === null, 'Rejected rollback kept the job slot')
+    await invoke('bridge_import_verify', { journalId: applied.journalId, rolledBack: false })
 
     await click(/^撤销本批$/)
     assert(buttons(/^确认撤销$/).length === 1, 'Undo confirmation missing')
     await click(/^确认撤销$/)
     await until(() => host.textContent?.includes('本批已撤销') === true, 'undo success in UI')
+    await until(() => {
+      const states = [...host.querySelectorAll('[aria-label="历史操作详情"] li strong')]
+      return states.length > 0 && states.every(label => label.textContent === '已撤销')
+    }, 'journal displays the rolled back operations')
     assert(buttons(/^撤销本批$/).length === 0 && (await job()).jobId === null, 'Undo did not settle')
     for (const code of ['NET-101', 'NET-102', 'NET-103']) assert(await api.libraryGet(code) === null, `Rolled-back film remains indexed: ${code}`)
     for (const code of ['SMPL-001', 'SMPL-002']) {

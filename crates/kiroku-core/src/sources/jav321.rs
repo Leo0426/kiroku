@@ -92,11 +92,12 @@ pub fn parse_detail(html: &str) -> Result<PartialMetadata, SourceError> {
         .filter_map(|i| i.value().attr("src").map(String::from))
         .collect();
     m.thumb_urls = imgs.iter().filter(|u| u.ends_with("pl.jpg")).take(1).cloned().collect();
-    // 左栏小图 ps.jpg 是竖版封面
+    // The detail panel owns the portrait artwork; alternate catalogs use pf_*
+    // rather than DMM ps.jpg. Restrict the DOM role to exclude recommendations.
     m.poster_urls = panel
-        .select(&sel("div.col-md-3 img.img-responsive"))
+        .select(&sel("div.panel-body > div.row > div.col-md-3 > img.img-responsive"))
         .filter_map(|i| i.value().attr("src"))
-        .filter(|u| u.ends_with("ps.jpg"))
+        .filter(|u| !u.trim().is_empty())
         .take(1)
         .map(String::from)
         .collect();
@@ -168,6 +169,15 @@ mod tests {
         assert!(m.plot.as_deref().unwrap().starts_with("Synthetic plot"));
         assert!(m.thumb_urls[0].ends_with("abc00001pl.jpg"));
         assert!(m.extrafanart.len() >= 2 && m.extrafanart[0].contains("jp-1"));
+    }
+
+    #[test]
+    fn alternate_main_artwork_is_a_poster_without_cropping_a_sample() {
+        let m = parse_detail(include_str!("../../tests/fixtures/jav321/detail_alternate_artwork.html")).unwrap();
+        assert_eq!(m.poster_urls, ["https://img.example.test/images/sample/pf_o1_test-001.jpg?size=small"]);
+        assert!(m.thumb_urls.is_empty(), "a landscape sample is not a wraparound cover");
+        assert_eq!(m.extrafanart.len(), 2);
+        assert!(!m.poster_urls.iter().any(|url| url.contains("other")));
     }
 
     #[test]

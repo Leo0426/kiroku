@@ -1,5 +1,12 @@
-import { expect, test } from '@playwright/test'
+import { expect, test, type Locator } from '@playwright/test'
 import { seedLibrary } from './helpers'
+
+function buttonBoxes(buttons: Locator) {
+  return buttons.evaluateAll(elements => elements.map(el => {
+    const { x, y, width, height } = el.getBoundingClientRect()
+    return { x, y, width, height }
+  }))
+}
 
 test('detail tools are compact and language export opens without losing its draft', async ({ page }) => {
   await seedLibrary(page)
@@ -10,7 +17,7 @@ test('detail tools are compact and language export opens without losing its draf
   await expect(tools).toBeVisible()
   await expect(panel.getByLabel('NFO 导出语言')).not.toBeVisible()
   const buttons = tools.getByRole('button')
-  await expect(buttons).toHaveCount(6)
+  await expect(buttons).toHaveCount(8)
   const edit = await tools.getByRole('button', { name: '编辑元数据', exact: true }).boundingBox()
   const update = await tools.getByRole('button', { name: '更新与来源', exact: true }).boundingBox()
   expect(Math.abs(edit!.y - update!.y)).toBeLessThan(3)
@@ -33,6 +40,98 @@ test('expanded editors fit a narrow detail panel and can be cancelled', async ({
   expect(await panel.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true)
   await panel.getByRole('button', { name: '取消编辑', exact: true }).click()
   await expect(panel.getByRole('button', { name: '编辑元数据', exact: true })).toBeVisible()
+})
+
+test('tool buttons use equal columns and editor actions share an aligned row', async ({ page }) => {
+  await seedLibrary(page)
+  await page.goto('/')
+  await page.locator('button.pcard').first().click()
+  const panel = page.getByLabel('影片详情', { exact: true })
+  const tools = panel.getByRole('region', { name: '影片工具', exact: true })
+  const triggers = tools.locator('.tool-grid > section > button:first-child')
+  const toolBoxes = () => buttonBoxes(triggers)
+
+  async function expectColumns(columns: number) {
+    await expect.poll(async () => new Set((await toolBoxes()).map(box => box.x)).size).toBe(columns)
+    const boxes = await toolBoxes()
+    expect(boxes).toHaveLength(8)
+    for (const [i, box] of boxes.entries()) {
+      expect(box.width).toBeCloseTo(boxes[0].width, 0)
+      expect(box.height).toBeCloseTo(boxes[0].height, 0)
+      expect(box.x).toBeCloseTo(boxes[i % columns].x, 0)
+      expect(box.y).toBeCloseTo(boxes[i - i % columns].y, 0)
+    }
+  }
+
+  await expectColumns(3)
+  const editor = tools.getByLabel('人工编辑', { exact: true })
+  await editor.getByRole('button', { name: '编辑元数据', exact: true }).click()
+  await expect(page.getByRole('complementary', { name: '影片详情' })).toBeVisible()
+  await editor.getByLabel('编辑标题', { exact: true }).fill('示例标题')
+  const previewButton = editor.getByRole('button', { name: '预览差异', exact: true })
+  const [previewBox, cancelBox] = await buttonBoxes(editor.locator('form .tool-actions > button'))
+  expect(previewBox.y).toBeCloseTo(cancelBox.y, 0)
+  expect(previewBox.width).toBeCloseTo(cancelBox.width, 0)
+  expect(previewBox.height).toBeCloseTo(cancelBox.height, 0)
+  await previewButton.click()
+  const preview = editor.getByLabel('修订差异预览')
+  const save = preview.getByRole('button', { name: '确认保存', exact: true })
+  await expect(save).toBeVisible()
+  const [saveBox, backBox] = await buttonBoxes(preview.locator('.tool-actions > button'))
+  expect(saveBox.y).toBeCloseTo(backBox.y, 0)
+  expect(saveBox.width).toBeCloseTo(backBox.width, 0)
+  expect(saveBox.height).toBeCloseTo(backBox.height, 0)
+
+  await page.setViewportSize({ width: 390, height: 780 })
+  await expectColumns(2)
+  await page.evaluate(() => document.documentElement.style.setProperty('--text-scale', '1.3'))
+  await expectColumns(2)
+  expect(await panel.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true)
+})
+
+test('metadata expands in the drawer and keeps its draft when fields reflow', async ({ page }) => {
+  await seedLibrary(page)
+  await page.setViewportSize({ width: 1280, height: 900 })
+  await page.goto('/')
+  await page.locator('button.pcard').first().click()
+  const panel = page.getByRole('complementary', { name: '影片详情', exact: true })
+  const tools = panel.getByRole('region', { name: '影片工具', exact: true })
+  const edit = tools.getByRole('button', { name: '编辑元数据', exact: true })
+  const resize = page.getByRole('separator', { name: '调整详情宽度' })
+  await expect(resize).toBeVisible()
+  const bounds = await panel.boundingBox()
+  await edit.click()
+  const title = tools.getByLabel('编辑标题', { exact: true })
+  await expect(title).toBeVisible()
+  expect(await panel.boundingBox()).toEqual(bounds)
+  await expect(resize).toBeVisible()
+
+  const fields = tools.getByRole('group', { name: '影片资料', exact: true })
+  const date = fields.getByLabel('编辑发行日期', { exact: true })
+  const length = fields.getByLabel('编辑时长', { exact: true })
+  const fieldBounds = () => fields.evaluate(el => ['编辑发行日期', '编辑时长'].map(label => {
+    const { x, y, width } = el.querySelector(`[aria-label="${label}"]`)!.getBoundingClientRect()
+    return { x, y, width }
+  }))
+  const [dateBox, lengthBox] = await fieldBounds()
+  expect(dateBox.y).toBeCloseTo(lengthBox.y, 0)
+  expect(dateBox.width).toBeCloseTo(lengthBox.width, 0)
+  expect(dateBox.x + dateBox.width).toBeLessThan(lengthBox.x)
+  await title.fill('示例草稿')
+
+  await page.setViewportSize({ width: 390, height: 780 })
+  await expect.poll(async () => {
+    const [first, second] = await fieldBounds()
+    return first.x === second.x && first.y < second.y
+  }).toBe(true)
+  await expect(date).toBeVisible()
+  await expect(length).toBeVisible()
+  await expect(title).toHaveValue('示例草稿')
+  await page.setViewportSize({ width: 1280, height: 900 })
+  await expect(title).toHaveValue('示例草稿')
+  await tools.getByRole('button', { name: '取消编辑', exact: true }).click()
+  await expect(title).not.toBeVisible()
+  expect(await panel.boundingBox()).toEqual(bounds)
 })
 
 test('detail width can be dragged, remembered, reset and clamped to the window', async ({ page }) => {
@@ -130,17 +229,20 @@ test('remembered large detail width never hides its poster behind navigation',as
  }
 })
 
-test('tool labels stay in place and every disclosure opens below all labels',async({page})=>{
- await seedLibrary(page);await page.goto('/');await page.locator('button.pcard').first().click()
+test('stacked tool labels stay in place and every disclosure opens below all labels',async({page})=>{
+ await seedLibrary(page);await page.setViewportSize({width:800,height:720});await page.goto('/');await page.locator('button.pcard').first().click()
  const panel=page.getByLabel('影片详情',{exact:true})
  const tools=panel.getByRole('region',{name:'影片工具',exact:true})
  const triggers=tools.locator('.tool-grid > section > button:first-child')
  const positions=()=>triggers.evaluateAll(els=>els.map(el=>{const r=el.getBoundingClientRect(),p=el.closest('.toolbox')!.getBoundingClientRect();return {x:r.x-p.x,y:r.y-p.y}}))
- const before=await positions()
+ await expect(page.getByRole('separator',{name:'调整详情宽度'})).toBeVisible()
+ const closedLayout = await positions()
+ const bounds = await panel.boundingBox()
  for(const name of ['编辑元数据','更新与来源','追加视频或字幕','演员头像','语言与 NFO']){
   const button=tools.getByRole('button',{name,exact:true})
   await button.click();await expect(button).toHaveAttribute('aria-expanded','true')
-  expect(await positions()).toEqual(before)
+  await expect.poll(positions).toEqual(closedLayout)
+  expect(await panel.boundingBox()).toEqual(bounds)
   const content=tools.locator('.tool-content:visible')
   await expect(content).toHaveCount(1)
   const lowest=await triggers.evaluateAll(els=>Math.max(...els.map(el=>el.getBoundingClientRect().bottom)))

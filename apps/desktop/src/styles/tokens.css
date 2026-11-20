@@ -16,7 +16,7 @@
 
   --text-1: #f3f1ec;
   --text-2: #a9a7a1;
-  --text-3: #6f6d69;
+  --text-3: #94918b;
 
   /* 单一强调色:琥珀 */
   --accent: #e9a64c;
@@ -93,15 +93,15 @@
     --line-strong: rgb(30 24 16 / 0.18);
     --text-1: #1d1b17;
     --text-2: #66625a;
-    --text-3: #9a958b;
-    --accent: #c9801f;
-    --accent-hover: #b36f16;
+    --text-3: #6c675e;
+    --accent: #98580e;
+    --accent-hover: #804708;
     --accent-ink: #ffffff;
     --accent-soft: rgb(201 128 31 / 0.12);
-    --ok: #1f9a67;
-    --warn: #b87a0c;
-    --danger: #d04846;
-    --info: #2f7fcf;
+    --ok: #18734b;
+    --warn: #895a08;
+    --danger: #a73b39;
+    --info: #2567a8;
     --ok-soft: rgb(31 154 103 / 0.12);
     --warn-soft: rgb(184 122 12 / 0.12);
     --danger-soft: rgb(208 72 70 / 0.1);

@@ -421,8 +421,8 @@ pub fn legacy_local_original(root: &Path, dir: &Path, url: &str) -> io::Result<O
 }
 
 /// Rebuild edited version badges from the retained original, in the same undoable revision.
-pub fn revise_phase(mut preview: Preview, settings: &crate::settings::Settings) -> io::Result<Preview> {
-    if preview.before.artwork_phase == preview.after.artwork_phase { return Ok(preview); }
+pub fn revise_phase(preview: Preview, settings: &crate::settings::Settings) -> io::Result<Preview> {
+    let mut preview = preview.for_version_export()?;
     let Some(original) = Original::load(preview.clone())? else {
         preview.warnings.push("版本标记会保存；缺少保留原图，海报未更新。请先通过海报裁剪保留原图，再修改版本标记。".into());
         return Ok(preview);
@@ -438,11 +438,12 @@ pub fn revise_phase(mut preview: Preview, settings: &crate::settings::Settings) 
     } else {
         // Old imports retain the original but not the chosen crop. Only reconstruct known geometry.
         let (w,h) = dimensions(&original.bytes)?;
-        let current_dims = current.as_ref().map(|b| dimensions(b)).transpose()?;
+        let current_dims = current.as_ref().and_then(|b| dimensions(b).ok());
         let right_width = ((h as f64 * 0.7047).round() as u32).min(w);
         let crop = match current_dims {
             Some(d) if d == (w,h) => None,
             Some(d) if w as f64 / h as f64 > 1.2 && d == (right_width,h) => Some(crate::organize::Crop::PosterRight),
+            None if current.is_none() => Some(crate::organize::Crop::PosterRight),
             _ => {
                 preview.warnings.push("版本标记会保存；无法确认现有海报裁剪范围，海报未更新。请先通过海报裁剪确认范围。".into());
                 return Ok(preview);
@@ -450,5 +451,6 @@ pub fn revise_phase(mut preview: Preview, settings: &crate::settings::Settings) 
         };
         crate::organize::process_image(original.bytes.clone(), crop, stamp.as_ref())?
     };
-    preview.with_original(original.bytes)?.with_file(path, expected, poster)
+    let preview = preview.with_original(original.bytes)?.with_file(path, expected, poster)?;
+    if settings.plex.naming || settings.plex.enabled { preview.with_plex_poster() } else { Ok(preview) }
 }

@@ -211,6 +211,15 @@ pub fn preview_with_video_cancellable(
 }
 
 pub(crate) fn preview_from_targets(root:&Path,code:&str,inputs:&[PathBuf],target_dir:Option<&Path>,target_video:Option<&Path>,cancel:&CancellationToken,candidates:&[PathBuf])->io::Result<AppendPreview> {
+    preview_targets_named(root,code,inputs,target_dir,target_video,cancel,candidates,None)
+}
+
+pub(crate) fn preview_import_target(root:&Path,code:&str,input:&Path,cancel:&CancellationToken,candidates:&[PathBuf],suffix:Option<&str>)->io::Result<AppendPreview> {
+    preview_targets_named(root,code,&[input.to_path_buf()],None,None,cancel,candidates,suffix)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn preview_targets_named(root:&Path,code:&str,inputs:&[PathBuf],target_dir:Option<&Path>,target_video:Option<&Path>,cancel:&CancellationToken,candidates:&[PathBuf],suffix:Option<&str>)->io::Result<AppendPreview> {
     check_cancel(cancel)?;
     let root_alias=root.to_path_buf();let root=root.canonicalize()?;
     let dir = if let Some(d) = target_dir {
@@ -354,7 +363,8 @@ pub(crate) fn preview_from_targets(root:&Path,code:&str,inputs:&[PathBuf],target
                 } else {
                     let anchor = existing.iter().min_by_key(|v| (v.as_os_str().len(), (**v).clone())).unwrap();
                     let taken = |path: &Path| crate::organize::occupied(path) || video_targets.contains(&path.to_path_buf()) || moves.iter().any(|(_, to)| to == path);
-                    let to = version_path(anchor, &version_label(&c), &extension, taken);
+                    let label = version_label(&c);
+                    let to = version_path(anchor, suffix.unwrap_or(&label), &extension, taken);
                     p.new_versions.push(to.clone());
                     to
                 }
@@ -405,6 +415,10 @@ pub(crate) fn preview_from_targets(root:&Path,code:&str,inputs:&[PathBuf],target
                 suffix
             ))
         };
+        let to = if let Some(name) = suffix.filter(|_| VIDEO_EXT.contains(&extension.as_str()) && !video_targets.contains(&to) && !p.new_versions.contains(&to)) {
+            let stem = to.file_stem().unwrap_or_default().to_string_lossy();
+            to.with_file_name(format!("{stem} - {name}.{extension}"))
+        } else { to };
         if to.file_name().is_some_and(|n|n.to_string_lossy().len()>240) {p.conflicts.push(format!("追加目标文件名超过 240 UTF-8 字节：{}",to.display()));continue;}
         moves.push((input.clone(), to.clone()));
         if VIDEO_EXT.contains(&extension.as_str()) {

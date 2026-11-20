@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/kiroku-core", "crates/kiroku-cli", "apps/desktop/src-tauri"]
 
 [workspace.package]
-version = "0.2.4"
+version = "0.2.13"
 edition = "2021"
 license = "GPL-3.0-or-later"
 
@@ -17,7 +17,7 @@ async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "cookies"] }
 walkdir = "2"
 tokio-util = "0.7"
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled", "backup"] }
 
 # 开发构建(tauri dev)里 SHA-256 不开优化只有约 30 MB/s(开优化约 450 MB/s);整理视频要完整读三遍做摘要,
 # 8 GB 的视频因此要等半小时以上。

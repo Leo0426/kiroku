@@ -235,12 +235,12 @@ mod smoke {
         }
     }
 
-    pub(super) fn journal_count(root: &Path) -> usize {
+    pub(super) fn journal_count(root: &std::path::Path) -> usize {
         fs::read_dir(root.join(".kiroku")).unwrap().filter_map(Result::ok)
             .filter(|entry| entry.file_name().to_string_lossy().starts_with("journal-")).count()
     }
 
-    pub fn fixture(root: &Path) -> kiroku_core::library::Library {
+    pub fn fixture(root: &std::path::Path) -> kiroku_core::library::Library {
         let lib = kiroku_core::library::Library::open(root).unwrap();
         for code in ["SMPL-001", "SMPL-002"] {
             let dir = root.join(code);

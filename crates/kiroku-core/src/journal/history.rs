@@ -10,7 +10,7 @@ const MAX_BYTES:usize=4*1024*1024;
 #[serde(rename_all="camelCase")]
 pub struct HistorySummary {pub id:String,pub ts:u64,pub status:JournalStatus,pub item_count:usize,pub op_count:usize,pub codes:Vec<String>,pub trashed:usize,pub pending_operations:usize,pub error:Option<String>}
 impl HistorySummary {
-    fn of(j:Journal)->Self {Self{id:j.id,ts:j.ts,status:j.status,item_count:j.items.len(),op_count:j.ops.len()+j.replacements.len(),codes:j.items.into_iter().take(6).map(|i|i.code).collect(),trashed:j.trashed.len(),pending_operations:usize::from(j.pending.is_some())+if j.status==JournalStatus::Partial{j.replacements.iter().filter(|r|!r.undone).count()}else{0},error:None}}
+    pub fn of(j:Journal)->Self {Self{id:j.id,ts:j.ts,status:j.status,item_count:j.items.len(),op_count:j.ops.len()+j.replacements.len(),codes:j.items.into_iter().take(6).map(|i|i.code).collect(),trashed:j.trashed.len(),pending_operations:usize::from(j.pending.is_some())+if j.status==JournalStatus::Partial{j.replacements.iter().filter(|r|!r.undone).count()}else{0},error:None}}
     fn failed(id:String,error:io::Error)->Self{Self{ts:id.parse().unwrap_or(0),id,status:JournalStatus::Partial,item_count:0,op_count:0,codes:vec![],trashed:0,pending_operations:0,error:Some(error.to_string())}}
     fn bytes(&self)->usize{std::mem::size_of::<Self>()+self.id.capacity()+self.codes.capacity()*std::mem::size_of::<String>()+self.codes.iter().map(String::capacity).sum::<usize>()+self.error.as_ref().map_or(0,String::capacity)}
 }
@@ -23,7 +23,7 @@ pub struct HistoryPage {pub items:Vec<HistorySummary>,pub total:usize,pub next:O
 pub struct HistoryFilter { pub text:String, pub status:Option<JournalStatus>, pub from:Option<u64>, pub until:Option<u64>, pub excluded_ids:std::collections::HashSet<String> }
 impl HistoryFilter {
     fn active(&self)->bool { !self.excluded_ids.is_empty() || !self.text.trim().is_empty() || self.status.is_some() || self.from.is_some() || self.until.is_some() }
-    fn matches(&self, summary:&HistorySummary, codes:&str)->bool {
+    pub fn matches(&self, summary:&HistorySummary, codes:&str)->bool {
         !self.excluded_ids.contains(&summary.id) && self.status.is_none_or(|v|v==summary.status) && self.from.is_none_or(|v|summary.ts>=v) && self.until.is_none_or(|v|summary.ts<v)
           && self.text.split_whitespace().all(|word|codes.contains(&word.to_lowercase()) || summary.id.to_lowercase().contains(&word.to_lowercase()))
     }

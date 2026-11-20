@@ -37,3 +37,5 @@ export function shortPath(path: string, max = 56): string {
   const tail = parts.slice(-5).join('')
   return '…' + tail.slice(-(max - 1))
 }
+
+export const platformModifier = typeof navigator !== 'undefined' && /Mac/.test(navigator.platform) ? '⌘' : 'Ctrl'

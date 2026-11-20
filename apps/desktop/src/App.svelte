@@ -6,7 +6,7 @@
   import Sidebar from './components/Sidebar.svelte'
   import Toast from './components/Toast.svelte'
   import CommandPalette from './components/CommandPalette.svelte'
-  import LoadingStatus from './components/LoadingStatus.svelte'
+  import LoadingScreen from './components/LoadingScreen.svelte'
   import { flow } from './lib/importflow.svelte'
   import { app } from './lib/state.svelte'
   import History from './views/History.svelte'
@@ -18,6 +18,7 @@
   let initialized = $state(false)
   let starting = $state(false)
   let startupError = $state('')
+  let startupStage = $state('正在读取应用设置…')
 
   // 换页后同一位置的连点可能落到新页面的海报/按钮上。
   // 只保护指针的双击时间窗口;移动到其他控件、键盘激活和稍后的点击照常执行。
@@ -40,8 +41,10 @@
     if (starting) return
     starting = true
     startupError = ''
+    startupStage = '正在读取应用设置…'
     try {
       await app.init()
+      startupStage = '正在准备导入工具…'
       await flow.init()
       initialized = true
     } catch (e) {
@@ -66,9 +69,8 @@
       <DropZone />
       <Sidebar />
       <main>
-        <StartupRecovery />
-        <div class="view-shell">
         {#key app.view}
+          <div class="view-shell">
           {#if app.view === 'library'}
             <Library />
           {:else if app.view === 'import'}
@@ -78,8 +80,8 @@
           {:else}
             <Settings />
           {/if}
+          </div>
         {/key}
-        </div>
       </main>
     </div>
   {/if}
@@ -90,13 +92,14 @@
       <p role="alert">{startupError}</p>
       <button class="btn primary" onclick={start} disabled={starting}>重试</button>
     {:else}
-      <LoadingStatus label="正在准备媒体库…" />
+      <LoadingScreen title="kiroku" label={startupStage} branded />
     {/if}
   </main>
 {/if}
 
-<ConfirmDialog />
+{#if initialized && !app.needsOnboarding}<StartupRecovery />{/if}
 {#if initialized}<CommandPalette />{/if}
+<ConfirmDialog />
 <Toast />
 
 <style>

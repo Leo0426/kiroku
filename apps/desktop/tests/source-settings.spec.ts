@@ -77,15 +77,28 @@ test('mock refresh and candidates reject wrong source types while valid old and 
   expect(result.dmmFormatError).toContain('没有可用的数据源')
 })
 
-test('each source can follow the global proxy, connect directly or use its own proxy', async ({ page }) => {
+test('each source shows its three proxy modes inline and supports keyboard selection', async ({ page }) => {
   await seedLibrary(page)
   await page.goto('/')
   await page.getByRole('navigation', { name: '主导航' }).getByRole('button', { name: '设置', exact: true }).click()
   await page.getByRole('tab', { name: '数据源', exact: true }).click()
   await page.locator('label.switch').filter({ hasText: 'DMM / FANZA 数字影片' }).getByRole('checkbox').check()
-  await page.getByLabel('DMM / FANZA 数字影片 代理').selectOption('custom')
+  const dmmProxy = page.getByRole('radiogroup', { name: 'DMM / FANZA 数字影片 代理' })
+  const javdbProxy = page.getByRole('radiogroup', { name: 'JavDB 代理' })
+  for (const label of ['跟随全局代理', '直连', '自定义']) {
+    await expect(dmmProxy.getByText(label, { exact: true })).toBeVisible()
+  }
+  const global = dmmProxy.getByRole('radio', { name: '跟随全局代理' })
+  await expect(global).toBeChecked()
+  await global.focus()
+  await page.keyboard.press('ArrowRight')
+  await expect(dmmProxy.getByRole('radio', { name: '直连' })).toBeChecked()
+  await page.keyboard.press('ArrowRight')
+  await expect(dmmProxy.getByRole('radio', { name: '自定义' })).toBeChecked()
+  await page.keyboard.press('Tab')
+  await expect(page.getByLabel('DMM / FANZA 数字影片 代理地址')).toBeFocused()
   await page.getByLabel('DMM / FANZA 数字影片 代理地址').fill('http://127.0.0.1:7891')
-  await page.getByLabel('JavDB 代理', { exact: true }).selectOption('direct')
+  await javdbProxy.getByRole('radio', { name: '直连' }).check()
   await page.getByRole('button', { name: /保存更改/ }).click()
   await expect(page.getByRole('button', { name: '已保存', exact: true })).toBeVisible()
   const saved = await page.evaluate(() => JSON.parse(localStorage.getItem('kiroku-mock-settings-v2')!))
@@ -97,6 +110,13 @@ test('each source can follow the global proxy, connect directly or use its own p
   await page.getByLabel('DMM / FANZA 数字影片 代理地址').fill('')
   await page.getByRole('button', { name: /保存更改/ }).click()
   await expect(page.getByRole('alert')).toContainText('自定义代理地址')
+  await global.check()
+  await expect(page.getByLabel('DMM / FANZA 数字影片 代理地址')).toHaveCount(0)
+  await page.getByRole('button', { name: /保存更改/ }).click()
+  await expect(page.getByRole('button', { name: '已保存', exact: true })).toBeVisible()
+  const restored = await page.evaluate(() => JSON.parse(localStorage.getItem('kiroku-mock-settings-v2')!).sources)
+  expect(restored.find((s: { id: string }) => s.id === 'dmm').proxy).toBeUndefined()
+  expect(restored.find((s: { id: string }) => s.id === 'javdb').proxy).toEqual({ mode: 'direct' })
 })
 
 test('a challenged source can be routed through the user solver once its address is set', async ({ page }) => {

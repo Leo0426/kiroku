@@ -216,12 +216,12 @@ pub(crate) fn plan_with_subtitles(src: &Path, code: &Code, meta: &Metadata, root
     }
     if with_meta {
         let assets = crate::assets::Paths::for_stem(&dir, &new_stem).expect("validated video stem");
-        ops.push(Op::WriteFile { path: assets.nfo, content: { let mut output=meta.clone();output.nfo_language=opts.nfo_language;nfo::to_nfo(&output) } });
         // 完整元数据,供之后无损重建媒体库索引
         let mut retained = meta.clone();
         retained.asset_stem = Some(new_stem);
         retained.nfo_language=opts.nfo_language;
         retained.artwork_phase = Some(phase.clone());
+        ops.push(Op::WriteFile { path: assets.nfo, content: nfo::to_nfo(&retained) });
         if opts.mode!=crate::placement::OrganizeMode::Move {
             retained.placements.extend(ops.iter().filter_map(|op| {
                 let (from,proof)=match op {Op::CopyFile{from,expected:Some(proof),..}|Op::HardlinkFile{from,expected:Some(proof),..}|Op::SymlinkFile{from,expected:Some(proof),..}=>(from,proof),_=>return None};
